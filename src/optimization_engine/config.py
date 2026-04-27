@@ -60,6 +60,8 @@ class EngineConfig:
     bounds: dict[str, list[float]] = field(default_factory=dict)
     groups: dict[str, str] = field(default_factory=dict)
     group_bounds: dict[str, list[float]] = field(default_factory=dict)
+    currencies: dict[str, str] = field(default_factory=dict)
+    base_currency: str = "USD"
     periods_per_year: int = 252
     covariance_method: str = "ledoit_wolf"
     ewma_lambda: float = 0.94
@@ -82,6 +84,8 @@ class EngineConfig:
             "bounds": {k: list(v) for k, v in self.bounds.items()},
             "groups": dict(self.groups),
             "group_bounds": {k: list(v) for k, v in self.group_bounds.items()},
+            "currencies": dict(self.currencies),
+            "base_currency": self.base_currency,
             "periods_per_year": self.periods_per_year,
             "covariance_method": self.covariance_method,
             "ewma_lambda": self.ewma_lambda,
@@ -99,6 +103,8 @@ class EngineConfig:
             bounds={k: list(v) for k, v in (data.get("bounds") or {}).items()},
             groups=dict(data.get("groups") or {}),
             group_bounds={k: list(v) for k, v in (data.get("group_bounds") or {}).items()},
+            currencies=dict(data.get("currencies") or {}),
+            base_currency=str(data.get("base_currency", "USD")).upper(),
             periods_per_year=int(data.get("periods_per_year", 252)),
             covariance_method=str(data.get("covariance_method", "ledoit_wolf")),
             ewma_lambda=float(data.get("ewma_lambda", 0.94)),
