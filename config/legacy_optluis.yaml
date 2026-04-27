@@ -1,0 +1,107 @@
+# Legacy configuration matching the original `Precios_OptLuis_USD.xlsx`
+# universe. Drop the original price file into ``data/`` and run::
+#
+#   optengine optimize --config config/legacy_optluis.yaml \
+#                      --prices data/Precios_OptLuis_USD.xlsx
+#
+periods_per_year: 252
+covariance_method: shrink
+
+optimizer:
+  name: mean_variance
+  target_return: 0.057
+  risk_free_rate: 0.075
+  risk_aversion: 1.0
+
+expected_returns:
+  US: 0.096
+  Mexico: 0.080
+  EM: 0.086
+  ACWIxUS: 0.090
+  ACWI: 0.093
+  Commodities: 0.050
+  Infrastructure: 0.110
+  UMS: 0.040
+  Bonos: 0.055
+  Bonos_1y: 0.045
+  Bonos_3y: 0.047
+  Bonos_5y: 0.049
+  Bonos_10y: 0.057
+  Bonos_20y: 0.062
+  Bonos_30y: 0.065
+  Udibonos: 0.055
+  Udibonos_1y: 0.049
+  Udibonos_3y: 0.051
+  Udibonos_5y: 0.054
+  Udibonos_10y: 0.055
+  Udibonos_20y: 0.057
+  Udibonos_30y: 0.059
+  Cetes: 0.050
+  Float: 0.052
+  AGG: 0.050
+  SHV: 0.030
+  IEF: 0.045
+  TLT: 0.060
+  TIP: 0.035
+
+bounds:
+  US:            [0.00, 0.50]
+  Mexico:        [0.00, 0.05]
+  EM:            [0.00, 0.05]
+  ACWIxUS:       [0.00, 0.05]
+  ACWI:          [0.00, 0.00]
+  Commodities:   [0.00, 0.05]
+  Infrastructure:[0.00, 0.05]
+  UMS:           [0.00, 0.00]
+  Bonos:         [0.00, 0.00]
+  Bonos_1y:      [0.00, 0.00]
+  Bonos_3y:      [0.00, 0.00]
+  Bonos_5y:      [0.00, 0.00]
+  Bonos_10y:     [0.00, 0.00]
+  Bonos_20y:     [0.00, 0.00]
+  Bonos_30y:     [0.00, 0.00]
+  Udibonos:      [0.00, 0.00]
+  Udibonos_1y:   [0.00, 0.00]
+  Udibonos_3y:   [0.00, 0.00]
+  Udibonos_5y:   [0.00, 0.00]
+  Udibonos_10y:  [0.00, 0.00]
+  Udibonos_20y:  [0.00, 0.00]
+  Udibonos_30y:  [0.00, 0.00]
+  Cetes:         [0.00, 0.00]
+  Float:         [0.00, 0.00]
+  AGG:           [0.00, 0.05]
+  SHV:           [0.00, 0.05]
+  IEF:           [0.00, 0.25]
+  TLT:           [0.00, 0.50]
+  TIP:           [0.00, 0.00]
+
+groups:
+  US: Equity
+  Mexico: Equity
+  EM: Equity
+  ACWIxUS: Equity
+  ACWI: Equity
+  Commodities: Alternatives
+  Infrastructure: Alternatives
+  UMS: FixedIncome
+  Bonos: FixedIncome
+  Bonos_1y: FixedIncome
+  Bonos_3y: FixedIncome
+  Bonos_5y: FixedIncome
+  Bonos_10y: FixedIncome
+  Bonos_20y: FixedIncome
+  Bonos_30y: FixedIncome
+  Udibonos: FixedIncome
+  Udibonos_1y: FixedIncome
+  Udibonos_3y: FixedIncome
+  Udibonos_5y: FixedIncome
+  Udibonos_10y: FixedIncome
+  Udibonos_20y: FixedIncome
+  Udibonos_30y: FixedIncome
+  Cetes: FixedIncome
+  Float: FixedIncome
+  AGG: FixedIncome
+  SHV: FixedIncome
+  IEF: FixedIncome
+  TLT: FixedIncome
+  TIP: FixedIncome

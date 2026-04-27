@@ -1,0 +1,69 @@
+# Example multi-asset configuration. Mirrors the spirit of the original
+# Mexican-fund optimizer, with a global multi-asset universe.
+
+periods_per_year: 252
+covariance_method: ledoit_wolf
+ewma_lambda: 0.94
+
+optimizer:
+  name: mean_variance        # mean_variance | min_variance | max_sharpe |
+                             # risk_parity | hrp | black_litterman | cvar |
+                             # max_diversification | equal_weight | inverse_vol
+  target_return: 0.07
+  risk_free_rate: 0.04
+  risk_aversion: 2.5
+  cvar_alpha: 0.05
+
+# Annualized expected returns per asset.
+expected_returns:
+  US_Equity: 0.080
+  Intl_Equity: 0.070
+  EM_Equity: 0.090
+  Real_Estate: 0.060
+  Commodities: 0.040
+  Infra: 0.070
+  Gold: 0.040
+  US_Treasuries: 0.030
+  TIPS: 0.030
+  IG_Credit: 0.040
+  HY_Credit: 0.050
+  EM_Debt: 0.050
+  Cash: 0.025
+
+# Per-asset weight bounds [lo, hi].
+bounds:
+  US_Equity:     [0.00, 0.50]
+  Intl_Equity:   [0.00, 0.30]
+  EM_Equity:     [0.00, 0.20]
+  Real_Estate:   [0.00, 0.10]
+  Commodities:   [0.00, 0.10]
+  Infra:         [0.00, 0.10]
+  Gold:          [0.00, 0.10]
+  US_Treasuries: [0.00, 0.40]
+  TIPS:          [0.00, 0.20]
+  IG_Credit:     [0.00, 0.30]
+  HY_Credit:     [0.00, 0.10]
+  EM_Debt:       [0.00, 0.15]
+  Cash:          [0.00, 0.20]
+
+# Optional asset-class mapping.
+groups:
+  US_Equity:     Equity
+  Intl_Equity:   Equity
+  EM_Equity:     Equity
+  Real_Estate:   Alternatives
+  Commodities:   Alternatives
+  Infra:         Alternatives
+  Gold:          Alternatives
+  US_Treasuries: FixedIncome
+  TIPS:          FixedIncome
+  IG_Credit:     FixedIncome
+  HY_Credit:     FixedIncome
+  EM_Debt:       FixedIncome
+  Cash:          FixedIncome
+
+# Optional group bounds.
+group_bounds:
+  Equity:       [0.30, 0.70]
+  Alternatives: [0.00, 0.20]
+  FixedIncome:  [0.20, 0.60]

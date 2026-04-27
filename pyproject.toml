@@ -1,0 +1,56 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "optimization-engine"
+version = "0.2.0"
+description = "Multi-asset portfolio optimization engine with mean-variance, risk parity, HRP, Black-Litterman, CVaR and more."
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.9"
+authors = [{ name = "Optimization Engine Contributors" }]
+keywords = ["portfolio", "optimization", "finance", "quant", "risk-parity", "black-litterman", "hrp", "cvar"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Topic :: Office/Business :: Financial :: Investment",
+]
+dependencies = [
+    "numpy>=1.24",
+    "pandas>=2.0",
+    "scipy>=1.10",
+    "matplotlib>=3.7",
+    "seaborn>=0.12",
+    "plotly>=5.17",
+    "cvxpy>=1.4",
+    "scikit-learn>=1.3",
+    "statsmodels>=0.14",
+    "pyyaml>=6.0",
+    "openpyxl>=3.1",
+    "xlsxwriter>=3.1",
+]
+
+[project.optional-dependencies]
+ui = ["streamlit>=1.30", "ipywidgets>=8.0"]
+data = ["yfinance>=0.2.40"]
+extras = ["riskfolio-lib>=5.0"]
+dev = ["pytest>=7.4", "pytest-cov>=4.1", "ruff>=0.5"]
+
+[project.scripts]
+optengine = "optimization_engine.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+optimization_engine = ["py.typed"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py39"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "W"]
+ignore = ["E501"]
