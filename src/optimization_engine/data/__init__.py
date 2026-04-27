@@ -9,6 +9,10 @@ from optimization_engine.data.loader import (
     prices_to_returns,
     sample_dataset,
 )
+from optimization_engine.data.yahoo import (
+    YahooFinanceError,
+    load_prices_yahoo,
+)
 
 __all__ = [
     "covariance_matrix",
@@ -16,4 +20,6 @@ __all__ = [
     "load_prices",
     "prices_to_returns",
     "sample_dataset",
+    "YahooFinanceError",
+    "load_prices_yahoo",
 ]

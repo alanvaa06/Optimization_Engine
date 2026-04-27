@@ -11,6 +11,7 @@ import pandas as pd
 
 from optimization_engine.config import load_config
 from optimization_engine.data.loader import load_prices, prices_to_returns, sample_dataset
+from optimization_engine.data.yahoo import YahooFinanceError, load_prices_yahoo
 from optimization_engine.engine import run_engine
 from optimization_engine.optimizers.factory import available_optimizers
 from optimization_engine.reporting.exporters import write_excel_report
@@ -28,6 +29,17 @@ def _build_parser() -> argparse.ArgumentParser:
     optimize.add_argument("--prices", help="Excel/CSV/Parquet file of prices.")
     optimize.add_argument("--sheet", default="Precios", help="Excel sheet name.")
     optimize.add_argument("--sample", action="store_true", help="Use built-in sample data.")
+    optimize.add_argument(
+        "--yahoo",
+        help="Download prices from Yahoo Finance. "
+             "Pass tickers as a comma- or space-separated list.",
+    )
+    optimize.add_argument(
+        "--yahoo-period", default="5y",
+        help="Yahoo period when --yahoo is used (default: 5y).",
+    )
+    optimize.add_argument("--yahoo-start", help="Yahoo start date (YYYY-MM-DD).")
+    optimize.add_argument("--yahoo-end", help="Yahoo end date (YYYY-MM-DD).")
     optimize.add_argument("--output", default="outputs.xlsx", help="Output Excel path.")
     optimize.add_argument("--frontier", action="store_true", help="Also compute the frontier.")
     optimize.add_argument("--frontier-points", type=int, default=25)
@@ -43,7 +55,18 @@ def _build_parser() -> argparse.ArgumentParser:
 
 def _cmd_optimize(args: argparse.Namespace) -> int:
     config = load_config(args.config)
-    if args.sample or not args.prices:
+    if args.yahoo:
+        try:
+            if args.yahoo_start:
+                prices = load_prices_yahoo(
+                    args.yahoo, start=args.yahoo_start, end=args.yahoo_end
+                )
+            else:
+                prices = load_prices_yahoo(args.yahoo, period=args.yahoo_period)
+        except YahooFinanceError as exc:
+            print(f"Yahoo Finance error: {exc}", file=sys.stderr)
+            return 2
+    elif args.sample or not args.prices:
         prices = sample_dataset()
     else:
         prices = load_prices(args.prices, sheet_name=args.sheet)

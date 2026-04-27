@@ -15,6 +15,10 @@ from optimization_engine.data.loader import (
     prices_to_returns,
     sample_dataset,
 )
+from optimization_engine.data.yahoo import (
+    YahooFinanceError,
+    load_prices_yahoo,
+)
 from optimization_engine.engine import EngineRun, run_engine
 from optimization_engine.frontier import FrontierResult, efficient_frontier
 from optimization_engine.optimizers import (
@@ -44,6 +48,8 @@ __all__ = [
     "load_prices",
     "prices_to_returns",
     "sample_dataset",
+    "YahooFinanceError",
+    "load_prices_yahoo",
     "EngineRun",
     "run_engine",
     "FrontierResult",
