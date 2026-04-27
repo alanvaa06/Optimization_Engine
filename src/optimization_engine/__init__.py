@@ -32,6 +32,19 @@ from optimization_engine.data.fx import (
 )
 from optimization_engine.engine import EngineRun, run_engine
 from optimization_engine.frontier import FrontierResult, efficient_frontier
+from optimization_engine.scenarios import (
+    Scenario,
+    config_signature,
+    delete_scenario,
+    dump_scenarios_yaml,
+    load_scenarios,
+    load_scenarios_yaml,
+    rename_scenario,
+    save_scenarios,
+    scenario_from_dict,
+    scenario_signature,
+    scenario_to_dict,
+)
 from optimization_engine.optimizers import (
     BaseOptimizer,
     BlackLittermanOptimizer,
@@ -72,6 +85,17 @@ __all__ = [
     "run_engine",
     "FrontierResult",
     "efficient_frontier",
+    "Scenario",
+    "config_signature",
+    "delete_scenario",
+    "dump_scenarios_yaml",
+    "load_scenarios",
+    "load_scenarios_yaml",
+    "rename_scenario",
+    "save_scenarios",
+    "scenario_from_dict",
+    "scenario_signature",
+    "scenario_to_dict",
     "BaseOptimizer",
     "BlackLittermanOptimizer",
     "CVaROptimizer",
