@@ -82,8 +82,20 @@ Tabs walk you through the workflow:
 3. **Expected returns & constraints** — fully editable tables for
    expected returns, bounds, groups, group bounds, plus optimizer-specific
    inputs (risk budgets / Black-Litterman views).
-4. **Optimize** — KPI cards, weights, risk contributions, frontier, backtest.
-5. **Report** — one-click Excel export and the YAML config the run used.
+4. **Compare** — pick up to 5 saved scenarios; renders a stacked-weight
+   chart, a per-asset grouped bar chart, a wealth-overlay backtest, and a
+   summary table with annualized return / vol / Sharpe / active positions.
+5. **What-if** — anchor on a saved scenario and drag per-asset weight-bound
+   range sliders; the optimizer re-solves live (or behind a Recompute button
+   for `cvar` or universes >25 assets) and KPIs update immediately. "Save
+   these as new scenario" forks the result.
+6. **Optimize** — KPI cards, weights, risk contributions, frontier, backtest.
+7. **Report** — one-click Excel export and the YAML config the run used.
+
+The sidebar's **📚 Scenarios** block lets you save, update, load, rename,
+delete, and download/upload named profiles (YAML) — so you can switch
+between a "Conservative", "Black-Litterman bull case", and "Risk parity"
+view without retyping the constraints.
 
 ### CLI
 
