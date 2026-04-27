@@ -34,11 +34,17 @@ from optimization_engine.data.loader import (  # noqa: E402
     prices_to_returns,
     sample_dataset,
 )
+from optimization_engine.data.fx import (  # noqa: E402
+    FXError,
+    convert_prices_to_base,
+    fetch_fx_to_base,
+    supported_currencies,
+)
 from optimization_engine.data.yahoo import (  # noqa: E402
     YahooFinanceError,
     load_prices_yahoo,
 )
-from optimization_engine.engine import run_engine  # noqa: E402
+from optimization_engine.engine import apply_fx_conversion, run_engine  # noqa: E402
 from optimization_engine.optimizers.factory import available_optimizers  # noqa: E402
 from optimization_engine.reporting.exporters import write_excel_report  # noqa: E402
 from optimization_engine.reporting.plots import (  # noqa: E402
@@ -207,7 +213,20 @@ with st.sidebar:
     prices = prices[selected_assets]
 
     st.divider()
-    st.header("2 · Optimizer")
+    st.header("2 · Currency")
+    currency_options = supported_currencies()
+    base_currency = st.selectbox(
+        "Base currency",
+        options=currency_options,
+        index=currency_options.index("USD"),
+        help=(
+            "All asset prices are converted into this currency before "
+            "computing returns. FX rates come from FRED."
+        ),
+    )
+
+    st.divider()
+    st.header("3 · Optimizer")
     optimizer_name = st.selectbox(
         "Method",
         options=available_optimizers(),
@@ -264,9 +283,33 @@ with st.sidebar:
         target_return = None if target_return == 0.0 else target_return
 
     st.divider()
-    st.header("3 · Frontier")
+    st.header("4 · Frontier")
     build_frontier = st.checkbox("Build efficient frontier", value=True)
     n_frontier_points = st.slider("Frontier points", 5, 100, 25)
+
+
+# ---------------------------------------------------------------------------
+# Currency conversion (apply once, before returns)
+# ---------------------------------------------------------------------------
+
+if "asset_currency" not in st.session_state or set(st.session_state.asset_currency) != set(prices.columns):
+    st.session_state.asset_currency = {a: base_currency for a in prices.columns}
+
+unique_currencies = {st.session_state.asset_currency.get(a, base_currency) for a in prices.columns}
+if unique_currencies != {base_currency}:
+    try:
+        prices = convert_prices_to_base(
+            prices,
+            asset_currency=st.session_state.asset_currency,
+            base=base_currency,
+        )
+        with st.sidebar:
+            st.caption(
+                f"FX-converted {len(prices.columns)} series → {base_currency} via FRED."
+            )
+    except FXError as exc:
+        st.sidebar.error(f"FX conversion failed: {exc}")
+        st.stop()
 
 
 # ---------------------------------------------------------------------------
@@ -355,9 +398,16 @@ with tab_constraints:
                 "Min Weight": 0.0,
                 "Max Weight": 1.0,
                 "Group": "Other",
+                "Currency": [
+                    st.session_state.asset_currency.get(a, base_currency) for a in returns.columns
+                ],
             },
             index=returns.columns,
         )
+    elif "Currency" not in st.session_state.config_table.columns:
+        st.session_state.config_table["Currency"] = [
+            st.session_state.asset_currency.get(a, base_currency) for a in returns.columns
+        ]
 
     edited = st.data_editor(
         st.session_state.config_table,
@@ -368,9 +418,21 @@ with tab_constraints:
             "Min Weight": st.column_config.NumberColumn(min_value=-1.0, max_value=1.0, step=0.01, format="%.2f"),
             "Max Weight": st.column_config.NumberColumn(min_value=0.0, max_value=1.5, step=0.01, format="%.2f"),
             "Group": st.column_config.TextColumn(),
+            "Currency": st.column_config.SelectboxColumn(
+                "Currency",
+                options=supported_currencies(),
+                help="ISO code of the currency the price series is quoted in.",
+            ),
         },
     )
     st.session_state.config_table = edited
+    st.session_state.asset_currency = {
+        a: str(edited.loc[a, "Currency"]) for a in returns.columns
+    }
+    st.caption(
+        f"Currencies set per asset; non-{base_currency} series are converted "
+        "via FRED FX rates the next time prices are loaded."
+    )
 
     st.markdown("**Group constraints**")
     unique_groups = sorted(edited["Group"].dropna().unique().tolist())
@@ -467,6 +529,8 @@ def _build_config() -> EngineConfig:
         bounds=bounds,
         groups=groups,
         group_bounds=group_bounds,
+        currencies=dict(st.session_state.asset_currency),
+        base_currency=base_currency,
         periods_per_year=int(periods_per_year),
         covariance_method=cov_method,
         ewma_lambda=float(ewma_lambda),

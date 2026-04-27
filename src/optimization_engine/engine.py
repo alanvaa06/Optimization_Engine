@@ -22,6 +22,34 @@ from optimization_engine.optimizers.base import OptimizationResult
 from optimization_engine.optimizers.factory import optimizer_factory
 
 
+def apply_fx_conversion(
+    prices: pd.DataFrame,
+    config: EngineConfig,
+    fx_rates: pd.DataFrame | None = None,
+) -> pd.DataFrame:
+    """Convert ``prices`` into ``config.base_currency`` if needed.
+
+    No-op when every asset is already quoted in the base currency, or
+    when ``config.currencies`` is empty.
+    """
+    if not config.currencies:
+        return prices
+    base = config.base_currency.upper()
+    needed = {config.currencies.get(a, base).upper() for a in prices.columns}
+    if needed == {base}:
+        return prices
+
+    # Local import: keeps this module importable when urllib is restricted.
+    from optimization_engine.data.fx import convert_prices_to_base
+
+    return convert_prices_to_base(
+        prices,
+        asset_currency=config.currencies,
+        base=base,
+        fx_rates=fx_rates,
+    )
+
+
 @dataclass
 class EngineRun:
     config: EngineConfig

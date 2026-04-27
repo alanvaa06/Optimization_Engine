@@ -19,6 +19,17 @@ from optimization_engine.data.yahoo import (
     YahooFinanceError,
     load_prices_yahoo,
 )
+from optimization_engine.data.fred import (
+    FREDError,
+    load_fred_series,
+    load_risk_free_rate,
+)
+from optimization_engine.data.fx import (
+    FXError,
+    convert_prices_to_base,
+    fetch_fx_to_base,
+    supported_currencies,
+)
 from optimization_engine.engine import EngineRun, run_engine
 from optimization_engine.frontier import FrontierResult, efficient_frontier
 from optimization_engine.optimizers import (
@@ -50,6 +61,13 @@ __all__ = [
     "sample_dataset",
     "YahooFinanceError",
     "load_prices_yahoo",
+    "FREDError",
+    "load_fred_series",
+    "load_risk_free_rate",
+    "FXError",
+    "convert_prices_to_base",
+    "fetch_fx_to_base",
+    "supported_currencies",
     "EngineRun",
     "run_engine",
     "FrontierResult",
