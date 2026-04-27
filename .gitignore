@@ -46,6 +46,9 @@ outputs/
 .DS_Store
 Thumbs.db
 
+# Claude Code — personal local settings (the team-shared ones live in .claude/settings.json)
+.claude/settings.local.json
+
 # Test / coverage
 .pytest_cache/
 .coverage
