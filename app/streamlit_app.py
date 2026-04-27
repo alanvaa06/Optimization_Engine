@@ -34,6 +34,10 @@ from optimization_engine.data.loader import (  # noqa: E402
     prices_to_returns,
     sample_dataset,
 )
+from optimization_engine.data.yahoo import (  # noqa: E402
+    YahooFinanceError,
+    load_prices_yahoo,
+)
 from optimization_engine.engine import run_engine  # noqa: E402
 from optimization_engine.optimizers.factory import available_optimizers  # noqa: E402
 from optimization_engine.reporting.exporters import write_excel_report  # noqa: E402
@@ -86,6 +90,19 @@ def _load_sample(n_periods: int) -> pd.DataFrame:
     return sample_dataset(n_periods=n_periods)
 
 
+@st.cache_data(show_spinner=True, ttl=60 * 60)
+def _load_yahoo_cached(
+    tickers: tuple[str, ...],
+    period: str,
+    start: str | None,
+    end: str | None,
+    interval: str,
+) -> pd.DataFrame:
+    if start:
+        return load_prices_yahoo(list(tickers), start=start, end=end or None, interval=interval)
+    return load_prices_yahoo(list(tickers), period=period, interval=interval)
+
+
 def _load_uploaded(file: io.BytesIO, sheet: str) -> pd.DataFrame:
     name = file.name.lower()
     if name.endswith((".xlsx", ".xls", ".xlsm")):
@@ -109,7 +126,7 @@ with st.sidebar:
     st.header("1 · Data")
     data_source = st.radio(
         "Source",
-        options=["Sample", "Upload file"],
+        options=["Sample", "Upload file", "Yahoo Finance"],
         index=0,
         horizontal=True,
     )
@@ -117,7 +134,7 @@ with st.sidebar:
     if data_source == "Sample":
         years = st.slider("Years of history", 2, 15, 8)
         prices = _load_sample(years * 252)
-    else:
+    elif data_source == "Upload file":
         uploaded = st.file_uploader(
             "Price file (Excel/CSV/Parquet)",
             type=["xlsx", "xls", "xlsm", "csv", "parquet"],
@@ -129,6 +146,53 @@ with st.sidebar:
         prices = _load_uploaded(uploaded, sheet)
         prices.index = pd.to_datetime(prices.index)
         prices = prices.sort_index().dropna(how="all")
+    else:
+        st.markdown(
+            "Pull adjusted prices directly from Yahoo Finance. "
+            "Tickers are validated locally before any network call."
+        )
+        yahoo_tickers = st.text_input(
+            "Tickers (comma- or space-separated)",
+            value="SPY, QQQ, EFA, EEM, AGG, TLT, IEF, GLD, DBC, VNQ",
+        )
+        yahoo_period = st.selectbox(
+            "Period",
+            options=["1y", "2y", "5y", "10y", "max", "Custom range"],
+            index=2,
+        )
+        yahoo_start: str | None = None
+        yahoo_end: str | None = None
+        if yahoo_period == "Custom range":
+            today = pd.Timestamp.today().normalize()
+            default_start = (today - pd.DateOffset(years=5)).date()
+            yahoo_start = str(st.date_input("Start", value=default_start))
+            yahoo_end = str(st.date_input("End", value=today.date()))
+            yahoo_period = "5y"  # ignored when start is set
+        yahoo_interval = st.selectbox(
+            "Interval", options=["1d", "1wk", "1mo"], index=0
+        )
+
+        if not st.button("Fetch from Yahoo", type="primary"):
+            st.info("Set tickers and click **Fetch from Yahoo** to download prices.")
+            st.stop()
+
+        try:
+            tickers_tuple = tuple(
+                t for t in yahoo_tickers.replace(",", " ").split() if t
+            )
+            prices = _load_yahoo_cached(
+                tickers_tuple,
+                period=yahoo_period,
+                start=yahoo_start,
+                end=yahoo_end,
+                interval=yahoo_interval,
+            )
+        except YahooFinanceError as exc:
+            st.error(f"Yahoo Finance error: {exc}")
+            st.stop()
+        except Exception as exc:  # network / library issues
+            st.error(f"Could not load Yahoo prices: {exc}")
+            st.stop()
 
     st.success(f"Loaded {prices.shape[0]} rows × {prices.shape[1]} assets")
 
