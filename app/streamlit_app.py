@@ -67,6 +67,10 @@ from optimization_engine.reporting.plots import (  # noqa: E402
     plot_risk_contributions,
     plot_wealth_index,
 )
+from optimization_engine.ui_state import (  # noqa: E402
+    yahoo_cache_key,
+    yahoo_prices_for_rerun,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -277,26 +281,38 @@ with st.sidebar:
             "Interval", options=["1d", "1wk", "1mo"], index=0
         )
 
-        if not st.button("Fetch from Yahoo", type="primary"):
-            st.info("Set tickers and click **Fetch from Yahoo** to download prices.")
-            st.stop()
+        fetch_clicked = st.button("Fetch from Yahoo", type="primary")
+
+        tickers_tuple = tuple(t for t in yahoo_tickers.replace(",", " ").split() if t)
+        cache_key = yahoo_cache_key(
+            tickers_tuple,
+            yahoo_period,
+            yahoo_start,
+            yahoo_end,
+            yahoo_interval,
+        )
 
         try:
-            tickers_tuple = tuple(
-                t for t in yahoo_tickers.replace(",", " ").split() if t
-            )
-            prices = _load_yahoo_cached(
-                tickers_tuple,
-                period=yahoo_period,
-                start=yahoo_start,
-                end=yahoo_end,
-                interval=yahoo_interval,
+            prices = yahoo_prices_for_rerun(
+                fetch_clicked=fetch_clicked,
+                cache_key=cache_key,
+                state=st.session_state,
+                fetch_prices=lambda: _load_yahoo_cached(
+                    tickers_tuple,
+                    period=yahoo_period,
+                    start=yahoo_start,
+                    end=yahoo_end,
+                    interval=yahoo_interval,
+                ),
             )
         except YahooFinanceError as exc:
             st.error(f"Yahoo Finance error: {exc}")
             st.stop()
         except Exception as exc:  # network / library issues
             st.error(f"Could not load Yahoo prices: {exc}")
+            st.stop()
+        if prices is None:
+            st.info("Set tickers and click **Fetch from Yahoo** to download prices.")
             st.stop()
 
     st.success(f"Loaded {prices.shape[0]} rows × {prices.shape[1]} assets")
