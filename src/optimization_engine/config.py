@@ -11,7 +11,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import yaml
 
@@ -31,6 +31,7 @@ class OptimizerSpec:
     bl_view_confidences: dict[str, float] | None = None
     bl_tau: float = 0.05
     bl_market_caps: dict[str, float] | None = None
+    hrp_linkage: Literal["single", "average", "complete", "ward"] = "single"
     extra: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:

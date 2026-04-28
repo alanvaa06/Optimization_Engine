@@ -120,7 +120,7 @@ def optimizer_factory(
     if cls is RiskParityOptimizer:
         return cls(risk_budget=spec.risk_budget, **common, **overrides)
     if cls is HRPOptimizer:
-        return cls(linkage_method=getattr(spec, "hrp_linkage", "single"), **common, **overrides)
+        return cls(linkage_method=spec.hrp_linkage, **common, **overrides)
     if cls is BlackLittermanOptimizer:
         return cls(
             market_weights=spec.bl_market_caps,

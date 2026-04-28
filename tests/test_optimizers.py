@@ -199,3 +199,18 @@ def test_factory_warns_on_incompatible_target_return(returns, baseline_config, c
     with caplog.at_level(logging.WARNING):
         run_engine(returns, cfg)
     assert any("target_return" in r.message for r in caplog.records)
+
+
+@pytest.mark.parametrize("linkage", ["single", "average", "complete", "ward"])
+def test_hrp_linkage_methods(returns, baseline_config, linkage):
+    cfg = EngineConfig(
+        expected_returns=baseline_config.expected_returns,
+        bounds=baseline_config.bounds,
+        groups=baseline_config.groups,
+        optimizer=OptimizerSpec(name="hrp", hrp_linkage=linkage),
+    )
+    run = run_engine(returns, cfg)
+    w = run.result.weights
+    assert pytest.approx(w.sum(), abs=1e-3) == 1.0
+    assert (w >= -1e-6).all()
+    assert (w <= 0.5 + 1e-6).all()
