@@ -584,12 +584,87 @@ with tab_constraints:
             st.session_state.asset_currency.get(a, base_currency) for a in returns.columns
         ]
 
+    if ws["expected_returns_method"]["enabled"]:
+        er_method = st.radio(
+            "Expected-returns method",
+            options=["historical_mean", "ema", "capm"],
+            index=["historical_mean", "ema", "capm"].index(
+                st.session_state.get("expected_returns_method", "historical_mean")
+            ),
+            horizontal=True,
+            key="expected_returns_method",
+        )
+        if er_method == "ema":
+            st.session_state.ema_span = st.slider(
+                "EMA span (periods)",
+                min_value=30, max_value=504,
+                value=int(st.session_state.get("ema_span", 180)),
+                step=10,
+                key="ema_span_slider",
+            )
+        elif er_method == "capm":
+            st.session_state.market_return = st.number_input(
+                "Market return (annual, optional)",
+                value=float(st.session_state.get("market_return") or 0.08),
+                step=0.005, format="%.4f",
+                key="market_return_input",
+            )
+            mw_idx = list(returns.columns)
+            mw_default = pd.DataFrame(
+                {"Market weight": [1.0 / len(mw_idx)] * len(mw_idx)},
+                index=mw_idx,
+            )
+            if "market_weights_table" not in st.session_state:
+                st.session_state.market_weights_table = mw_default
+            st.session_state.market_weights_table = st.data_editor(
+                st.session_state.market_weights_table,
+                num_rows="fixed",
+                column_config={
+                    "Market weight": st.column_config.NumberColumn(
+                        min_value=0.0, max_value=1.0, step=0.01, format="%.3f",
+                    ),
+                },
+            )
+
+        if st.button("Reset μ to method default", key="reset_mu_btn"):
+            from optimization_engine.data.covariance import expected_returns_from_history, covariance_matrix as _cov
+
+            mw_for_capm = (
+                pd.Series(st.session_state.market_weights_table["Market weight"])
+                if er_method == "capm"
+                and "market_weights_table" in st.session_state
+                else None
+            )
+            seeded = expected_returns_from_history(
+                returns,
+                method=er_method,
+                periods_per_year=int(periods_per_year),
+                span=int(st.session_state.get("ema_span", 180)),
+                market_return=float(st.session_state.get("market_return") or 0.0) or None,
+                risk_free_rate=float(risk_free_rate),
+                market_weights=mw_for_capm,
+                cov_matrix=_cov(returns, method=cov_method, ewma_lambda=ewma_lambda,
+                                periods_per_year=int(periods_per_year)),
+            )
+            st.session_state.config_table["Expected Return"] = seeded.round(4)
+            st.rerun()
+
+    if ws["soft_bounds_caption"]["enabled"]:
+        st.caption(
+            "_Bounds are enforced via projection on solved weights "
+            "(soft bounds; small drift may occur for marginal cases)._"
+        )
+
     edited = st.data_editor(
         st.session_state.config_table,
         use_container_width=True,
         num_rows="fixed",
         column_config={
-            "Expected Return": st.column_config.NumberColumn(format="%.4f"),
+            "Expected Return": st.column_config.NumberColumn(
+                format="%.4f",
+                disabled=not ws["expected_returns_column"]["enabled"],
+                help=ws["expected_returns_column"]["tooltip"],
+            ),
             "Min Weight": st.column_config.NumberColumn(min_value=-1.0, max_value=1.0, step=0.01, format="%.2f"),
             "Max Weight": st.column_config.NumberColumn(min_value=0.0, max_value=1.5, step=0.01, format="%.2f"),
             "Group": st.column_config.TextColumn(),
@@ -609,22 +684,27 @@ with tab_constraints:
         "via FRED FX rates the next time prices are loaded."
     )
 
-    st.markdown("**Group constraints**")
-    unique_groups = sorted(edited["Group"].dropna().unique().tolist())
-    if unique_groups:
-        gb_default = pd.DataFrame(
-            {"Min Weight": 0.0, "Max Weight": 1.0}, index=unique_groups
-        )
-        if "group_bounds" not in st.session_state or list(st.session_state.group_bounds.index) != unique_groups:
-            st.session_state.group_bounds = gb_default
-        st.session_state.group_bounds = st.data_editor(
-            st.session_state.group_bounds,
-            use_container_width=True,
-            num_rows="fixed",
-            column_config={
-                "Min Weight": st.column_config.NumberColumn(min_value=0.0, max_value=1.5, step=0.01, format="%.2f"),
-                "Max Weight": st.column_config.NumberColumn(min_value=0.0, max_value=1.5, step=0.01, format="%.2f"),
-            },
+    if ws["group_bounds"]["enabled"]:
+        st.markdown("**Group constraints**")
+        unique_groups = sorted(edited["Group"].dropna().unique().tolist())
+        if unique_groups:
+            gb_default = pd.DataFrame(
+                {"Min Weight": 0.0, "Max Weight": 1.0}, index=unique_groups
+            )
+            if "group_bounds" not in st.session_state or list(st.session_state.group_bounds.index) != unique_groups:
+                st.session_state.group_bounds = gb_default
+            st.session_state.group_bounds = st.data_editor(
+                st.session_state.group_bounds,
+                use_container_width=True,
+                num_rows="fixed",
+                column_config={
+                    "Min Weight": st.column_config.NumberColumn(min_value=0.0, max_value=1.5, step=0.01, format="%.2f"),
+                    "Max Weight": st.column_config.NumberColumn(min_value=0.0, max_value=1.5, step=0.01, format="%.2f"),
+                },
+            )
+    else:
+        st.caption(
+            f"_{optimizer_name} does not enforce group bounds — group editor hidden._"
         )
 
     if optimizer_name == "risk_parity":
@@ -659,6 +739,44 @@ with tab_constraints:
             },
         )
 
+        st.markdown("**Black-Litterman extras**")
+        st.session_state["bl_tau"] = st.slider(
+            "τ (prior uncertainty)",
+            min_value=0.01, max_value=0.5,
+            value=float(st.session_state.get("bl_tau", 0.05)),
+            step=0.01,
+            key="bl_tau_slider",
+        )
+        if (
+            "bl_market_caps_table" not in st.session_state
+            or set(st.session_state.bl_market_caps_table.index) != set(returns.columns)
+        ):
+            st.session_state.bl_market_caps_table = pd.DataFrame(
+                {"Market cap weight": [1.0 / len(returns.columns)] * len(returns.columns)},
+                index=returns.columns,
+            )
+        st.session_state.bl_market_caps_table = st.data_editor(
+            st.session_state.bl_market_caps_table,
+            num_rows="fixed",
+            column_config={
+                "Market cap weight": st.column_config.NumberColumn(
+                    min_value=0.0, max_value=1.0, step=0.01, format="%.3f",
+                    help="Equal weights → equilibrium under no views. Set to your view of the market portfolio.",
+                ),
+            },
+        )
+
+    if optimizer_name == "hrp":
+        st.session_state["hrp_linkage"] = st.selectbox(
+            "HRP linkage method",
+            options=["single", "average", "complete", "ward"],
+            index=["single", "average", "complete", "ward"].index(
+                st.session_state.get("hrp_linkage", "single")
+            ),
+            key="hrp_linkage_select",
+            help="Hierarchical clustering linkage rule.",
+        )
+
 
 def _build_config() -> EngineConfig:
     table = st.session_state.config_table
@@ -681,23 +799,39 @@ def _build_config() -> EngineConfig:
         risk_free_rate=float(risk_free_rate),
         risk_aversion=float(risk_aversion),
         cvar_alpha=float(cvar_alpha),
+        bl_tau=float(st.session_state.get("bl_tau", 0.05)),
+        hrp_linkage=str(st.session_state.get("hrp_linkage", "single")),
     )
 
     if optimizer_name == "risk_parity" and "risk_budget" in st.session_state:
         spec.risk_budget = st.session_state.risk_budget["Risk Budget"].to_dict()
 
-    if optimizer_name == "black_litterman" and "bl_views" in st.session_state:
-        v = st.session_state.bl_views
-        spec.bl_views = {
-            a: float(v.loc[a, "View"])
-            for a in v.index
-            if pd.notna(v.loc[a, "View"])
-        }
-        spec.bl_view_confidences = {
-            a: float(v.loc[a, "Confidence (variance)"])
-            for a in v.index
-            if pd.notna(v.loc[a, "Confidence (variance)"])
-        }
+    if optimizer_name == "black_litterman":
+        if "bl_views" in st.session_state:
+            v = st.session_state.bl_views
+            spec.bl_views = {
+                a: float(v.loc[a, "View"])
+                for a in v.index
+                if pd.notna(v.loc[a, "View"])
+            }
+            spec.bl_view_confidences = {
+                a: float(v.loc[a, "Confidence (variance)"])
+                for a in v.index
+                if pd.notna(v.loc[a, "Confidence (variance)"])
+            }
+        if "bl_market_caps_table" in st.session_state:
+            spec.bl_market_caps = (
+                st.session_state.bl_market_caps_table["Market cap weight"].to_dict()
+            )
+
+    market_weights = None
+    if (
+        st.session_state.get("expected_returns_method") == "capm"
+        and "market_weights_table" in st.session_state
+    ):
+        market_weights = (
+            st.session_state.market_weights_table["Market weight"].to_dict()
+        )
 
     return EngineConfig(
         expected_returns=expected_returns,
@@ -709,6 +843,17 @@ def _build_config() -> EngineConfig:
         periods_per_year=int(periods_per_year),
         covariance_method=cov_method,
         ewma_lambda=float(ewma_lambda),
+        expected_returns_method=str(
+            st.session_state.get("expected_returns_method", "historical_mean")
+        ),
+        ema_span=int(st.session_state.get("ema_span", 180)),
+        market_return=(
+            float(st.session_state.get("market_return"))
+            if st.session_state.get("expected_returns_method") == "capm"
+            and st.session_state.get("market_return")
+            else None
+        ),
+        market_weights=market_weights,
         optimizer=spec,
     )
 
