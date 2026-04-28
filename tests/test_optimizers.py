@@ -312,3 +312,60 @@ def test_engine_default_method_unchanged(returns, baseline_config):
     )
     run = run_engine(returns, cfg)
     assert run.expected_returns.notna().all()
+
+
+def test_cvar_with_target_return(returns, baseline_config):
+    target = 0.05
+    cfg = EngineConfig(
+        expected_returns=baseline_config.expected_returns,
+        bounds=baseline_config.bounds,
+        groups=baseline_config.groups,
+        optimizer=OptimizerSpec(
+            name="cvar", cvar_alpha=0.05, target_return=target,
+        ),
+    )
+    run = run_engine(returns, cfg)
+    assert run.result.expected_return >= target - 1e-3
+
+
+def test_black_litterman_no_views_runs(returns, baseline_config):
+    cfg = EngineConfig(
+        expected_returns=baseline_config.expected_returns,
+        bounds=baseline_config.bounds,
+        groups=baseline_config.groups,
+        group_bounds=baseline_config.group_bounds,
+        optimizer=OptimizerSpec(name="black_litterman", risk_aversion=2.5),
+    )
+    run = run_engine(returns, cfg)
+    assert pytest.approx(run.result.weights.sum(), abs=1e-3) == 1.0
+    assert (run.result.weights >= -1e-6).all()
+
+
+@pytest.mark.parametrize("method", [
+    "mean_variance", "min_variance", "max_sharpe", "cvar", "black_litterman",
+])
+def test_group_bounds_enforced_for_hard_methods(returns, method):
+    cols = list(returns.columns)
+    half = len(cols) // 2
+    groups = {a: ("A" if i < half else "B") for i, a in enumerate(cols)}
+    cfg = EngineConfig(
+        expected_returns={a: 0.05 for a in cols},
+        bounds={a: [0.0, 1.0] for a in cols},
+        groups=groups,
+        group_bounds={"A": [0.4, 0.6], "B": [0.4, 0.6]},
+        optimizer=OptimizerSpec(name=method, risk_free_rate=0.0),
+    )
+    run = run_engine(returns, cfg)
+    g = run.result.weights.groupby(groups).sum()
+    assert 0.4 - 2e-3 <= g["A"] <= 0.6 + 2e-3, g.to_dict()
+    assert 0.4 - 2e-3 <= g["B"] <= 0.6 + 2e-3, g.to_dict()
+
+
+def test_infeasible_target_raises_clearly(returns, baseline_config):
+    cfg = EngineConfig(
+        expected_returns=baseline_config.expected_returns,
+        bounds=baseline_config.bounds,
+        optimizer=OptimizerSpec(name="mean_variance", target_return=10.0),
+    )
+    with pytest.raises(RuntimeError, match=r"infeasible|status|Solver"):
+        run_engine(returns, cfg)
