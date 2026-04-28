@@ -1118,7 +1118,9 @@ git commit -m "feat: naive optimizers iterated bounds projection"
 
 **Files:**
 - Modify: `src/optimization_engine/optimizers/risk_parity.py`
+- Modify: `src/optimization_engine/optimizers/requirements.py`
 - Modify: `tests/test_optimizers.py`
+- Modify: `tests/test_requirements.py`
 
 - [ ] **Step 1: Write the failing test**
 
@@ -1237,18 +1239,50 @@ import pandas as pd
 from optimization_engine.optimizers.base import BaseOptimizer
 ```
 
-- [ ] **Step 4: Run tests**
+- [ ] **Step 4: Update the registry to reflect the new capabilities**
 
-```bash
-pytest tests/test_optimizers.py -v
+In `src/optimization_engine/optimizers/requirements.py`, find the `risk_parity` entry and flip the two flags that the constrained reformulation now actually honors:
+
+```python
+    "risk_parity": MethodRequirements(
+        name="risk_parity",
+        requires_mu=False, requires_cov=True, requires_returns=False,
+        supports_target_return=False, supports_target_volatility=False,
+        supports_risk_aversion=False, supports_risk_free_rate=False,
+        supports_group_bounds=True, bounds_mode="constrained",
+        supports_frontier=False, extras=(_RISK_BUDGET,),
+    ),
 ```
 
-Expected: all PASS, including the two new constrained-RP tests and the existing `test_risk_parity_equal_contributions`.
+In `tests/test_requirements.py`, update `EXPECTED_FLAGS["risk_parity"]` to match:
 
-- [ ] **Step 5: Commit**
+```python
+    "risk_parity": dict(
+        requires_mu=False, requires_cov=True, requires_returns=False,
+        supports_target_return=False, supports_target_volatility=False,
+        supports_risk_aversion=False, supports_risk_free_rate=False,
+        supports_group_bounds=True, bounds_mode="constrained",
+        supports_frontier=False,
+    ),
+```
+
+(Task 2 had set both to the conservative-but-current values `False` /
+`"soft_iterated"` because the old `_solve` only post-projected per-asset
+bounds. Now that the CVXPY reformulation enforces both per-asset and group
+bounds natively, the registry can advertise them.)
+
+- [ ] **Step 5: Run tests**
 
 ```bash
-git add src/optimization_engine/optimizers/risk_parity.py tests/test_optimizers.py
+.venv/Scripts/pytest.exe tests/test_optimizers.py tests/test_requirements.py -v
+```
+
+Expected: all PASS, including the two new constrained-RP tests, the existing `test_risk_parity_equal_contributions`, and the registry parametrized case for `risk_parity`.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add src/optimization_engine/optimizers/risk_parity.py src/optimization_engine/optimizers/requirements.py tests/test_optimizers.py tests/test_requirements.py
 git commit -m "feat: constrained risk-parity respects asset and group bounds"
 ```
 
