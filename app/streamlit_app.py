@@ -213,6 +213,34 @@ def _load_yahoo_cached(
     return load_prices_yahoo(list(tickers), period=period, interval=interval)
 
 
+def _frame_hash(df: pd.DataFrame) -> str:
+    return pd.util.hash_pandas_object(df, index=True).values.tobytes().hex()
+
+
+@st.cache_data(show_spinner=False, max_entries=16)
+def _covariance_cached(
+    returns_hash: str,
+    method: str,
+    ewma_lambda: float,
+    periods_per_year: int,
+    annualize: bool,
+    _returns: pd.DataFrame,
+) -> pd.DataFrame:
+    return covariance_matrix(
+        _returns, method=method, ewma_lambda=ewma_lambda,
+        periods_per_year=periods_per_year, annualize=annualize,
+    )
+
+
+@st.cache_data(show_spinner=False, max_entries=8)
+def _historical_mu_cached(
+    returns_hash: str,
+    periods_per_year: int,
+    _returns: pd.DataFrame,
+) -> pd.Series:
+    return (1 + _returns).prod() ** (periods_per_year / len(_returns)) - 1
+
+
 def _load_uploaded(file: io.BytesIO, sheet: str) -> pd.DataFrame:
     name = file.name.lower()
     if name.endswith((".xlsx", ".xls", ".xlsm")):
@@ -564,7 +592,9 @@ with tab_constraints:
         "asset-class constraints set below."
     )
 
-    historical_mu = (1 + returns).prod() ** (periods_per_year / len(returns)) - 1
+    historical_mu = _historical_mu_cached(
+        _frame_hash(returns), int(periods_per_year), returns,
+    )
 
     if "config_table" not in st.session_state or set(st.session_state.config_table.index) != set(returns.columns):
         st.session_state.config_table = pd.DataFrame(
@@ -627,7 +657,7 @@ with tab_constraints:
             )
 
         if st.button("Reset μ to method default", key="reset_mu_btn"):
-            from optimization_engine.data.covariance import expected_returns_from_history, covariance_matrix as _cov
+            from optimization_engine.data.covariance import expected_returns_from_history
 
             mw_for_capm = (
                 pd.Series(st.session_state.market_weights_table["Market weight"])
@@ -643,8 +673,12 @@ with tab_constraints:
                 market_return=float(st.session_state.get("market_return") or 0.0) or None,
                 risk_free_rate=float(risk_free_rate),
                 market_weights=mw_for_capm,
-                cov_matrix=_cov(returns, method=cov_method, ewma_lambda=ewma_lambda,
-                                periods_per_year=int(periods_per_year)),
+                cov_matrix=_covariance_cached(
+                    _frame_hash(returns),
+                    cov_method, float(ewma_lambda),
+                    int(periods_per_year), True,
+                    returns,
+                ),
             )
             st.session_state.config_table["Expected Return"] = seeded.round(4)
             st.rerun()
