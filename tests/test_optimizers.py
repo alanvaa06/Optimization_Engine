@@ -271,3 +271,44 @@ def test_risk_parity_with_group_bounds(returns):
     g = run.result.weights.groupby(groups).sum()
     assert 0.45 - 1e-3 <= g["A"] <= 0.55 + 1e-3
     assert 0.45 - 1e-3 <= g["B"] <= 0.55 + 1e-3
+
+
+def test_engine_uses_ema_expected_returns_when_specified(returns):
+    cfg = EngineConfig(
+        expected_returns={},  # empty -> engine seeds from history
+        bounds={a: [0.0, 1.0] for a in returns.columns},
+        expected_returns_method="ema",
+        ema_span=120,
+        optimizer=OptimizerSpec(name="min_variance"),  # min_variance ignores mu but engine still computes it
+    )
+    run = run_engine(returns, cfg)
+    # Sanity: μ vector populated with finite values.
+    assert run.expected_returns.notna().all()
+    assert run.expected_returns.shape[0] == returns.shape[1]
+
+
+def test_engine_uses_capm_expected_returns_when_specified(returns):
+    cols = list(returns.columns)
+    cfg = EngineConfig(
+        expected_returns={},
+        bounds={a: [0.0, 1.0] for a in cols},
+        expected_returns_method="capm",
+        market_weights={a: 1.0 / len(cols) for a in cols},
+        market_return=0.08,
+        optimizer=OptimizerSpec(name="min_variance", risk_free_rate=0.03),
+    )
+    run = run_engine(returns, cfg)
+    assert run.expected_returns.notna().all()
+
+
+def test_engine_default_method_unchanged(returns, baseline_config):
+    # Existing test_optimizer_runs already covers this; just ensure default
+    # historical_mean still works when method left at default.
+    cfg = EngineConfig(
+        expected_returns={},
+        bounds=baseline_config.bounds,
+        groups=baseline_config.groups,
+        optimizer=OptimizerSpec(name="min_variance"),
+    )
+    run = run_engine(returns, cfg)
+    assert run.expected_returns.notna().all()

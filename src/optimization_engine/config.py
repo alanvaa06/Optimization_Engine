@@ -52,6 +52,12 @@ class EngineConfig:
             ``shrink`` (Ledoit-Wolf via riskfolio when available),
             or ``ewma``.
         ewma_lambda: Decay used when ``covariance_method == "ewma"``.
+        expected_returns_method: How to seed expected returns when
+            ``expected_returns`` is empty: ``historical_mean``, ``ema``,
+            or ``capm``.
+        ema_span: Span for the ``ema`` method.
+        market_return: Optional CAPM market return (defaults to estimated).
+        market_weights: Optional CAPM market portfolio (defaults to equal).
         optimizer: ``OptimizerSpec`` describing the run.
         benchmark_weights: Optional benchmark weight vector for
             comparison.
@@ -66,6 +72,10 @@ class EngineConfig:
     periods_per_year: int = 252
     covariance_method: str = "ledoit_wolf"
     ewma_lambda: float = 0.94
+    expected_returns_method: Literal["historical_mean", "ema", "capm"] = "historical_mean"
+    ema_span: int = 180
+    market_return: float | None = None
+    market_weights: dict[str, float] | None = None
     optimizer: OptimizerSpec = field(default_factory=OptimizerSpec)
     benchmark_weights: dict[str, float] | None = None
 
@@ -90,6 +100,10 @@ class EngineConfig:
             "periods_per_year": self.periods_per_year,
             "covariance_method": self.covariance_method,
             "ewma_lambda": self.ewma_lambda,
+            "expected_returns_method": self.expected_returns_method,
+            "ema_span": self.ema_span,
+            "market_return": self.market_return,
+            "market_weights": (dict(self.market_weights) if self.market_weights else None),
             "optimizer": self.optimizer.to_dict(),
             "benchmark_weights": self.benchmark_weights,
         }
@@ -109,6 +123,18 @@ class EngineConfig:
             periods_per_year=int(data.get("periods_per_year", 252)),
             covariance_method=str(data.get("covariance_method", "ledoit_wolf")),
             ewma_lambda=float(data.get("ewma_lambda", 0.94)),
+            expected_returns_method=str(
+                data.get("expected_returns_method", "historical_mean")
+            ),
+            ema_span=int(data.get("ema_span", 180)),
+            market_return=(
+                float(data["market_return"])
+                if data.get("market_return") is not None else None
+            ),
+            market_weights=(
+                dict(data["market_weights"])
+                if data.get("market_weights") else None
+            ),
             optimizer=OptimizerSpec(**opt_raw),
             benchmark_weights=data.get("benchmark_weights"),
         )

@@ -113,10 +113,22 @@ def run_engine(
     if expected_returns is None and config.expected_returns:
         expected_returns = pd.Series(config.expected_returns)
     if expected_returns is None:
-        # default: annualized historical mean.
-        expected_returns = (1 + returns).prod() ** (
-            config.periods_per_year / len(returns)
-        ) - 1
+        from optimization_engine.data.covariance import expected_returns_from_history
+
+        market_w = (
+            pd.Series(config.market_weights) if config.market_weights else None
+        )
+        expected_returns = expected_returns_from_history(
+            returns,
+            method=("mean" if config.expected_returns_method == "historical_mean"
+                    else config.expected_returns_method),
+            periods_per_year=config.periods_per_year,
+            span=config.ema_span,
+            market_return=config.market_return,
+            risk_free_rate=config.optimizer.risk_free_rate,
+            market_weights=market_w,
+            cov_matrix=cov,
+        )
     expected_returns = expected_returns.reindex(returns.columns).fillna(0.0)
 
     optimizer = optimizer_factory(
