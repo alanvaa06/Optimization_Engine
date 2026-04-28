@@ -241,3 +241,33 @@ def test_naive_methods_respect_tight_bounds(returns, method):
     assert (w <= 0.2 + 1e-6).all()
     assert (w >= -1e-6).all()
     assert pytest.approx(w.sum(), abs=1e-4) == 1.0
+
+
+def test_constrained_risk_parity_respects_bounds(returns):
+    cfg = EngineConfig(
+        expected_returns={a: 0.05 for a in returns.columns},
+        bounds={a: [0.05, 0.25] for a in returns.columns},
+        optimizer=OptimizerSpec(name="risk_parity"),
+    )
+    run = run_engine(returns, cfg)
+    w = run.result.weights
+    assert (w >= 0.05 - 1e-5).all(), w[w < 0.05].to_dict()
+    assert (w <= 0.25 + 1e-5).all(), w[w > 0.25].to_dict()
+    assert pytest.approx(w.sum(), abs=1e-4) == 1.0
+
+
+def test_risk_parity_with_group_bounds(returns):
+    cols = list(returns.columns)
+    half = len(cols) // 2
+    groups = {a: ("A" if i < half else "B") for i, a in enumerate(cols)}
+    cfg = EngineConfig(
+        expected_returns={a: 0.05 for a in cols},
+        bounds={a: [0.0, 1.0] for a in cols},
+        groups=groups,
+        group_bounds={"A": [0.45, 0.55], "B": [0.45, 0.55]},
+        optimizer=OptimizerSpec(name="risk_parity"),
+    )
+    run = run_engine(returns, cfg)
+    g = run.result.weights.groupby(groups).sum()
+    assert 0.45 - 1e-3 <= g["A"] <= 0.55 + 1e-3
+    assert 0.45 - 1e-3 <= g["B"] <= 0.55 + 1e-3

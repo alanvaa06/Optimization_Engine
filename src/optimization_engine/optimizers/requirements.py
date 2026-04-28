@@ -109,9 +109,7 @@ REQUIREMENTS: dict[str, MethodRequirements] = {
         requires_mu=False, requires_cov=True, requires_returns=False,
         supports_target_return=False, supports_target_volatility=False,
         supports_risk_aversion=False, supports_risk_free_rate=False,
-        # NB: flips to True + bounds_mode="constrained" once Task 7 lands a
-        # CVXPY reformulation that honours per-asset and group bounds natively.
-        supports_group_bounds=False, bounds_mode="soft_iterated",
+        supports_group_bounds=True, bounds_mode="constrained",
         supports_frontier=False, extras=(_RISK_BUDGET,),
     ),
     "hrp": MethodRequirements(
