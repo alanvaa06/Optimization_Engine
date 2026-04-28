@@ -1515,7 +1515,7 @@ with tab_optimize:
             use_container_width=True,
         )
 
-    if run.frontier is not None:
+    if run.frontier is not None and ws["frontier"]["enabled"]:
         st.markdown("### Efficient Frontier")
         st.plotly_chart(
             plot_efficient_frontier(run.frontier.summary, run.frontier.max_sharpe_index),
