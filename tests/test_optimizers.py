@@ -157,13 +157,20 @@ def test_risk_parity_equal_contributions(returns: pd.DataFrame):
 
 
 def test_factory_raises_when_required_mu_missing(returns):
+    # Test the factory directly: empty config + no override -> ConfigurationError.
+    # (run_engine has a historical-mean fallback that fills mu in that case;
+    # this validation matters for direct factory use.)
+    from optimization_engine.data.covariance import covariance_matrix
+    from optimization_engine.optimizers.factory import optimizer_factory
+
     cfg = EngineConfig(
-        expected_returns={},  # empty -> required for mean_variance
+        expected_returns={},
         bounds={a: [0.0, 1.0] for a in returns.columns},
         optimizer=OptimizerSpec(name="mean_variance"),
     )
+    cov = covariance_matrix(returns, method="ledoit_wolf")
     with pytest.raises(ConfigurationError, match="expected_returns"):
-        run_engine(returns, cfg)
+        optimizer_factory(cfg, cov, expected_returns=None, returns=returns)
 
 
 def test_factory_raises_when_returns_missing_for_cvar(returns):
