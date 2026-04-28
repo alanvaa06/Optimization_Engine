@@ -1027,19 +1027,28 @@ with tab_whatif:
         st.session_state.whatif_overrides = overrides
 
         st.markdown("**Optimizer extras**")
-        extras: dict[str, float] = dict(st.session_state.whatif_extra)
-        opt_name = anchor_cfg.optimizer.name
-        if opt_name == "mean_variance":
-            mode_choices = ["Target return", "Target volatility", "Utility"]
+        from optimization_engine.optimizers.requirements import requirements_for as _req_for
+
+        req = _req_for(opt_name)
+        extras: dict[str, object] = dict(st.session_state.whatif_extra)
+
+        if req.supports_target_return or req.supports_target_volatility:
+            modes = []
+            if req.supports_target_return:
+                modes.append("Target return")
+            if req.supports_target_volatility:
+                modes.append("Target volatility")
+            if req.supports_risk_aversion:
+                modes.append("Utility")
             if anchor_cfg.optimizer.target_return is not None:
                 default_mode = "Target return"
             elif anchor_cfg.optimizer.target_volatility is not None:
                 default_mode = "Target volatility"
             else:
-                default_mode = "Utility"
+                default_mode = modes[0]
             wf_mode = st.radio(
-                "Mode", mode_choices,
-                index=mode_choices.index(default_mode),
+                "Mode", modes,
+                index=modes.index(default_mode) if default_mode in modes else 0,
                 horizontal=True,
                 key="whatif_mv_mode",
             )
@@ -1070,13 +1079,54 @@ with tab_whatif:
                     "target_volatility": None,
                     "risk_aversion": float(ra),
                 }
-        elif opt_name == "cvar":
-            ca = st.slider(
-                "CVaR tail prob α", 0.01, 0.20,
-                float(anchor_cfg.optimizer.cvar_alpha or 0.05), 0.01,
-                key="whatif_cvar_alpha",
-            )
-            extras = {"cvar_alpha": float(ca)}
+
+        for extra in req.extras:
+            if extra.kind == "scalar" and extra.key == "cvar_alpha":
+                ca = st.slider(
+                    "CVaR tail prob α", 0.01, 0.20,
+                    float(anchor_cfg.optimizer.cvar_alpha or 0.05), 0.01,
+                    key="whatif_cvar_alpha",
+                )
+                extras["cvar_alpha"] = float(ca)
+            elif extra.kind == "scalar" and extra.key == "bl_tau":
+                tau = st.slider(
+                    "τ (prior uncertainty)", 0.01, 0.5,
+                    float(anchor_cfg.optimizer.bl_tau or 0.05), 0.01,
+                    key="whatif_bl_tau",
+                )
+                extras["bl_tau"] = float(tau)
+            elif extra.kind == "choice" and extra.key == "hrp_linkage":
+                lk = st.selectbox(
+                    "HRP linkage", list(extra.choices or ()),
+                    index=(extra.choices or ("single",)).index(
+                        anchor_cfg.optimizer.hrp_linkage or "single"
+                    ),
+                    key="whatif_hrp_linkage",
+                )
+                extras["hrp_linkage"] = str(lk)
+            elif extra.kind == "per_asset" and extra.key == "risk_budget":
+                # Editable risk budget as a small frame.
+                rb_idx = list(anchor_cfg.expected_returns.keys())
+                default_rb = anchor_cfg.optimizer.risk_budget or {
+                    a: 1.0 / len(rb_idx) for a in rb_idx
+                }
+                rb_df = pd.DataFrame(
+                    {"Risk Budget": [default_rb.get(a, 0.0) for a in rb_idx]},
+                    index=rb_idx,
+                )
+                rb_df = st.data_editor(
+                    rb_df, num_rows="fixed",
+                    column_config={
+                        "Risk Budget": st.column_config.NumberColumn(
+                            min_value=0.0, max_value=1.0, step=0.01, format="%.3f",
+                        ),
+                    },
+                    key="whatif_rb_editor",
+                )
+                extras["risk_budget"] = rb_df["Risk Budget"].to_dict()
+            # view tables and market caps are skipped in What-if to keep it light;
+            # users can edit those in the constraints tab.
+
         st.session_state.whatif_extra = extras
 
         # Build the live config from anchor + overrides + extras.
