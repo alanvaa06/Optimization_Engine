@@ -213,6 +213,7 @@ def _load_yahoo_cached(
     return load_prices_yahoo(list(tickers), period=period, interval=interval)
 
 
+@st.cache_data(show_spinner=False, max_entries=16)
 def _frame_hash(df: pd.DataFrame) -> str:
     return pd.util.hash_pandas_object(df, index=True).values.tobytes().hex()
 
@@ -667,7 +668,7 @@ with tab_constraints:
             )
             seeded = expected_returns_from_history(
                 returns,
-                method=er_method,
+                method=("mean" if er_method == "historical_mean" else er_method),
                 periods_per_year=int(periods_per_year),
                 span=int(st.session_state.get("ema_span", 180)),
                 market_return=float(st.session_state.get("market_return") or 0.0) or None,
@@ -1063,7 +1064,7 @@ with tab_whatif:
         st.markdown("**Optimizer extras**")
         from optimization_engine.optimizers.requirements import requirements_for as _req_for
 
-        req = _req_for(opt_name)
+        req = _req_for(anchor_cfg.optimizer.name)
         extras: dict[str, object] = dict(st.session_state.whatif_extra)
 
         if req.supports_target_return or req.supports_target_volatility:
