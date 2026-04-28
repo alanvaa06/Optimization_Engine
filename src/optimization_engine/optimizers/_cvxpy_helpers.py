@@ -8,42 +8,6 @@ import numpy as np
 from optimization_engine.optimizers.base import PortfolioConstraints
 
 
-def project_to_bounds(
-    w: np.ndarray, lb: np.ndarray, ub: np.ndarray, max_iter: int = 100
-) -> np.ndarray:
-    """Project ``w`` into ``[lb, ub]`` while preserving ``Σ w = 1``.
-
-    Iteratively clips violators and redistributes residual mass to assets
-    that still have headroom. Falls back to a single clipped renorm when
-    the bounds are themselves infeasible.
-    """
-    w = np.asarray(w, dtype=float).copy()
-    if lb.sum() > 1 + 1e-9 or ub.sum() < 1 - 1e-9:
-        clipped = np.clip(w, lb, ub)
-        s = clipped.sum()
-        return clipped / s if s > 0 else clipped
-
-    w = np.clip(w, lb, ub)
-    for _ in range(max_iter):
-        s = w.sum()
-        diff = 1.0 - s
-        if abs(diff) < 1e-10:
-            return w
-        if diff > 0:
-            slack = ub - w
-            mask = slack > 1e-12
-        else:
-            slack = w - lb
-            mask = slack > 1e-12
-        if not mask.any():
-            return w
-        share = slack * mask
-        share = share / share.sum()
-        w = w + diff * share
-        w = np.clip(w, lb, ub)
-    return w
-
-
 def bounds_arrays(
     assets: list[str], constraints: PortfolioConstraints
 ) -> tuple[np.ndarray, np.ndarray]:
