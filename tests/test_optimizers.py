@@ -214,3 +214,16 @@ def test_hrp_linkage_methods(returns, baseline_config, linkage):
     assert pytest.approx(w.sum(), abs=1e-3) == 1.0
     assert (w >= -1e-6).all()
     assert (w <= 0.5 + 1e-6).all()
+
+
+def test_max_diversification_respects_tight_bounds(returns):
+    cfg = EngineConfig(
+        expected_returns={a: 0.05 for a in returns.columns},
+        bounds={a: [0.0, 0.3] for a in returns.columns},
+        optimizer=OptimizerSpec(name="max_diversification"),
+    )
+    run = run_engine(returns, cfg)
+    w = run.result.weights
+    assert (w <= 0.3 + 1e-6).all(), w[w > 0.3].to_dict()
+    assert (w >= -1e-6).all()
+    assert pytest.approx(w.sum(), abs=1e-4) == 1.0
