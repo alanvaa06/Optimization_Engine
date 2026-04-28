@@ -68,6 +68,7 @@ from optimization_engine.reporting.plots import (  # noqa: E402
     plot_wealth_index,
 )
 from optimization_engine.ui_state import (  # noqa: E402
+    derive_widget_state,
     yahoo_cache_key,
     yahoo_prices_for_rerun,
 )
@@ -350,11 +351,14 @@ with st.sidebar:
         key="optimizer_name",
         help="Choose the optimization technique.",
     )
+    ws = derive_widget_state(optimizer_name)
     risk_free_rate = st.number_input(
         "Risk-free rate (annual)",
         min_value=0.0, max_value=0.30,
         value=0.04, step=0.005, format="%.4f",
         key="risk_free_rate",
+        disabled=not ws["risk_free_rate"]["enabled"],
+        help=ws["risk_free_rate"]["tooltip"],
     )
     periods_per_year = st.number_input(
         "Periods per year", min_value=1, max_value=365, value=252,
@@ -365,10 +369,17 @@ with st.sidebar:
         options=["ledoit_wolf", "sample", "oas", "ewma", "semi", "shrink"],
         index=0,
         key="cov_method",
+        disabled=not ws["cov_method"]["enabled"],
+        help=ws["cov_method"]["tooltip"],
     )
     ewma_lambda = (
-        st.slider("EWMA λ", 0.80, 0.999, 0.94, 0.005, key="ewma_lambda")
-        if cov_method == "ewma"
+        st.slider(
+            "EWMA λ", 0.80, 0.999, 0.94, 0.005,
+            key="ewma_lambda",
+            disabled=not ws["ewma_lambda"]["enabled"],
+            help=ws["ewma_lambda"]["tooltip"],
+        )
+        if cov_method == "ewma" and ws["cov_method"]["enabled"]
         else 0.94
     )
 
@@ -378,10 +389,24 @@ with st.sidebar:
     cvar_alpha = 0.05
     risk_budget: dict[str, float] | None = None
 
-    if optimizer_name == "mean_variance":
+    # The Mode radio is for methods that genuinely offer >1 mode
+    # (mean_variance and Black-Litterman). CVaR has only target_return and
+    # is handled in its own block below.
+    show_mode_radio = (
+        optimizer_name != "cvar"
+        and (ws["target_return"]["enabled"] or ws["target_volatility"]["enabled"])
+        and ws["risk_aversion"]["enabled"]
+    )
+    if show_mode_radio:
+        modes = []
+        if ws["target_return"]["enabled"]:
+            modes.append("Target return")
+        if ws["target_volatility"]["enabled"]:
+            modes.append("Target volatility")
+        if ws["risk_aversion"]["enabled"]:
+            modes.append("Utility")
         mode = st.radio(
-            "Mode", ["Target return", "Target volatility", "Utility"],
-            horizontal=True, key="mv_mode",
+            "Mode", modes, horizontal=True, key="mv_mode",
         )
         if mode == "Target return":
             target_return = st.number_input(
@@ -395,7 +420,7 @@ with st.sidebar:
             )
         else:
             risk_aversion = st.slider("Risk aversion λ", 0.1, 20.0, 2.5, key="risk_aversion")
-    elif optimizer_name == "cvar":
+    if optimizer_name == "cvar":
         cvar_alpha = st.slider(
             "CVaR tail prob α", 0.01, 0.20, 0.05, 0.01,
             key="cvar_alpha",
@@ -409,8 +434,18 @@ with st.sidebar:
 
     st.divider()
     st.header("4 · Frontier")
-    build_frontier = st.checkbox("Build efficient frontier", value=True)
-    n_frontier_points = st.slider("Frontier points", 5, 100, 25)
+    build_frontier = st.checkbox(
+        "Build efficient frontier",
+        value=True,
+        disabled=not ws["frontier"]["enabled"],
+        help=ws["frontier"]["tooltip"],
+    )
+    n_frontier_points = st.slider(
+        "Frontier points", 5, 100, 25,
+        disabled=not ws["frontier"]["enabled"],
+    )
+    if not ws["frontier"]["enabled"]:
+        build_frontier = False
 
 
 # ---------------------------------------------------------------------------
