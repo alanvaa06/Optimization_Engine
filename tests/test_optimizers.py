@@ -227,3 +227,17 @@ def test_max_diversification_respects_tight_bounds(returns):
     assert (w <= 0.3 + 1e-6).all(), w[w > 0.3].to_dict()
     assert (w >= -1e-6).all()
     assert pytest.approx(w.sum(), abs=1e-4) == 1.0
+
+
+@pytest.mark.parametrize("method", ["equal_weight", "inverse_vol"])
+def test_naive_methods_respect_tight_bounds(returns, method):
+    cfg = EngineConfig(
+        expected_returns={a: 0.05 for a in returns.columns},
+        bounds={a: [0.0, 0.2] for a in returns.columns},
+        optimizer=OptimizerSpec(name=method),
+    )
+    run = run_engine(returns, cfg)
+    w = run.result.weights
+    assert (w <= 0.2 + 1e-6).all()
+    assert (w >= -1e-6).all()
+    assert pytest.approx(w.sum(), abs=1e-4) == 1.0
