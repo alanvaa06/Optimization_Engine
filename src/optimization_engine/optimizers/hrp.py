@@ -18,7 +18,8 @@ import pandas as pd
 from scipy.cluster.hierarchy import linkage
 from scipy.spatial.distance import squareform
 
-from optimization_engine.optimizers._cvxpy_helpers import bounds_arrays, project_to_bounds
+from optimization_engine.optimizers._bounds import project_to_bounds_iterated
+from optimization_engine.optimizers._cvxpy_helpers import bounds_arrays
 from optimization_engine.optimizers.base import BaseOptimizer
 
 
@@ -111,4 +112,4 @@ class HRPOptimizer(BaseOptimizer):
         w = w.reindex(self.assets).fillna(0.0)
         weights = w.values.astype(float)
         lb, ub = bounds_arrays(self.assets, self.constraints)
-        return project_to_bounds(weights, lb, ub)
+        return project_to_bounds_iterated(weights, lb, ub)

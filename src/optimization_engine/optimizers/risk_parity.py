@@ -16,7 +16,6 @@ import cvxpy as cp
 import numpy as np
 import pandas as pd
 
-from optimization_engine.optimizers._cvxpy_helpers import bounds_arrays, project_to_bounds
 from optimization_engine.optimizers.base import BaseOptimizer
 
 
@@ -49,10 +48,37 @@ class RiskParityOptimizer(BaseOptimizer):
             raise ValueError("Risk budget must sum to a positive number")
         b = b / b.sum()
 
+        lb_arr = np.array(
+            [float(self.constraints.get_bounds(a)[0]) for a in self.assets]
+        )
+        ub_arr = np.array(
+            [float(self.constraints.get_bounds(a)[1]) for a in self.assets]
+        )
+        # Strict positivity for the log-barrier; tighten lb a hair if zero.
+        lb_pos = np.maximum(lb_arr, 1e-8)
+
         y = cp.Variable(n, pos=True)
         sigma_psd = cp.psd_wrap(sigma)
+        total = cp.sum(y)
+        cons: list = [
+            y >= cp.multiply(lb_pos, total),
+            y <= cp.multiply(ub_arr, total),
+        ]
+
+        if self.constraints.groups and self.constraints.group_bounds:
+            grouped: dict[str, list[int]] = {}
+            for i, a in enumerate(self.assets):
+                g = self.constraints.groups.get(a)
+                if g is not None:
+                    grouped.setdefault(g, []).append(i)
+            for g, idx in grouped.items():
+                if g in self.constraints.group_bounds:
+                    g_lb, g_ub = self.constraints.group_bounds[g]
+                    cons.append(cp.sum(y[idx]) >= float(g_lb) * total)
+                    cons.append(cp.sum(y[idx]) <= float(g_ub) * total)
+
         objective = cp.Minimize(0.5 * cp.quad_form(y, sigma_psd) - b @ cp.log(y))
-        problem = cp.Problem(objective)
+        problem = cp.Problem(objective, cons)
         try:
             problem.solve()
         except cp.SolverError:
@@ -61,8 +87,8 @@ class RiskParityOptimizer(BaseOptimizer):
             raise RuntimeError(f"Solver failed: status={problem.status}")
 
         w = np.array(y.value) / float(np.sum(y.value))
-        lb, ub = bounds_arrays(self.assets, self.constraints)
-        return project_to_bounds(w, lb, ub)
+        # Clamp tiny floating drift back into the box.
+        return np.clip(w, lb_arr, ub_arr)
 
     def risk_contributions(self, weights: np.ndarray | pd.Series) -> pd.Series:
         sigma = self._sigma_matrix()

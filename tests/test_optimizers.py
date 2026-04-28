@@ -19,6 +19,7 @@ from optimization_engine.data.covariance import covariance_matrix
 from optimization_engine.data.loader import prices_to_returns, sample_dataset
 from optimization_engine.engine import run_engine
 from optimization_engine.optimizers.factory import available_optimizers
+from optimization_engine.optimizers import ConfigurationError
 
 
 @pytest.fixture(scope="module")
@@ -153,3 +154,218 @@ def test_risk_parity_equal_contributions(returns: pd.DataFrame):
     rc = rc / rc.sum()
     target = np.ones_like(rc) / len(rc)
     assert np.max(np.abs(rc - target)) < 0.05  # ERC: roughly equal
+
+
+def test_factory_raises_when_required_mu_missing(returns):
+    # Test the factory directly: empty config + no override -> ConfigurationError.
+    # (run_engine has a historical-mean fallback that fills mu in that case;
+    # this validation matters for direct factory use.)
+    from optimization_engine.data.covariance import covariance_matrix
+    from optimization_engine.optimizers.factory import optimizer_factory
+
+    cfg = EngineConfig(
+        expected_returns={},
+        bounds={a: [0.0, 1.0] for a in returns.columns},
+        optimizer=OptimizerSpec(name="mean_variance"),
+    )
+    cov = covariance_matrix(returns, method="ledoit_wolf")
+    with pytest.raises(ConfigurationError, match="expected_returns"):
+        optimizer_factory(cfg, cov, expected_returns=None, returns=returns)
+
+
+def test_factory_raises_when_returns_missing_for_cvar(returns):
+    # CVaR needs the returns DataFrame; we exercise the factory directly
+    # because the engine always supplies returns.
+    from optimization_engine.data.covariance import covariance_matrix
+    from optimization_engine.optimizers.factory import optimizer_factory
+
+    cfg = EngineConfig(
+        expected_returns={a: 0.05 for a in returns.columns},
+        bounds={a: [0.0, 1.0] for a in returns.columns},
+        optimizer=OptimizerSpec(name="cvar"),
+    )
+    cov = covariance_matrix(returns, method="ledoit_wolf")
+    with pytest.raises(ConfigurationError, match="returns"):
+        optimizer_factory(cfg, cov, expected_returns=None, returns=None)
+
+
+def test_factory_warns_on_incompatible_target_return(returns, baseline_config, caplog):
+    import logging
+    cfg = EngineConfig(
+        expected_returns=baseline_config.expected_returns,
+        bounds=baseline_config.bounds,
+        optimizer=OptimizerSpec(name="hrp", target_return=0.05),
+    )
+    with caplog.at_level(logging.WARNING):
+        run_engine(returns, cfg)
+    assert any("target_return" in r.message for r in caplog.records)
+
+
+@pytest.mark.parametrize("linkage", ["single", "average", "complete", "ward"])
+def test_hrp_linkage_methods(returns, baseline_config, linkage):
+    cfg = EngineConfig(
+        expected_returns=baseline_config.expected_returns,
+        bounds=baseline_config.bounds,
+        groups=baseline_config.groups,
+        optimizer=OptimizerSpec(name="hrp", hrp_linkage=linkage),
+    )
+    run = run_engine(returns, cfg)
+    w = run.result.weights
+    assert pytest.approx(w.sum(), abs=1e-3) == 1.0
+    assert (w >= -1e-6).all()
+    assert (w <= 0.5 + 1e-6).all()
+
+
+def test_max_diversification_respects_tight_bounds(returns):
+    cfg = EngineConfig(
+        expected_returns={a: 0.05 for a in returns.columns},
+        bounds={a: [0.0, 0.3] for a in returns.columns},
+        optimizer=OptimizerSpec(name="max_diversification"),
+    )
+    run = run_engine(returns, cfg)
+    w = run.result.weights
+    assert (w <= 0.3 + 1e-6).all(), w[w > 0.3].to_dict()
+    assert (w >= -1e-6).all()
+    assert pytest.approx(w.sum(), abs=1e-4) == 1.0
+
+
+@pytest.mark.parametrize("method", ["equal_weight", "inverse_vol"])
+def test_naive_methods_respect_tight_bounds(returns, method):
+    cfg = EngineConfig(
+        expected_returns={a: 0.05 for a in returns.columns},
+        bounds={a: [0.0, 0.2] for a in returns.columns},
+        optimizer=OptimizerSpec(name=method),
+    )
+    run = run_engine(returns, cfg)
+    w = run.result.weights
+    assert (w <= 0.2 + 1e-6).all()
+    assert (w >= -1e-6).all()
+    assert pytest.approx(w.sum(), abs=1e-4) == 1.0
+
+
+def test_constrained_risk_parity_respects_bounds(returns):
+    cfg = EngineConfig(
+        expected_returns={a: 0.05 for a in returns.columns},
+        bounds={a: [0.05, 0.25] for a in returns.columns},
+        optimizer=OptimizerSpec(name="risk_parity"),
+    )
+    run = run_engine(returns, cfg)
+    w = run.result.weights
+    assert (w >= 0.05 - 1e-5).all(), w[w < 0.05].to_dict()
+    assert (w <= 0.25 + 1e-5).all(), w[w > 0.25].to_dict()
+    assert pytest.approx(w.sum(), abs=1e-4) == 1.0
+
+
+def test_risk_parity_with_group_bounds(returns):
+    cols = list(returns.columns)
+    half = len(cols) // 2
+    groups = {a: ("A" if i < half else "B") for i, a in enumerate(cols)}
+    cfg = EngineConfig(
+        expected_returns={a: 0.05 for a in cols},
+        bounds={a: [0.0, 1.0] for a in cols},
+        groups=groups,
+        group_bounds={"A": [0.45, 0.55], "B": [0.45, 0.55]},
+        optimizer=OptimizerSpec(name="risk_parity"),
+    )
+    run = run_engine(returns, cfg)
+    g = run.result.weights.groupby(groups).sum()
+    assert 0.45 - 1e-3 <= g["A"] <= 0.55 + 1e-3
+    assert 0.45 - 1e-3 <= g["B"] <= 0.55 + 1e-3
+
+
+def test_engine_uses_ema_expected_returns_when_specified(returns):
+    cfg = EngineConfig(
+        expected_returns={},  # empty -> engine seeds from history
+        bounds={a: [0.0, 1.0] for a in returns.columns},
+        expected_returns_method="ema",
+        ema_span=120,
+        optimizer=OptimizerSpec(name="min_variance"),  # min_variance ignores mu but engine still computes it
+    )
+    run = run_engine(returns, cfg)
+    # Sanity: μ vector populated with finite values.
+    assert run.expected_returns.notna().all()
+    assert run.expected_returns.shape[0] == returns.shape[1]
+
+
+def test_engine_uses_capm_expected_returns_when_specified(returns):
+    cols = list(returns.columns)
+    cfg = EngineConfig(
+        expected_returns={},
+        bounds={a: [0.0, 1.0] for a in cols},
+        expected_returns_method="capm",
+        market_weights={a: 1.0 / len(cols) for a in cols},
+        market_return=0.08,
+        optimizer=OptimizerSpec(name="min_variance", risk_free_rate=0.03),
+    )
+    run = run_engine(returns, cfg)
+    assert run.expected_returns.notna().all()
+
+
+def test_engine_default_method_unchanged(returns, baseline_config):
+    # Existing test_optimizer_runs already covers this; just ensure default
+    # historical_mean still works when method left at default.
+    cfg = EngineConfig(
+        expected_returns={},
+        bounds=baseline_config.bounds,
+        groups=baseline_config.groups,
+        optimizer=OptimizerSpec(name="min_variance"),
+    )
+    run = run_engine(returns, cfg)
+    assert run.expected_returns.notna().all()
+
+
+def test_cvar_with_target_return(returns, baseline_config):
+    target = 0.05
+    cfg = EngineConfig(
+        expected_returns=baseline_config.expected_returns,
+        bounds=baseline_config.bounds,
+        groups=baseline_config.groups,
+        optimizer=OptimizerSpec(
+            name="cvar", cvar_alpha=0.05, target_return=target,
+        ),
+    )
+    run = run_engine(returns, cfg)
+    assert run.result.expected_return >= target - 1e-3
+
+
+def test_black_litterman_no_views_runs(returns, baseline_config):
+    cfg = EngineConfig(
+        expected_returns=baseline_config.expected_returns,
+        bounds=baseline_config.bounds,
+        groups=baseline_config.groups,
+        group_bounds=baseline_config.group_bounds,
+        optimizer=OptimizerSpec(name="black_litterman", risk_aversion=2.5),
+    )
+    run = run_engine(returns, cfg)
+    assert pytest.approx(run.result.weights.sum(), abs=1e-3) == 1.0
+    assert (run.result.weights >= -1e-6).all()
+
+
+@pytest.mark.parametrize("method", [
+    "mean_variance", "min_variance", "max_sharpe", "cvar", "black_litterman",
+])
+def test_group_bounds_enforced_for_hard_methods(returns, method):
+    cols = list(returns.columns)
+    half = len(cols) // 2
+    groups = {a: ("A" if i < half else "B") for i, a in enumerate(cols)}
+    cfg = EngineConfig(
+        expected_returns={a: 0.05 for a in cols},
+        bounds={a: [0.0, 1.0] for a in cols},
+        groups=groups,
+        group_bounds={"A": [0.4, 0.6], "B": [0.4, 0.6]},
+        optimizer=OptimizerSpec(name=method, risk_free_rate=0.0),
+    )
+    run = run_engine(returns, cfg)
+    g = run.result.weights.groupby(groups).sum()
+    assert 0.4 - 2e-3 <= g["A"] <= 0.6 + 2e-3, g.to_dict()
+    assert 0.4 - 2e-3 <= g["B"] <= 0.6 + 2e-3, g.to_dict()
+
+
+def test_infeasible_target_raises_clearly(returns, baseline_config):
+    cfg = EngineConfig(
+        expected_returns=baseline_config.expected_returns,
+        bounds=baseline_config.bounds,
+        optimizer=OptimizerSpec(name="mean_variance", target_return=10.0),
+    )
+    with pytest.raises(RuntimeError, match=r"infeasible|status|Solver"):
+        run_engine(returns, cfg)

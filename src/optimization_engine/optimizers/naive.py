@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import numpy as np
 
-from optimization_engine.optimizers._cvxpy_helpers import bounds_arrays, project_to_bounds
+from optimization_engine.optimizers._bounds import project_to_bounds_iterated
+from optimization_engine.optimizers._cvxpy_helpers import bounds_arrays
 from optimization_engine.optimizers.base import BaseOptimizer
 
 
@@ -17,7 +18,7 @@ class EqualWeightOptimizer(BaseOptimizer):
         n = len(self.assets)
         w = np.ones(n) / n
         lb, ub = bounds_arrays(self.assets, self.constraints)
-        return project_to_bounds(w, lb, ub)
+        return project_to_bounds_iterated(w, lb, ub)
 
 
 class InverseVolatilityOptimizer(BaseOptimizer):
@@ -37,4 +38,4 @@ class InverseVolatilityOptimizer(BaseOptimizer):
             raise RuntimeError("All variances are zero or NaN")
         w = inv / inv.sum()
         lb, ub = bounds_arrays(self.assets, self.constraints)
-        return project_to_bounds(w, lb, ub)
+        return project_to_bounds_iterated(w, lb, ub)

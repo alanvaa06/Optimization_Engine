@@ -67,6 +67,11 @@ from optimization_engine.reporting.plots import (  # noqa: E402
     plot_risk_contributions,
     plot_wealth_index,
 )
+from optimization_engine.ui_state import (  # noqa: E402
+    derive_widget_state,
+    yahoo_cache_key,
+    yahoo_prices_for_rerun,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -208,6 +213,35 @@ def _load_yahoo_cached(
     return load_prices_yahoo(list(tickers), period=period, interval=interval)
 
 
+@st.cache_data(show_spinner=False, max_entries=16)
+def _frame_hash(df: pd.DataFrame) -> str:
+    return pd.util.hash_pandas_object(df, index=True).values.tobytes().hex()
+
+
+@st.cache_data(show_spinner=False, max_entries=16)
+def _covariance_cached(
+    returns_hash: str,
+    method: str,
+    ewma_lambda: float,
+    periods_per_year: int,
+    annualize: bool,
+    _returns: pd.DataFrame,
+) -> pd.DataFrame:
+    return covariance_matrix(
+        _returns, method=method, ewma_lambda=ewma_lambda,
+        periods_per_year=periods_per_year, annualize=annualize,
+    )
+
+
+@st.cache_data(show_spinner=False, max_entries=8)
+def _historical_mu_cached(
+    returns_hash: str,
+    periods_per_year: int,
+    _returns: pd.DataFrame,
+) -> pd.Series:
+    return (1 + _returns).prod() ** (periods_per_year / len(_returns)) - 1
+
+
 def _load_uploaded(file: io.BytesIO, sheet: str) -> pd.DataFrame:
     name = file.name.lower()
     if name.endswith((".xlsx", ".xls", ".xlsm")):
@@ -277,26 +311,38 @@ with st.sidebar:
             "Interval", options=["1d", "1wk", "1mo"], index=0
         )
 
-        if not st.button("Fetch from Yahoo", type="primary"):
-            st.info("Set tickers and click **Fetch from Yahoo** to download prices.")
-            st.stop()
+        fetch_clicked = st.button("Fetch from Yahoo", type="primary")
+
+        tickers_tuple = tuple(t for t in yahoo_tickers.replace(",", " ").split() if t)
+        cache_key = yahoo_cache_key(
+            tickers_tuple,
+            yahoo_period,
+            yahoo_start,
+            yahoo_end,
+            yahoo_interval,
+        )
 
         try:
-            tickers_tuple = tuple(
-                t for t in yahoo_tickers.replace(",", " ").split() if t
-            )
-            prices = _load_yahoo_cached(
-                tickers_tuple,
-                period=yahoo_period,
-                start=yahoo_start,
-                end=yahoo_end,
-                interval=yahoo_interval,
+            prices = yahoo_prices_for_rerun(
+                fetch_clicked=fetch_clicked,
+                cache_key=cache_key,
+                state=st.session_state,
+                fetch_prices=lambda: _load_yahoo_cached(
+                    tickers_tuple,
+                    period=yahoo_period,
+                    start=yahoo_start,
+                    end=yahoo_end,
+                    interval=yahoo_interval,
+                ),
             )
         except YahooFinanceError as exc:
             st.error(f"Yahoo Finance error: {exc}")
             st.stop()
         except Exception as exc:  # network / library issues
             st.error(f"Could not load Yahoo prices: {exc}")
+            st.stop()
+        if prices is None:
+            st.info("Set tickers and click **Fetch from Yahoo** to download prices.")
             st.stop()
 
     st.success(f"Loaded {prices.shape[0]} rows × {prices.shape[1]} assets")
@@ -334,11 +380,14 @@ with st.sidebar:
         key="optimizer_name",
         help="Choose the optimization technique.",
     )
+    ws = derive_widget_state(optimizer_name)
     risk_free_rate = st.number_input(
         "Risk-free rate (annual)",
         min_value=0.0, max_value=0.30,
         value=0.04, step=0.005, format="%.4f",
         key="risk_free_rate",
+        disabled=not ws["risk_free_rate"]["enabled"],
+        help=ws["risk_free_rate"]["tooltip"],
     )
     periods_per_year = st.number_input(
         "Periods per year", min_value=1, max_value=365, value=252,
@@ -349,10 +398,17 @@ with st.sidebar:
         options=["ledoit_wolf", "sample", "oas", "ewma", "semi", "shrink"],
         index=0,
         key="cov_method",
+        disabled=not ws["cov_method"]["enabled"],
+        help=ws["cov_method"]["tooltip"],
     )
     ewma_lambda = (
-        st.slider("EWMA λ", 0.80, 0.999, 0.94, 0.005, key="ewma_lambda")
-        if cov_method == "ewma"
+        st.slider(
+            "EWMA λ", 0.80, 0.999, 0.94, 0.005,
+            key="ewma_lambda",
+            disabled=not ws["ewma_lambda"]["enabled"],
+            help=ws["ewma_lambda"]["tooltip"],
+        )
+        if cov_method == "ewma" and ws["cov_method"]["enabled"]
         else 0.94
     )
 
@@ -362,10 +418,24 @@ with st.sidebar:
     cvar_alpha = 0.05
     risk_budget: dict[str, float] | None = None
 
-    if optimizer_name == "mean_variance":
+    # The Mode radio is for methods that genuinely offer >1 mode
+    # (mean_variance and Black-Litterman). CVaR has only target_return and
+    # is handled in its own block below.
+    show_mode_radio = (
+        optimizer_name != "cvar"
+        and (ws["target_return"]["enabled"] or ws["target_volatility"]["enabled"])
+        and ws["risk_aversion"]["enabled"]
+    )
+    if show_mode_radio:
+        modes = []
+        if ws["target_return"]["enabled"]:
+            modes.append("Target return")
+        if ws["target_volatility"]["enabled"]:
+            modes.append("Target volatility")
+        if ws["risk_aversion"]["enabled"]:
+            modes.append("Utility")
         mode = st.radio(
-            "Mode", ["Target return", "Target volatility", "Utility"],
-            horizontal=True, key="mv_mode",
+            "Mode", modes, horizontal=True, key="mv_mode",
         )
         if mode == "Target return":
             target_return = st.number_input(
@@ -379,7 +449,7 @@ with st.sidebar:
             )
         else:
             risk_aversion = st.slider("Risk aversion λ", 0.1, 20.0, 2.5, key="risk_aversion")
-    elif optimizer_name == "cvar":
+    if optimizer_name == "cvar":
         cvar_alpha = st.slider(
             "CVaR tail prob α", 0.01, 0.20, 0.05, 0.01,
             key="cvar_alpha",
@@ -393,8 +463,18 @@ with st.sidebar:
 
     st.divider()
     st.header("4 · Frontier")
-    build_frontier = st.checkbox("Build efficient frontier", value=True)
-    n_frontier_points = st.slider("Frontier points", 5, 100, 25)
+    build_frontier = st.checkbox(
+        "Build efficient frontier",
+        value=True,
+        disabled=not ws["frontier"]["enabled"],
+        help=ws["frontier"]["tooltip"],
+    )
+    n_frontier_points = st.slider(
+        "Frontier points", 5, 100, 25,
+        disabled=not ws["frontier"]["enabled"],
+    )
+    if not ws["frontier"]["enabled"]:
+        build_frontier = False
 
 
 # ---------------------------------------------------------------------------
@@ -513,7 +593,9 @@ with tab_constraints:
         "asset-class constraints set below."
     )
 
-    historical_mu = (1 + returns).prod() ** (periods_per_year / len(returns)) - 1
+    historical_mu = _historical_mu_cached(
+        _frame_hash(returns), int(periods_per_year), returns,
+    )
 
     if "config_table" not in st.session_state or set(st.session_state.config_table.index) != set(returns.columns):
         st.session_state.config_table = pd.DataFrame(
@@ -533,12 +615,91 @@ with tab_constraints:
             st.session_state.asset_currency.get(a, base_currency) for a in returns.columns
         ]
 
+    if ws["expected_returns_method"]["enabled"]:
+        er_method = st.radio(
+            "Expected-returns method",
+            options=["historical_mean", "ema", "capm"],
+            index=["historical_mean", "ema", "capm"].index(
+                st.session_state.get("expected_returns_method", "historical_mean")
+            ),
+            horizontal=True,
+            key="expected_returns_method",
+        )
+        if er_method == "ema":
+            st.session_state.ema_span = st.slider(
+                "EMA span (periods)",
+                min_value=30, max_value=504,
+                value=int(st.session_state.get("ema_span", 180)),
+                step=10,
+                key="ema_span_slider",
+            )
+        elif er_method == "capm":
+            st.session_state.market_return = st.number_input(
+                "Market return (annual, optional)",
+                value=float(st.session_state.get("market_return") or 0.08),
+                step=0.005, format="%.4f",
+                key="market_return_input",
+            )
+            mw_idx = list(returns.columns)
+            mw_default = pd.DataFrame(
+                {"Market weight": [1.0 / len(mw_idx)] * len(mw_idx)},
+                index=mw_idx,
+            )
+            if "market_weights_table" not in st.session_state:
+                st.session_state.market_weights_table = mw_default
+            st.session_state.market_weights_table = st.data_editor(
+                st.session_state.market_weights_table,
+                num_rows="fixed",
+                column_config={
+                    "Market weight": st.column_config.NumberColumn(
+                        min_value=0.0, max_value=1.0, step=0.01, format="%.3f",
+                    ),
+                },
+            )
+
+        if st.button("Reset μ to method default", key="reset_mu_btn"):
+            from optimization_engine.data.covariance import expected_returns_from_history
+
+            mw_for_capm = (
+                pd.Series(st.session_state.market_weights_table["Market weight"])
+                if er_method == "capm"
+                and "market_weights_table" in st.session_state
+                else None
+            )
+            seeded = expected_returns_from_history(
+                returns,
+                method=("mean" if er_method == "historical_mean" else er_method),
+                periods_per_year=int(periods_per_year),
+                span=int(st.session_state.get("ema_span", 180)),
+                market_return=float(st.session_state.get("market_return") or 0.0) or None,
+                risk_free_rate=float(risk_free_rate),
+                market_weights=mw_for_capm,
+                cov_matrix=_covariance_cached(
+                    _frame_hash(returns),
+                    cov_method, float(ewma_lambda),
+                    int(periods_per_year), True,
+                    returns,
+                ),
+            )
+            st.session_state.config_table["Expected Return"] = seeded.round(4)
+            st.rerun()
+
+    if ws["soft_bounds_caption"]["enabled"]:
+        st.caption(
+            "_Bounds are enforced via projection on solved weights "
+            "(soft bounds; small drift may occur for marginal cases)._"
+        )
+
     edited = st.data_editor(
         st.session_state.config_table,
         use_container_width=True,
         num_rows="fixed",
         column_config={
-            "Expected Return": st.column_config.NumberColumn(format="%.4f"),
+            "Expected Return": st.column_config.NumberColumn(
+                format="%.4f",
+                disabled=not ws["expected_returns_column"]["enabled"],
+                help=ws["expected_returns_column"]["tooltip"],
+            ),
             "Min Weight": st.column_config.NumberColumn(min_value=-1.0, max_value=1.0, step=0.01, format="%.2f"),
             "Max Weight": st.column_config.NumberColumn(min_value=0.0, max_value=1.5, step=0.01, format="%.2f"),
             "Group": st.column_config.TextColumn(),
@@ -558,22 +719,27 @@ with tab_constraints:
         "via FRED FX rates the next time prices are loaded."
     )
 
-    st.markdown("**Group constraints**")
-    unique_groups = sorted(edited["Group"].dropna().unique().tolist())
-    if unique_groups:
-        gb_default = pd.DataFrame(
-            {"Min Weight": 0.0, "Max Weight": 1.0}, index=unique_groups
-        )
-        if "group_bounds" not in st.session_state or list(st.session_state.group_bounds.index) != unique_groups:
-            st.session_state.group_bounds = gb_default
-        st.session_state.group_bounds = st.data_editor(
-            st.session_state.group_bounds,
-            use_container_width=True,
-            num_rows="fixed",
-            column_config={
-                "Min Weight": st.column_config.NumberColumn(min_value=0.0, max_value=1.5, step=0.01, format="%.2f"),
-                "Max Weight": st.column_config.NumberColumn(min_value=0.0, max_value=1.5, step=0.01, format="%.2f"),
-            },
+    if ws["group_bounds"]["enabled"]:
+        st.markdown("**Group constraints**")
+        unique_groups = sorted(edited["Group"].dropna().unique().tolist())
+        if unique_groups:
+            gb_default = pd.DataFrame(
+                {"Min Weight": 0.0, "Max Weight": 1.0}, index=unique_groups
+            )
+            if "group_bounds" not in st.session_state or list(st.session_state.group_bounds.index) != unique_groups:
+                st.session_state.group_bounds = gb_default
+            st.session_state.group_bounds = st.data_editor(
+                st.session_state.group_bounds,
+                use_container_width=True,
+                num_rows="fixed",
+                column_config={
+                    "Min Weight": st.column_config.NumberColumn(min_value=0.0, max_value=1.5, step=0.01, format="%.2f"),
+                    "Max Weight": st.column_config.NumberColumn(min_value=0.0, max_value=1.5, step=0.01, format="%.2f"),
+                },
+            )
+    else:
+        st.caption(
+            f"_{optimizer_name} does not enforce group bounds — group editor hidden._"
         )
 
     if optimizer_name == "risk_parity":
@@ -608,6 +774,44 @@ with tab_constraints:
             },
         )
 
+        st.markdown("**Black-Litterman extras**")
+        st.session_state["bl_tau"] = st.slider(
+            "τ (prior uncertainty)",
+            min_value=0.01, max_value=0.5,
+            value=float(st.session_state.get("bl_tau", 0.05)),
+            step=0.01,
+            key="bl_tau_slider",
+        )
+        if (
+            "bl_market_caps_table" not in st.session_state
+            or set(st.session_state.bl_market_caps_table.index) != set(returns.columns)
+        ):
+            st.session_state.bl_market_caps_table = pd.DataFrame(
+                {"Market cap weight": [1.0 / len(returns.columns)] * len(returns.columns)},
+                index=returns.columns,
+            )
+        st.session_state.bl_market_caps_table = st.data_editor(
+            st.session_state.bl_market_caps_table,
+            num_rows="fixed",
+            column_config={
+                "Market cap weight": st.column_config.NumberColumn(
+                    min_value=0.0, max_value=1.0, step=0.01, format="%.3f",
+                    help="Equal weights → equilibrium under no views. Set to your view of the market portfolio.",
+                ),
+            },
+        )
+
+    if optimizer_name == "hrp":
+        st.session_state["hrp_linkage"] = st.selectbox(
+            "HRP linkage method",
+            options=["single", "average", "complete", "ward"],
+            index=["single", "average", "complete", "ward"].index(
+                st.session_state.get("hrp_linkage", "single")
+            ),
+            key="hrp_linkage_select",
+            help="Hierarchical clustering linkage rule.",
+        )
+
 
 def _build_config() -> EngineConfig:
     table = st.session_state.config_table
@@ -630,23 +834,39 @@ def _build_config() -> EngineConfig:
         risk_free_rate=float(risk_free_rate),
         risk_aversion=float(risk_aversion),
         cvar_alpha=float(cvar_alpha),
+        bl_tau=float(st.session_state.get("bl_tau", 0.05)),
+        hrp_linkage=str(st.session_state.get("hrp_linkage", "single")),
     )
 
     if optimizer_name == "risk_parity" and "risk_budget" in st.session_state:
         spec.risk_budget = st.session_state.risk_budget["Risk Budget"].to_dict()
 
-    if optimizer_name == "black_litterman" and "bl_views" in st.session_state:
-        v = st.session_state.bl_views
-        spec.bl_views = {
-            a: float(v.loc[a, "View"])
-            for a in v.index
-            if pd.notna(v.loc[a, "View"])
-        }
-        spec.bl_view_confidences = {
-            a: float(v.loc[a, "Confidence (variance)"])
-            for a in v.index
-            if pd.notna(v.loc[a, "Confidence (variance)"])
-        }
+    if optimizer_name == "black_litterman":
+        if "bl_views" in st.session_state:
+            v = st.session_state.bl_views
+            spec.bl_views = {
+                a: float(v.loc[a, "View"])
+                for a in v.index
+                if pd.notna(v.loc[a, "View"])
+            }
+            spec.bl_view_confidences = {
+                a: float(v.loc[a, "Confidence (variance)"])
+                for a in v.index
+                if pd.notna(v.loc[a, "Confidence (variance)"])
+            }
+        if "bl_market_caps_table" in st.session_state:
+            spec.bl_market_caps = (
+                st.session_state.bl_market_caps_table["Market cap weight"].to_dict()
+            )
+
+    market_weights = None
+    if (
+        st.session_state.get("expected_returns_method") == "capm"
+        and "market_weights_table" in st.session_state
+    ):
+        market_weights = (
+            st.session_state.market_weights_table["Market weight"].to_dict()
+        )
 
     return EngineConfig(
         expected_returns=expected_returns,
@@ -658,6 +878,17 @@ def _build_config() -> EngineConfig:
         periods_per_year=int(periods_per_year),
         covariance_method=cov_method,
         ewma_lambda=float(ewma_lambda),
+        expected_returns_method=str(
+            st.session_state.get("expected_returns_method", "historical_mean")
+        ),
+        ema_span=int(st.session_state.get("ema_span", 180)),
+        market_return=(
+            float(st.session_state.get("market_return"))
+            if st.session_state.get("expected_returns_method") == "capm"
+            and st.session_state.get("market_return")
+            else None
+        ),
+        market_weights=market_weights,
         optimizer=spec,
     )
 
@@ -831,19 +1062,28 @@ with tab_whatif:
         st.session_state.whatif_overrides = overrides
 
         st.markdown("**Optimizer extras**")
-        extras: dict[str, float] = dict(st.session_state.whatif_extra)
-        opt_name = anchor_cfg.optimizer.name
-        if opt_name == "mean_variance":
-            mode_choices = ["Target return", "Target volatility", "Utility"]
+        from optimization_engine.optimizers.requirements import requirements_for as _req_for
+
+        req = _req_for(anchor_cfg.optimizer.name)
+        extras: dict[str, object] = dict(st.session_state.whatif_extra)
+
+        if req.supports_target_return or req.supports_target_volatility:
+            modes = []
+            if req.supports_target_return:
+                modes.append("Target return")
+            if req.supports_target_volatility:
+                modes.append("Target volatility")
+            if req.supports_risk_aversion:
+                modes.append("Utility")
             if anchor_cfg.optimizer.target_return is not None:
                 default_mode = "Target return"
             elif anchor_cfg.optimizer.target_volatility is not None:
                 default_mode = "Target volatility"
             else:
-                default_mode = "Utility"
+                default_mode = modes[0]
             wf_mode = st.radio(
-                "Mode", mode_choices,
-                index=mode_choices.index(default_mode),
+                "Mode", modes,
+                index=modes.index(default_mode) if default_mode in modes else 0,
                 horizontal=True,
                 key="whatif_mv_mode",
             )
@@ -874,13 +1114,54 @@ with tab_whatif:
                     "target_volatility": None,
                     "risk_aversion": float(ra),
                 }
-        elif opt_name == "cvar":
-            ca = st.slider(
-                "CVaR tail prob α", 0.01, 0.20,
-                float(anchor_cfg.optimizer.cvar_alpha or 0.05), 0.01,
-                key="whatif_cvar_alpha",
-            )
-            extras = {"cvar_alpha": float(ca)}
+
+        for extra in req.extras:
+            if extra.kind == "scalar" and extra.key == "cvar_alpha":
+                ca = st.slider(
+                    "CVaR tail prob α", 0.01, 0.20,
+                    float(anchor_cfg.optimizer.cvar_alpha or 0.05), 0.01,
+                    key="whatif_cvar_alpha",
+                )
+                extras["cvar_alpha"] = float(ca)
+            elif extra.kind == "scalar" and extra.key == "bl_tau":
+                tau = st.slider(
+                    "τ (prior uncertainty)", 0.01, 0.5,
+                    float(anchor_cfg.optimizer.bl_tau or 0.05), 0.01,
+                    key="whatif_bl_tau",
+                )
+                extras["bl_tau"] = float(tau)
+            elif extra.kind == "choice" and extra.key == "hrp_linkage":
+                lk = st.selectbox(
+                    "HRP linkage", list(extra.choices or ()),
+                    index=(extra.choices or ("single",)).index(
+                        anchor_cfg.optimizer.hrp_linkage or "single"
+                    ),
+                    key="whatif_hrp_linkage",
+                )
+                extras["hrp_linkage"] = str(lk)
+            elif extra.kind == "per_asset" and extra.key == "risk_budget":
+                # Editable risk budget as a small frame.
+                rb_idx = list(anchor_cfg.expected_returns.keys())
+                default_rb = anchor_cfg.optimizer.risk_budget or {
+                    a: 1.0 / len(rb_idx) for a in rb_idx
+                }
+                rb_df = pd.DataFrame(
+                    {"Risk Budget": [default_rb.get(a, 0.0) for a in rb_idx]},
+                    index=rb_idx,
+                )
+                rb_df = st.data_editor(
+                    rb_df, num_rows="fixed",
+                    column_config={
+                        "Risk Budget": st.column_config.NumberColumn(
+                            min_value=0.0, max_value=1.0, step=0.01, format="%.3f",
+                        ),
+                    },
+                    key="whatif_rb_editor",
+                )
+                extras["risk_budget"] = rb_df["Risk Budget"].to_dict()
+            # view tables and market caps are skipped in What-if to keep it light;
+            # users can edit those in the constraints tab.
+
         st.session_state.whatif_extra = extras
 
         # Build the live config from anchor + overrides + extras.
@@ -1235,7 +1516,7 @@ with tab_optimize:
             use_container_width=True,
         )
 
-    if run.frontier is not None:
+    if run.frontier is not None and ws["frontier"]["enabled"]:
         st.markdown("### Efficient Frontier")
         st.plotly_chart(
             plot_efficient_frontier(run.frontier.summary, run.frontier.max_sharpe_index),
