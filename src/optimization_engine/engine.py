@@ -18,8 +18,10 @@ from optimization_engine.analytics.risk import risk_contribution
 from optimization_engine.config import EngineConfig
 from optimization_engine.data.covariance import covariance_matrix
 from optimization_engine.frontier import FrontierResult, efficient_frontier
+from optimization_engine.optimizers import ConfigurationError
 from optimization_engine.optimizers.base import OptimizationResult
 from optimization_engine.optimizers.factory import optimizer_factory
+from optimization_engine.optimizers.requirements import requirements_for
 
 
 def apply_fx_conversion(
@@ -102,6 +104,16 @@ def run_engine(
         return_range: Optional (lo, hi) range to sweep; defaults to
             (min μ, max μ).
     """
+    # Validate before computing any fallback: if the optimizer requires
+    # expected_returns but the config supplies none and the caller did not
+    # provide an explicit override, raise immediately.
+    if expected_returns is None:
+        req = requirements_for(config.optimizer.name)
+        if req.requires_mu and not config.expected_returns:
+            raise ConfigurationError(
+                f"Optimizer '{config.optimizer.name}' requires expected_returns; got empty."
+            )
+
     cov = covariance_matrix(
         returns,
         method=config.covariance_method,

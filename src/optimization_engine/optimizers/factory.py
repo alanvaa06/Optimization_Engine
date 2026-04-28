@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 import pandas as pd
 
 from optimization_engine.config import EngineConfig, OptimizerSpec
+from optimization_engine.optimizers import ConfigurationError
 from optimization_engine.optimizers.base import BaseOptimizer, PortfolioConstraints
 from optimization_engine.optimizers.black_litterman import BlackLittermanOptimizer
 from optimization_engine.optimizers.cvar import CVaROptimizer
@@ -21,7 +23,10 @@ from optimization_engine.optimizers.naive import (
     EqualWeightOptimizer,
     InverseVolatilityOptimizer,
 )
+from optimization_engine.optimizers.requirements import requirements_for
 from optimization_engine.optimizers.risk_parity import RiskParityOptimizer
+
+_LOG = logging.getLogger(__name__)
 
 _REGISTRY: dict[str, type[BaseOptimizer]] = {
     "mean_variance": MeanVarianceOptimizer,
@@ -53,6 +58,32 @@ def _constraints_from_config(config: EngineConfig) -> PortfolioConstraints:
     )
 
 
+def _validate(spec: OptimizerSpec, expected_returns, cov_matrix, returns) -> None:
+    req = requirements_for(spec.name)
+    if req.requires_mu and (expected_returns is None or len(expected_returns) == 0):
+        raise ConfigurationError(
+            f"Optimizer '{spec.name}' requires expected_returns; got empty."
+        )
+    if req.requires_cov and cov_matrix is None:
+        raise ConfigurationError(
+            f"Optimizer '{spec.name}' requires a covariance matrix; got None."
+        )
+    if req.requires_returns and returns is None:
+        raise ConfigurationError(
+            f"Optimizer '{spec.name}' requires a returns DataFrame; got None."
+        )
+    if not req.supports_target_return and spec.target_return is not None:
+        _LOG.warning(
+            "Optimizer '%s' does not support target_return; ignoring value %s.",
+            spec.name, spec.target_return,
+        )
+    if not req.supports_target_volatility and spec.target_volatility is not None:
+        _LOG.warning(
+            "Optimizer '%s' does not support target_volatility; ignoring value %s.",
+            spec.name, spec.target_volatility,
+        )
+
+
 def optimizer_factory(
     config: EngineConfig,
     cov_matrix: pd.DataFrame,
@@ -60,11 +91,7 @@ def optimizer_factory(
     returns: pd.DataFrame | None = None,
     **overrides: Any,
 ) -> BaseOptimizer:
-    """Build an optimizer instance from an `EngineConfig`.
-
-    `expected_returns` defaults to the values in ``config.expected_returns``.
-    `returns` is required for the CVaR optimizer.
-    """
+    """Build an optimizer instance from an :class:`EngineConfig`."""
     spec: OptimizerSpec = config.optimizer
     name = spec.name.lower()
     if name not in _REGISTRY:
@@ -75,6 +102,8 @@ def optimizer_factory(
 
     if expected_returns is None and config.expected_returns:
         expected_returns = pd.Series(config.expected_returns, name="expected_return")
+
+    _validate(spec, expected_returns, cov_matrix, returns)
 
     constraints = _constraints_from_config(config)
 
@@ -90,6 +119,8 @@ def optimizer_factory(
         return cls(risk_aversion=spec.risk_aversion, **common, **overrides)
     if cls is RiskParityOptimizer:
         return cls(risk_budget=spec.risk_budget, **common, **overrides)
+    if cls is HRPOptimizer:
+        return cls(linkage_method=getattr(spec, "hrp_linkage", "single"), **common, **overrides)
     if cls is BlackLittermanOptimizer:
         return cls(
             market_weights=spec.bl_market_caps,
@@ -101,8 +132,6 @@ def optimizer_factory(
             **overrides,
         )
     if cls is CVaROptimizer:
-        if returns is None:
-            raise ValueError("CVaR optimizer requires a returns DataFrame")
         return cls(
             returns=returns,
             alpha=spec.cvar_alpha,

@@ -19,6 +19,7 @@ from optimization_engine.data.covariance import covariance_matrix
 from optimization_engine.data.loader import prices_to_returns, sample_dataset
 from optimization_engine.engine import run_engine
 from optimization_engine.optimizers.factory import available_optimizers
+from optimization_engine.optimizers import ConfigurationError
 
 
 @pytest.fixture(scope="module")
@@ -153,3 +154,41 @@ def test_risk_parity_equal_contributions(returns: pd.DataFrame):
     rc = rc / rc.sum()
     target = np.ones_like(rc) / len(rc)
     assert np.max(np.abs(rc - target)) < 0.05  # ERC: roughly equal
+
+
+def test_factory_raises_when_required_mu_missing(returns):
+    cfg = EngineConfig(
+        expected_returns={},  # empty -> required for mean_variance
+        bounds={a: [0.0, 1.0] for a in returns.columns},
+        optimizer=OptimizerSpec(name="mean_variance"),
+    )
+    with pytest.raises(ConfigurationError, match="expected_returns"):
+        run_engine(returns, cfg)
+
+
+def test_factory_raises_when_returns_missing_for_cvar(returns):
+    # CVaR needs the returns DataFrame; we exercise the factory directly
+    # because the engine always supplies returns.
+    from optimization_engine.data.covariance import covariance_matrix
+    from optimization_engine.optimizers.factory import optimizer_factory
+
+    cfg = EngineConfig(
+        expected_returns={a: 0.05 for a in returns.columns},
+        bounds={a: [0.0, 1.0] for a in returns.columns},
+        optimizer=OptimizerSpec(name="cvar"),
+    )
+    cov = covariance_matrix(returns, method="ledoit_wolf")
+    with pytest.raises(ConfigurationError, match="returns"):
+        optimizer_factory(cfg, cov, expected_returns=None, returns=None)
+
+
+def test_factory_warns_on_incompatible_target_return(returns, baseline_config, caplog):
+    import logging
+    cfg = EngineConfig(
+        expected_returns=baseline_config.expected_returns,
+        bounds=baseline_config.bounds,
+        optimizer=OptimizerSpec(name="hrp", target_return=0.05),
+    )
+    with caplog.at_level(logging.WARNING):
+        run_engine(returns, cfg)
+    assert any("target_return" in r.message for r in caplog.records)
