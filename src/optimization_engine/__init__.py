@@ -6,9 +6,25 @@ from optimization_engine.config import (
     load_config,
     save_config,
 )
+from optimization_engine.analytics.backtest import (
+    BacktestResult,
+    WalkForwardResult,
+    backtest_weights,
+    compare_in_and_out_of_sample,
+    walk_forward_backtest,
+)
 from optimization_engine.data.covariance import (
+    CovarianceDiagnostics,
+    covariance_diagnostics,
     covariance_matrix,
     expected_returns_from_history,
+    james_stein_shrinkage,
+    nearest_psd,
+)
+from optimization_engine.data.quality import (
+    DataQualityReport,
+    align_panel,
+    analyze_prices,
 )
 from optimization_engine.data.loader import (
     load_prices,
@@ -45,6 +61,20 @@ from optimization_engine.scenarios import (
     scenario_signature,
     scenario_to_dict,
 )
+from optimization_engine.optimizers.diagnostics import (
+    PortfolioDiagnostics,
+    diversification_ratio,
+    effective_n,
+    herfindahl_index,
+    portfolio_diagnostics,
+    risk_decomposition,
+)
+from optimization_engine.optimizers.feasibility import (
+    FeasibilityReport,
+    InfeasibleConstraintsError,
+    analyze_feasibility,
+)
+from optimization_engine.optimizers.black_litterman import View
 from optimization_engine.optimizers import (
     BaseOptimizer,
     BlackLittermanOptimizer,
@@ -68,7 +98,29 @@ __all__ = [
     "load_config",
     "save_config",
     "covariance_matrix",
+    "covariance_diagnostics",
+    "CovarianceDiagnostics",
     "expected_returns_from_history",
+    "james_stein_shrinkage",
+    "nearest_psd",
+    "DataQualityReport",
+    "align_panel",
+    "analyze_prices",
+    "BacktestResult",
+    "WalkForwardResult",
+    "backtest_weights",
+    "compare_in_and_out_of_sample",
+    "walk_forward_backtest",
+    "PortfolioDiagnostics",
+    "portfolio_diagnostics",
+    "risk_decomposition",
+    "diversification_ratio",
+    "effective_n",
+    "herfindahl_index",
+    "FeasibilityReport",
+    "InfeasibleConstraintsError",
+    "analyze_feasibility",
+    "View",
     "load_prices",
     "prices_to_returns",
     "sample_dataset",

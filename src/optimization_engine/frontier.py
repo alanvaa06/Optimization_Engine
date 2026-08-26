@@ -4,6 +4,19 @@ Sweeps either target returns (mean-variance) or risk-aversion levels
 (utility-maximization) to trace out a frontier of optimal portfolios.
 Solves are dispatched on a thread pool because CVXPY/CLARABEL/ECOS spend
 most of their time inside C extensions that release the GIL.
+
+Two properties this module is careful about, because getting them wrong
+produces a chart that looks right and is not:
+
+**The sweep range must be reachable.** Sweeping from ``min(μ)`` to ``max(μ)``
+is only correct without constraints. Add a 15% per-asset cap and roughly half
+the targets become infeasible — the chart silently loses its ends. The range
+is therefore derived from two LPs over the actual constraint set.
+
+**Only the upper branch is efficient.** Targets below the global
+minimum-variance return are *dominated*: the same volatility buys more return
+higher up. They are still solved, so the analyst can see the full opportunity
+set, but they are flagged and excluded from the efficient frontier by default.
 """
 
 from __future__ import annotations
@@ -17,18 +30,72 @@ import numpy as np
 import pandas as pd
 
 from optimization_engine.config import EngineConfig
-from optimization_engine.optimizers.factory import optimizer_factory
+from optimization_engine.optimizers.factory import constraints_from_config, optimizer_factory
+
+#: Optimizers whose own objective can be swept along a return target.
+_SWEEPABLE = {"mean_variance", "cvar"}
 
 
 @dataclass
 class FrontierResult:
+    """A traced frontier: summary rows, per-point weights, and key portfolios.
+
+    Attributes:
+        summary: One row per swept target. Carries ``expected_return``,
+            ``expected_volatility``, ``sharpe_ratio``, ``status``, and
+            ``is_efficient`` — False for points on the dominated lower branch.
+        weights: Assets × targets weight matrix.
+        group_weights: Same, aggregated by group. Empty when no groups.
+        min_variance: Summary row of the global minimum-variance portfolio.
+        tangency: Summary row of the maximum-Sharpe portfolio, when one exists.
+        risk_measure: What the x-axis actually is — ``"volatility"`` for the
+            mean-variance sweep, ``"CVaR"`` for a mean-CVaR sweep.
+        reachable_range: ``(min, max)`` expected return the constraints allow.
+        failures: Human-readable reasons for any point that did not solve.
+    """
+
     summary: pd.DataFrame
     weights: pd.DataFrame
     group_weights: pd.DataFrame | None = None
+    min_variance: pd.Series | None = None
+    tangency: pd.Series | None = None
+    risk_measure: str = "volatility"
+    reachable_range: tuple[float, float] | None = None
+    failures: tuple[str, ...] = ()
 
     @property
     def max_sharpe_index(self) -> int:
-        return int(np.argmax(self.summary["sharpe_ratio"].values))
+        """Positional index of the highest-Sharpe point among solved rows.
+
+        NaN-safe: a frontier where every point failed returns ``-1`` rather
+        than silently pointing at row 0, which would put the "max Sharpe"
+        marker on an arbitrary portfolio.
+        """
+        sharpe = self.summary["sharpe_ratio"].values
+        if np.all(np.isnan(sharpe)):
+            return -1
+        return int(np.nanargmax(sharpe))
+
+    @property
+    def efficient(self) -> pd.DataFrame:
+        """Solved points on the efficient (upper) branch only."""
+        df = self.summary
+        mask = (df["status"] == "ok") & df.get("is_efficient", True)
+        return df[mask]
+
+    @property
+    def n_failed(self) -> int:
+        return int((self.summary["status"] != "ok").sum())
+
+    def plot_frame(self, efficient_only: bool = True) -> pd.DataFrame:
+        """Rows ready to plot, with a positional index the caller can trust.
+
+        Charting code that drops NaN rows and then indexes with a position
+        taken from the *undropped* frame highlights the wrong point; this
+        returns one frame so both come from the same place.
+        """
+        df = self.efficient if efficient_only else self.summary[self.summary["status"] == "ok"]
+        return df.dropna(subset=["expected_volatility", "expected_return"]).reset_index(drop=True)
 
 
 def _group_weights(weights: pd.DataFrame, groups: dict[str, str]) -> pd.DataFrame:
@@ -67,6 +134,110 @@ def _solve_one(
         return float(target), None, str(exc)
 
 
+def _anchor_portfolios(
+    base_config: EngineConfig,
+    cov_matrix: pd.DataFrame,
+    expected_returns: pd.Series | None,
+) -> tuple[pd.Series | None, pd.Series | None]:
+    """Solve the two portfolios every frontier chart should mark.
+
+    The global minimum-variance point is where the efficient branch starts;
+    the tangency point is where a risk-free asset would take you. Both are
+    solved directly rather than picked off the sweep, so they land on the
+    true frontier instead of the nearest grid point.
+    """
+    from optimization_engine.optimizers.mean_variance import (
+        MaxSharpeOptimizer,
+        MinVarianceOptimizer,
+    )
+
+    constraints = constraints_from_config(base_config)
+    constraints.target_return = None
+    constraints.target_volatility = None
+
+    def _row(result, label: str) -> pd.Series:
+        return pd.Series(
+            {
+                "label": label,
+                "expected_return": result.expected_return,
+                "expected_volatility": result.expected_volatility,
+                "sharpe_ratio": result.sharpe_ratio,
+            }
+        )
+
+    gmv = tangency = None
+    try:
+        gmv_result = MinVarianceOptimizer(
+            expected_returns=expected_returns,
+            cov_matrix=cov_matrix,
+            constraints=constraints,
+            risk_free_rate=base_config.optimizer.risk_free_rate,
+        ).optimize()
+        gmv = _row(gmv_result, "Minimum variance")
+        gmv["weights"] = gmv_result.weights
+    except Exception:
+        pass
+
+    if expected_returns is not None:
+        try:
+            tan_result = MaxSharpeOptimizer(
+                expected_returns=expected_returns,
+                cov_matrix=cov_matrix,
+                constraints=constraints,
+                risk_free_rate=base_config.optimizer.risk_free_rate,
+            ).optimize()
+            tangency = _row(tan_result, "Maximum Sharpe")
+            tangency["weights"] = tan_result.weights
+        except Exception:
+            pass
+
+    return gmv, tangency
+
+
+def _resolve_return_range(
+    base_config: EngineConfig,
+    cov_matrix: pd.DataFrame,
+    expected_returns: pd.Series,
+    return_range: tuple[float, float] | None,
+    efficient_only: bool,
+    gmv: pd.Series | None,
+) -> tuple[tuple[float, float], tuple[float, float] | None]:
+    """Pick the sweep endpoints, and report what the constraints can reach.
+
+    Returns ``(sweep_range, reachable_range)``. An explicit ``return_range``
+    is honoured verbatim — a caller who asks for an unreachable range wants
+    to see it fail, and the tests rely on that.
+    """
+    from optimization_engine.optimizers.feasibility import reachable_return_range
+
+    constraints = constraints_from_config(base_config)
+    constraints.target_return = None
+    constraints.target_volatility = None
+    reachable = reachable_return_range(
+        expected_returns, constraints, list(cov_matrix.columns)
+    )
+
+    if return_range is not None:
+        return (float(return_range[0]), float(return_range[1])), reachable
+
+    if reachable is None:
+        mu = expected_returns.reindex(cov_matrix.columns).fillna(0.0).values
+        return (float(mu.min()), float(mu.max())), None
+
+    lo, hi = reachable
+    # Nudge off the exact endpoints: an equality target sitting on the
+    # boundary of the feasible set is where solvers report
+    # optimal_inaccurate or fail outright.
+    span = hi - lo
+    pad = max(span * 1e-4, 1e-9)
+    lo, hi = lo + pad, hi - pad
+    if efficient_only and gmv is not None:
+        gmv_return = float(gmv["expected_return"])
+        if lo < gmv_return < hi:
+            lo = gmv_return
+    return (lo, max(hi, lo)), reachable
+
+
 def efficient_frontier(
     config: EngineConfig,
     cov_matrix: pd.DataFrame,
@@ -77,40 +248,62 @@ def efficient_frontier(
     sweep: Literal["return", "risk_aversion"] = "return",
     return_range: tuple[float, float] | None = None,
     n_workers: int | None = None,
+    efficient_only: bool = True,
 ) -> FrontierResult:
     """Trace the efficient frontier.
 
-    The default ``sweep="return"`` solves a target-return MV problem at
-    each candidate target. ``sweep="risk_aversion"`` instead sweeps the
-    utility coefficient λ — useful with optimizers that don't support a
-    hard return target.
+    The default ``sweep="return"`` solves a target-return problem at each
+    candidate target. ``sweep="risk_aversion"`` instead sweeps the utility
+    coefficient λ — useful with optimizers that don't support a hard return
+    target, and it never produces an infeasible point.
 
-    ``n_workers`` controls the size of the thread pool used to solve
-    individual frontier points in parallel. ``None`` defaults to
-    ``min(8, n_points)``; ``1`` (or less) runs sequentially.
+    Args:
+        config: The run's configuration; its constraints bound the sweep.
+        cov_matrix: Annualized covariance matrix.
+        expected_returns: Annualized expected returns. Falls back to
+            ``config.expected_returns``.
+        returns: Scenario returns, required for a mean-CVaR frontier.
+        target_returns: Explicit targets, bypassing range selection.
+        n_points: Resolution of the sweep.
+        sweep: ``"return"`` or ``"risk_aversion"``.
+        return_range: Explicit ``(lo, hi)``. When omitted the range is derived
+            from what the constraints can actually reach.
+        n_workers: Thread-pool size. ``None`` uses ``min(8, n_points)``;
+            ``1`` or less runs sequentially.
+        efficient_only: Start the sweep at the minimum-variance return so the
+            dominated lower branch is not traced. Points below it are flagged
+            ``is_efficient=False`` when they are swept anyway.
+
+    Raises:
+        ValueError: On an unknown ``sweep``, or a return sweep with no
+            expected returns to sweep over.
     """
     if expected_returns is None and config.expected_returns:
         expected_returns = pd.Series(config.expected_returns)
+
+    base_config = copy.deepcopy(config)
+    if base_config.optimizer.name not in _SWEEPABLE:
+        base_config.optimizer.name = "mean_variance"
+    risk_measure = "CVaR" if base_config.optimizer.name == "cvar" else "volatility"
+
+    gmv, tangency = _anchor_portfolios(base_config, cov_matrix, expected_returns)
+    reachable: tuple[float, float] | None = None
 
     if sweep == "return":
         if target_returns is None:
             if expected_returns is None:
                 raise ValueError("Cannot sweep returns without expected_returns")
-            mu = expected_returns.reindex(cov_matrix.columns).fillna(0.0).values
-            lo, hi = (return_range
-                      if return_range is not None
-                      else (float(mu.min()), float(mu.max())))
+            (lo, hi), reachable = _resolve_return_range(
+                base_config, cov_matrix, expected_returns,
+                return_range, efficient_only, gmv,
+            )
             target_returns = list(np.linspace(lo, hi, n_points))
         else:
             target_returns = list(target_returns)
     elif sweep == "risk_aversion":
         target_returns = list(np.geomspace(0.5, 50.0, n_points))
     else:
-        raise ValueError(f"Unknown sweep: {sweep}")
-
-    base_config = copy.deepcopy(config)
-    if base_config.optimizer.name not in {"mean_variance", "cvar"}:
-        base_config.optimizer.name = "mean_variance"
+        raise ValueError(f"Unknown sweep: {sweep!r}. Use 'return' or 'risk_aversion'.")
 
     workers = n_workers if n_workers is not None else min(8, len(target_returns))
     if workers <= 1:
@@ -131,28 +324,45 @@ def efficient_frontier(
                 [returns] * n,
             ))
 
-    summary_rows: list[dict[str, float]] = []
+    gmv_return = float(gmv["expected_return"]) if gmv is not None else None
+    # Solver tolerance, not economics, decides whether a point sitting exactly
+    # on the minimum-variance return lands a hair below it.
+    efficiency_tol = (
+        max(1e-6, abs(gmv_return) * 1e-3) if gmv_return is not None else 0.0
+    )
+    summary_rows: list[dict[str, object]] = []
     weights_rows: list[pd.Series] = []
+    failures: list[str] = []
     for target, result, err in rows:
         if result is None:
+            failures.append(f"target {target:.4%}: {err}")
             summary_rows.append({
                 "target": target,
                 "expected_return": np.nan,
                 "expected_volatility": np.nan,
                 "sharpe_ratio": np.nan,
+                "is_efficient": False,
                 "status": f"failed: {err}",
             })
             weights_rows.append(
                 pd.Series(np.nan, index=cov_matrix.columns, name=target)
             )
         else:
-            summary_rows.append({
+            is_efficient = (
+                True if gmv_return is None
+                else result.expected_return >= gmv_return - efficiency_tol
+            )
+            row: dict[str, object] = {
                 "target": target,
                 "expected_return": result.expected_return,
                 "expected_volatility": result.expected_volatility,
                 "sharpe_ratio": result.sharpe_ratio,
+                "is_efficient": is_efficient,
                 "status": "ok",
-            })
+            }
+            if risk_measure == "CVaR":
+                row["cvar"] = result.extras.get("cvar_annualized", np.nan)
+            summary_rows.append(row)
             weights_rows.append(result.weights.rename(target))
 
     summary = pd.DataFrame(summary_rows)
@@ -162,4 +372,9 @@ def efficient_frontier(
         summary=summary,
         weights=weights_df,
         group_weights=_group_weights(weights_df, base_config.groups),
+        min_variance=gmv,
+        tangency=tangency,
+        risk_measure=risk_measure,
+        reachable_range=reachable,
+        failures=tuple(failures),
     )
