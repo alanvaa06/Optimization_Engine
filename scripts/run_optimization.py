@@ -3,8 +3,6 @@
 Usage::
 
     python scripts/run_optimization.py --config config/example_multi_asset.yaml --sample
-    python scripts/run_optimization.py --config config/legacy_optluis.yaml \\
-                                       --prices data/Precios_OptLuis_USD.xlsx
 """
 
 from __future__ import annotations
