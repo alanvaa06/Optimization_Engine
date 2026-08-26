@@ -20,6 +20,7 @@ from optimization_engine.analytics.backtest import (
     rebalance_dates,
     walk_forward_backtest,
 )
+from optimization_engine.analytics.performance import sharpe_ratio
 from optimization_engine.config import EngineConfig, OptimizerSpec
 from optimization_engine.data.loader import prices_to_returns, sample_dataset
 from optimization_engine.data.quality import align_panel, analyze_prices
@@ -281,3 +282,80 @@ def test_overlap_matrix_is_symmetric_with_counts_on_the_diagonal():
     report = analyze_prices(prices)
     assert (report.overlap.values == report.overlap.values.T).all()
     assert report.overlap.iloc[0, 0] == 152
+
+
+# ---------------------------------------------------------------------------
+# Look-ahead
+# ---------------------------------------------------------------------------
+
+
+def test_walk_forward_reestimates_expected_returns_by_default(returns):
+    """Reusing the config's expected returns leaks the full sample.
+
+    config.expected_returns is normally populated — the UI fills it from the
+    whole history — so holding it fixed hands every "out-of-sample" window an
+    estimate computed partly from its own future.
+    """
+    mu_full = ((1 + returns).prod() ** (252 / len(returns)) - 1).to_dict()
+    cfg = EngineConfig(
+        expected_returns=mu_full,
+        bounds={a: [0.0, 0.30] for a in returns.columns},
+        optimizer=OptimizerSpec(name="max_sharpe", risk_free_rate=0.02),
+    )
+    run = run_engine(returns, cfg)
+
+    # Default: each window must derive its own expected returns.
+    wf = run.walk_forward(lookback=504, rebalance_every=126)
+    assert wf.backtest.metadata["reestimated_expected_returns"] is True
+
+    # Opting out reuses the fixed vector, and says so.
+    leaked = run.walk_forward(
+        lookback=504, rebalance_every=126, reestimate_expected_returns=False
+    )
+    assert leaked.backtest.metadata["reestimated_expected_returns"] is False
+
+    # And the leak flatters the result, which is why the default matters.
+    honest_sharpe = float(sharpe_ratio(wf.returns, 0.02, 252))
+    leaked_sharpe = float(sharpe_ratio(leaked.returns, 0.02, 252))
+    assert leaked_sharpe > honest_sharpe, (
+        "expected the look-ahead variant to score higher; if this flips, the "
+        "leak may no longer be reachable and this guard needs rethinking"
+    )
+
+
+def test_each_walk_forward_window_sees_a_different_expected_return_vector(returns):
+    """The concrete invariant: mu must move as the window moves.
+
+    Spies on the config the engine's *own* default solver builds, so reverting
+    the fix fails this test — a hand-written solve() would pass either way.
+    """
+    import optimization_engine.engine as engine_module
+
+    mu_full = ((1 + returns).prod() ** (252 / len(returns)) - 1).to_dict()
+    cfg = EngineConfig(
+        expected_returns=mu_full,
+        bounds={a: [0.0, 0.30] for a in returns.columns},
+        optimizer=OptimizerSpec(name="min_variance"),
+    )
+    run = run_engine(returns, cfg)
+
+    real_run_engine = engine_module.run_engine
+    seen: list[tuple[float, ...]] = []
+
+    def spy(window, config, *args, **kwargs):
+        out = real_run_engine(window, config, *args, **kwargs)
+        seen.append(tuple(out.expected_returns.round(8)))
+        return out
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(engine_module, "run_engine", spy)
+        run.walk_forward(lookback=504, rebalance_every=126)
+
+    assert len(seen) > 1, "the spy never saw a window solve"
+    assert len(set(seen)) > 1, (
+        "every window saw the same expected returns — the full-sample vector "
+        "is leaking into the walk-forward"
+    )
+    assert tuple(pd.Series(mu_full).round(8)) not in set(seen), (
+        "a window was handed the full-sample expected returns verbatim"
+    )

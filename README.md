@@ -10,6 +10,57 @@ respected, how well-conditioned the covariance estimate was, how concentrated
 the book is in risk rather than capital, and how much of the backtest
 survives out of sample.
 
+![The Optimize tab: compliance banner, concentration diagnostics, allocation and risk decomposition](docs/images/app-optimize.png)
+
+## The four questions it answers
+
+### 1. Where does this portfolio sit, and what else was available?
+
+The frontier is drawn with the portfolios worth marking on it — the
+minimum-variance anchor where the efficient branch starts, the tangency
+portfolio, the capital allocation line through it, and where your own
+allocation actually landed. The sweep range comes from what the constraints
+can reach, so a binding position cap shortens the curve instead of silently
+failing half of it.
+
+![Efficient frontier with minimum-variance, tangency, capital allocation line and the selected portfolio marked](docs/images/frontier.png)
+
+### 2. How much of that curve is real?
+
+The frontier is a point estimate of a curve. Resample the return history and
+re-trace it, and the curve moves a great deal: on the sample panel the
+expected return at a typical risk level spans a **6.3-percentage-point band**.
+Differences narrower than that band are not distinguishable from estimation
+noise, which is a useful thing to know before defending a 20bp allocation
+difference in a meeting.
+
+![The same frontier resampled 60 times, drawn as a confidence band around the point estimate](docs/images/frontier-uncertainty.png)
+
+### 3. Where is the risk, as opposed to the money?
+
+Capital weight and risk share are different quantities, and optimizers are
+happy to let them diverge. Here a 26% position in EM equity carries **71% of
+the portfolio's risk** — the gap between the two bars is the entire argument
+for risk budgeting, and it is invisible in a weights table.
+
+![Capital weight beside share of risk per asset, showing a 26% position carrying 71% of risk](docs/images/capital-vs-risk.png)
+
+### 4. Would any of this have worked?
+
+The optimizer estimated its inputs from the same returns a naive backtest
+replays, so a fitted track record is a description of the past, not a
+forecast. The walk-forward re-estimates and re-solves on a rolling window and
+holds each solution over returns the optimizer never saw. Same rebalancing
+cadence and the same 15bps of trading cost on both lines, so the gap is
+overfitting rather than a cost artefact: **Sharpe 0.74 fitted against 0.23
+walk-forward.**
+
+![In-sample and out-of-sample wealth curves diverging over time](docs/images/walk-forward.png)
+
+*Every figure above is produced by `python scripts/render_docs_images.py` from
+the built-in sample dataset, using the same plotting code the app calls — so
+what the README shows is what the library draws.*
+
 ## What's inside
 
 **Optimization techniques**
@@ -86,9 +137,9 @@ leave it there:
 * `bootstrap_frontier()` resamples the return history (block, IID or
   parametric), re-estimates and re-traces the frontier on each draw, and
   returns the resulting confidence band plus the per-asset weight dispersion.
-  On the sample panel the frontier's expected return spans a ~7% band at a
-  typical risk level — differences narrower than that are not distinguishable
-  from noise.
+  On the sample panel the frontier's expected return spans a 6.3-percentage-
+  point band at a typical risk level — differences narrower than that are not
+  distinguishable from noise.
 * `resampled_efficient_frontier()` implements Michaud-style resampling:
   averaging weights across draws at each frontier rank, which lifts the mean
   effective N from 3.3 to 5.2 on the sample panel because the optimizer stops
@@ -106,6 +157,37 @@ Two things a constant-weight in-sample replay hides, and this doesn't:
   optimizer never saw. `compare_in_and_out_of_sample()` puts the two track
   records side by side with the degradation between them.
 
+  Expected returns are re-derived inside each window by default
+  (`reestimate_expected_returns=True`). This matters more than it sounds:
+  `config.expected_returns` is normally populated — the UI seeds that table
+  from the *full* history — so reusing it would hand every "out-of-sample"
+  window an estimate built partly from its own future. On the sample panel
+  that look-ahead lifts walk-forward Sharpe from 0.46 to 0.89. Turn it off
+  only when your expected returns are genuine forward-looking assumptions
+  rather than estimates from the same data.
+
+## How a run flows
+
+```mermaid
+flowchart TD
+    A[Prices] --> B{Data quality}
+    B -->|gaps, stale feeds,<br/>splits, thin samples| B1[Reported before<br/>anything is estimated]
+    B --> C[Align panel<br/>explicitly, with a log]
+    C --> D[Covariance<br/>+ conditioning diagnostics]
+    C --> E[Expected returns<br/>historical · EMA · CAPM · shrunk]
+    D --> F{Feasibility}
+    E --> F
+    F -->|impossible| F1[Names the constraint<br/>and the fix]
+    F -->|solvable| G[Optimize]
+    G --> H{Constraints respected?}
+    H -->|breach| H1[Reported, never silent]
+    H --> I[Weights + diagnostics<br/>effective N · risk decomposition]
+    I --> J[Frontier<br/>+ resampled confidence band]
+    I --> K[Backtest<br/>drift · costs · walk-forward]
+    J --> L[Excel report<br/>carrying its own assumptions]
+    K --> L
+```
+
 ## Layout
 
 ```
@@ -117,13 +199,15 @@ src/optimization_engine/
 ├── config.py         # YAML/JSON-driven config
 ├── engine.py         # high-level façade (run_engine)
 ├── frontier.py       # efficient frontier sweep
+├── resampling.py     # bootstrap bands + Michaud resampling
 └── cli.py            # `optengine` entrypoint
 app/
 ├── streamlit_app.py  # interactive UI
 └── components.py     # reusable render blocks
 config/               # example configs
+docs/images/          # README figures (regenerate with scripts/)
 notebooks/            # quickstart notebook
-scripts/              # batch runners
+scripts/              # batch runners + docs-figure renderer
 tests/                # pytest suite
 ```
 
@@ -154,6 +238,8 @@ could make the next one wrong.
    splits, and how many periods actually have every asset present. The
    missing-data policy is an explicit choice, and the app logs exactly what it
    did to the panel.
+
+   ![The Data tab, leading with a data-quality verdict and per-asset coverage](docs/images/app-data.png)
 2. **Assets** — per-asset statistics (extended metrics on a toggle) plus a
    drawdown-episode table with peak, trough, recovery and time underwater.
 3. **Assumptions & constraints** — editable expected returns, weight bounds,
@@ -161,6 +247,8 @@ could make the next one wrong.
    views both absolute and relative), and a **live feasibility check** that
    names the constraint making the problem impossible and what to change,
    before you ever press solve.
+
+   ![The constraints tab, with the method card and the live feasibility check](docs/images/app-constraints.png)
 4. **Optimize** — a compliance banner, KPI cards, concentration and
    diversification measures, a capital-vs-risk chart, the full Euler
    decomposition, and a frontier marked with the minimum-variance and
@@ -249,6 +337,12 @@ against the posterior and says so.
 ```bash
 pytest -q
 ruff check src app tests scripts
+```
+
+The README figures are regenerated with:
+
+```bash
+python scripts/render_docs_images.py
 ```
 
 The suite covers the covariance estimators and their PSD repair, every
