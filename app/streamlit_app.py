@@ -1923,11 +1923,14 @@ with tab_compare:
         )
     else:
         names_all = sorted(st.session_state.scenarios.keys())
-        default_sel = (
-            [st.session_state.active_scenario]
-            if st.session_state.active_scenario in names_all
-            else names_all[:1]
-        )
+        # Default to everything saved (up to the cap): a comparison tab that
+        # opens on a single scenario is not comparing anything.
+        default_sel = names_all[:5]
+        if (
+            st.session_state.active_scenario in names_all
+            and st.session_state.active_scenario not in default_sel
+        ):
+            default_sel = [st.session_state.active_scenario] + default_sel[:4]
         chosen = st.multiselect(
             "Scenarios to compare",
             options=names_all,
