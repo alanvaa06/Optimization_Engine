@@ -83,6 +83,7 @@ from optimization_engine.optimizers.factory import (  # noqa: E402
 )
 from optimization_engine.optimizers.feasibility import analyze_feasibility  # noqa: E402
 from optimization_engine.optimizers.requirements import requirements_for  # noqa: E402
+from optimization_engine.reporting.exporters import run_sheets  # noqa: E402
 from optimization_engine.reporting.plots import (  # noqa: E402
     plot_correlation_heatmap,
     plot_drawdown,
@@ -2464,63 +2465,14 @@ with tab_report:
         )
 
         assumptions = run.assumptions()
-        sheets: dict[str, pd.DataFrame] = {
-            "weights": run.result.weights.to_frame("weight"),
-            "summary": pd.DataFrame(
-                [
-                    {
-                        "expected_return": run.result.expected_return,
-                        "expected_volatility": run.result.expected_volatility,
-                        "sharpe_ratio": run.result.sharpe_ratio,
-                    }
-                ]
-            ),
-            "assumptions": pd.DataFrame(
-                [{"assumption": k, "value": v} for k, v in assumptions.items()]
-            ),
-            "risk_decomposition": run.risk_decomposition(),
-            "expected_returns": run.expected_returns.to_frame("annualized"),
-            "cov_matrix": run.cov_matrix,
-            "absolute_summary": run.absolute_summary(
-                riskfree_rate=float(risk_free_rate), extended=True
-            ),
-            "data_quality": pd.DataFrame(
-                [
-                    {
-                        "severity": i.severity,
-                        "asset": i.asset or "",
-                        "finding": i.message,
-                        "suggestion": i.suggestion,
-                    }
-                    for i in quality.issues
-                ]
-            )
-            if quality.issues
-            else pd.DataFrame([{"severity": "info", "finding": "No issues found."}]),
-        }
-        if run.diagnostics is not None:
-            sheets["portfolio_diagnostics"] = pd.DataFrame(
-                [
-                    {"metric": k, "value": v}
-                    for k, v in run.diagnostics.to_dict().items()
-                    if not isinstance(v, list)
-                ]
-            )
-        if run.frontier is not None:
-            sheets["frontier_summary"] = run.frontier.summary
-            sheets["frontier_weights"] = run.frontier.weights
-            if (
-                run.frontier.group_weights is not None
-                and not run.frontier.group_weights.empty
-            ):
-                sheets["frontier_groups"] = run.frontier.group_weights
-        wf = st.session_state.get("walk_forward")
-        if wf is not None:
-            sheets["walk_forward_weights"] = wf.weights_history
-            sheets["walk_forward_windows"] = wf.windows
-            sheets["in_vs_out_of_sample"] = run.in_vs_out_of_sample(
-                wf, float(risk_free_rate)
-            )
+        # Same builder the CLI uses, so a workbook exported from the app and
+        # one written by `optengine optimize` carry identical sheets.
+        sheets = run_sheets(
+            run,
+            riskfree_rate=float(risk_free_rate),
+            data_quality=quality,
+            walk_forward=st.session_state.get("walk_forward"),
+        )
 
         buf = io.BytesIO()
         with pd.ExcelWriter(buf, engine="xlsxwriter") as writer:

@@ -683,3 +683,87 @@ def test_total_loss_is_reported_not_warned():
         warnings.simplefilter("error", RuntimeWarning)
         dd = drawdown_series(s)
     assert dd.iloc[1] == pytest.approx(-1.0)
+
+
+# ---------------------------------------------------------------------------
+# Solver dispatch
+# ---------------------------------------------------------------------------
+
+
+def test_solver_chain_prefers_an_exact_solution_over_an_inaccurate_one():
+    """An `optimal_inaccurate` first answer must not end the fallback chain."""
+    import cvxpy as cp
+
+    from optimization_engine.optimizers._cvxpy_helpers import solve_problem
+
+    calls: list[str] = []
+    real_solve = cp.Problem.solve
+
+    def fake_solve(self, *args, **kwargs):
+        solver = kwargs.get("solver", "default")
+        calls.append(str(solver))
+        real_solve(self, *args, **kwargs)
+        if len(calls) == 1:
+            # Pretend the first solver converged only loosely.
+            self._status = "optimal_inaccurate"
+
+    w = cp.Variable(2)
+    problem = cp.Problem(cp.Minimize(cp.sum_squares(w)), [cp.sum(w) == 1])
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(cp.Problem, "solve", fake_solve)
+        info = solve_problem(problem, solvers=("CLARABEL", "SCS"))
+    assert len(calls) == 2, "the chain stopped at the inaccurate answer"
+    assert info.status == "optimal"
+
+
+def test_solver_chain_falls_back_to_the_inaccurate_answer_if_nothing_better():
+    import cvxpy as cp
+
+    from optimization_engine.optimizers._cvxpy_helpers import solve_problem
+
+    real_solve = cp.Problem.solve
+    seen: list[str] = []
+
+    def always_inaccurate(self, *args, **kwargs):
+        seen.append(str(kwargs.get("solver", "default")))
+        real_solve(self, *args, **kwargs)
+        self._status = "optimal_inaccurate"
+
+    w = cp.Variable(2)
+    problem = cp.Problem(cp.Minimize(cp.sum_squares(w)), [cp.sum(w) == 1])
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(cp.Problem, "solve", always_inaccurate)
+        info = solve_problem(problem, solvers=("CLARABEL", "SCS"))
+    assert info.status == "optimal_inaccurate"
+    # And the weights from the first usable attempt are still on the variable.
+    assert w.value is not None
+    assert float(np.sum(w.value)) == pytest.approx(1.0, abs=1e-4)
+
+
+def test_solver_failure_distinguishes_infeasible_from_numerical():
+    import cvxpy as cp
+
+    from optimization_engine.optimizers._cvxpy_helpers import SolverFailure, solve_problem
+
+    w = cp.Variable(1)
+    impossible = cp.Problem(cp.Minimize(w), [w >= 1, w <= 0])
+    with pytest.raises(SolverFailure, match="infeasible"):
+        solve_problem(impossible)
+
+    unbounded = cp.Problem(cp.Minimize(w))
+    with pytest.raises(SolverFailure, match="unbounded"):
+        solve_problem(unbounded)
+
+
+def test_solvers_do_not_leak_inaccuracy_warnings_to_callers(returns, mu):
+    """The engine reports solver status itself; the duplicate is noise."""
+    cfg = EngineConfig(
+        expected_returns=mu.to_dict(),
+        bounds={a: [0.0, 0.4] for a in mu.index},
+        optimizer=OptimizerSpec(name="risk_parity"),
+    )
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        run = run_engine(returns, cfg, build_frontier=True, n_frontier_points=6)
+    assert not [c for c in caught if "may be inaccurate" in str(c.message)]
+    assert run.result.extras["solver_status"] in ("optimal", "optimal_inaccurate")

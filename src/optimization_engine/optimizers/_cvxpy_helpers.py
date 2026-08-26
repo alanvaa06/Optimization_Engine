@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import time
+import warnings
 from dataclasses import dataclass
 
 import cvxpy as cp
@@ -19,6 +20,22 @@ _LOG = logging.getLogger(__name__)
 SOLVER_FALLBACK = ("CLARABEL", "ECOS", "SCS", "OSQP")
 
 _OK_STATUSES = ("optimal", "optimal_inaccurate")
+
+# CVXPY warns on stderr whenever a solve returns ``optimal_inaccurate``. That
+# is not actionable for a caller of this module: the fallback chain below
+# treats an inaccurate answer as a *reason to try the next solver*, and when
+# it does end up settling for one it says so through ``SolveInfo.status``, a
+# logged warning, and the UI's compliance banner. Suppressing the duplicate
+# has to happen with a process-wide filter rather than a context manager,
+# because frontier sweeps and walk-forward runs solve on a thread pool and
+# ``warnings.catch_warnings`` is not thread-safe -- scoping it per solve would
+# leak across threads and could swallow unrelated warnings. The filter is
+# matched on the exact message so nothing else is silenced; ``module`` is not
+# usable here because CVXPY raises with a stacklevel that attributes the
+# warning to this file rather than to its own.
+warnings.filterwarnings(
+    "ignore", message="Solution may be inaccurate", category=UserWarning
+)
 
 
 @dataclass(frozen=True)
@@ -69,18 +86,51 @@ class SolverFailure(RuntimeError):
         super().__init__(message)
 
 
-def solve_problem(problem: cp.Problem, solvers: tuple[str, ...] = SOLVER_FALLBACK) -> SolveInfo:
+def _snapshot(problem: cp.Problem) -> dict[int, object]:
+    """Capture the current value of every variable in ``problem``."""
+    return {id(v): (v, None if v.value is None else np.array(v.value)) for v in problem.variables()}
+
+
+def _restore(snapshot: dict[int, object]) -> None:
+    """Put a snapshotted solution back onto the problem's variables.
+
+    Needed because CVXPY overwrites ``variable.value`` on every solve: once a
+    later solver in the fallback chain has run, the earlier (usable) answer is
+    gone unless it was saved.
+    """
+    for variable, value in snapshot.values():
+        variable.value = value
+
+
+def solve_problem(
+    problem: cp.Problem,
+    solvers: tuple[str, ...] = SOLVER_FALLBACK,
+    accept_inaccurate: bool = True,
+) -> SolveInfo:
     """Solve ``problem``, walking a fallback chain, and report what happened.
 
+    An ``optimal_inaccurate`` answer is *not* accepted straight away: the rest
+    of the chain is tried first in case another solver converges properly, and
+    the loose answer is only returned if nothing better turns up. Settling for
+    the first solver's inaccurate result is how a portfolio ends up a few
+    basis points outside its own constraints for no reason.
+
+    Args:
+        problem: The CVXPY problem to solve.
+        solvers: Fallback chain, tried in order. Missing solvers are skipped.
+        accept_inaccurate: Return a loose solution when no solver converges
+            exactly. Set False to raise instead.
+
     Raises:
-        SolverFailure: When every solver fails or reports a non-optimal status.
-            The exception distinguishes *infeasible* (the constraints are
-            impossible) from *unbounded* and from numerical failure, because
-            the analyst's next action is different in each case.
+        SolverFailure: When every solver fails or reports a non-optimal
+            status. The exception distinguishes *infeasible* (the constraints
+            are impossible) from *unbounded* and from numerical failure,
+            because the analyst's next action differs in each case.
     """
     attempts: list[str] = []
     last_status = "unknown"
     last_error: Exception | None = None
+    inaccurate: tuple[SolveInfo, dict[int, object]] | None = None
     installed = set(cp.installed_solvers())
 
     candidates = [s for s in solvers if s in installed] or [None]
@@ -98,13 +148,8 @@ def solve_problem(problem: cp.Problem, solvers: tuple[str, ...] = SOLVER_FALLBAC
             continue
         elapsed = time.perf_counter() - start
         last_status = str(problem.status)
-        if last_status in _OK_STATUSES:
-            if last_status == "optimal_inaccurate":
-                _LOG.warning(
-                    "Solver %s returned an inaccurate solution; treat the "
-                    "result as approximate.",
-                    solver or "default",
-                )
+
+        if last_status == "optimal":
             return SolveInfo(
                 solver=solver or "default",
                 status=last_status,
@@ -114,10 +159,41 @@ def solve_problem(problem: cp.Problem, solvers: tuple[str, ...] = SOLVER_FALLBAC
                 ),
                 attempts=tuple(attempts),
             )
+        if last_status == "optimal_inaccurate" and inaccurate is None:
+            inaccurate = (
+                SolveInfo(
+                    solver=solver or "default",
+                    status=last_status,
+                    solve_seconds=elapsed,
+                    objective_value=(
+                        float(problem.value) if problem.value is not None else None
+                    ),
+                    attempts=tuple(attempts),
+                ),
+                _snapshot(problem),
+            )
+            continue
         # infeasible / unbounded are properties of the problem, not the
-        # solver — no point trying the rest of the chain.
+        # solver -- no point trying the rest of the chain.
         if last_status in ("infeasible", "unbounded"):
             break
+
+    if inaccurate is not None and accept_inaccurate:
+        info, snapshot = inaccurate
+        _restore(snapshot)
+        _LOG.warning(
+            "No solver converged exactly; falling back to %s's approximate "
+            "solution. Treat the weights as indicative and check the "
+            "constraint-compliance report.",
+            info.solver,
+        )
+        return SolveInfo(
+            solver=info.solver,
+            status=info.status,
+            solve_seconds=info.solve_seconds,
+            objective_value=info.objective_value,
+            attempts=tuple(attempts),
+        )
 
     raise SolverFailure(
         last_status,

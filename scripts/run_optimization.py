@@ -16,16 +16,18 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-import pandas as pd  # noqa: E402
-
 from optimization_engine.config import load_config  # noqa: E402
 from optimization_engine.data.loader import (  # noqa: E402
     load_prices,
     prices_to_returns,
     sample_dataset,
 )
+from optimization_engine.data.quality import analyze_prices  # noqa: E402
 from optimization_engine.engine import run_engine  # noqa: E402
-from optimization_engine.reporting.exporters import write_excel_report  # noqa: E402
+from optimization_engine.reporting.exporters import (  # noqa: E402
+    run_sheets,
+    write_excel_report,
+)
 
 
 def main() -> int:
@@ -45,13 +47,21 @@ def main() -> int:
     else:
         prices = load_prices(args.prices, sheet_name=args.sheet)
 
-    returns = prices_to_returns(prices)
-    common = sorted(set(returns.columns) & set(config.expected_returns))
+    common = sorted(set(prices.columns) & set(config.expected_returns))
     if not common:
         print("No overlap between prices and config.expected_returns", file=sys.stderr)
         return 2
-    returns = returns[common]
+    prices = prices[common]
     config.expected_returns = {a: config.expected_returns[a] for a in common}
+
+    quality = analyze_prices(prices, periods_per_year=config.periods_per_year)
+    for issue in quality.issues:
+        print(f"Data {issue.severity} — {issue.describe()}", file=sys.stderr)
+
+    returns = prices_to_returns(prices).dropna(how="any")
+    if returns.empty:
+        print("No usable returns after alignment.", file=sys.stderr)
+        return 2
 
     run = run_engine(
         returns,
@@ -59,30 +69,14 @@ def main() -> int:
         build_frontier=args.frontier,
         n_frontier_points=args.frontier_points,
     )
+    for warning in run.warnings:
+        print(f"Warning — {warning}", file=sys.stderr)
 
-    sheets: dict[str, pd.DataFrame] = {
-        "weights": run.result.weights.to_frame("weight"),
-        "summary": pd.DataFrame(
-            [
-                {
-                    "expected_return": run.result.expected_return,
-                    "expected_volatility": run.result.expected_volatility,
-                    "sharpe_ratio": run.result.sharpe_ratio,
-                }
-            ]
-        ),
-        "risk_contributions": run.risk_contributions().to_frame("share_of_variance"),
-        "expected_returns": run.expected_returns.to_frame("annualized"),
-        "absolute_summary": run.absolute_summary(
-            riskfree_rate=config.optimizer.risk_free_rate
-        ),
-        "cov_matrix": run.cov_matrix,
-    }
-    if run.frontier is not None:
-        sheets["frontier_summary"] = run.frontier.summary
-        sheets["frontier_weights"] = run.frontier.weights
-        if run.frontier.group_weights is not None and not run.frontier.group_weights.empty:
-            sheets["frontier_groups"] = run.frontier.group_weights
+    sheets = run_sheets(
+        run,
+        riskfree_rate=config.optimizer.risk_free_rate,
+        data_quality=quality,
+    )
 
     out = write_excel_report(args.output, sheets)
     print(f"Wrote {out}")

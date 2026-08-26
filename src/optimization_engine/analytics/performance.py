@@ -9,7 +9,6 @@ from optimization_engine.analytics.risk import (
     cvar_historic,
     downside_deviation,
     drawdown_series,
-    wealth_index,
     kurtosis,
     max_drawdown_duration,
     omega_ratio,
@@ -18,6 +17,7 @@ from optimization_engine.analytics.risk import (
     ulcer_index,
     var_gaussian,
     var_historic,
+    wealth_index,
 )
 
 
