@@ -1,6 +1,7 @@
 """Hierarchical Risk Parity (López de Prado, 2016).
 
 HRP avoids matrix inversion entirely. Steps:
+
 1. Build a correlation distance ``d = √(½(1 − ρ))``.
 2. Cluster with single linkage (or any linkage method).
 3. Quasi-diagonalize: reorder assets so similar items sit together.
@@ -8,19 +9,29 @@ HRP avoids matrix inversion entirely. Steps:
    sub-clusters using inverse-variance weights at each split.
 
 The result is robust to ill-conditioned covariance matrices and to noisy
-estimates — particularly useful with many assets or limited history.
+estimates — particularly useful with many assets or limited history, and the
+natural choice when ``T/N`` is too small for mean-variance to mean anything.
+
+Constraints are *not* part of the recursion: HRP allocates top-down and the
+result is then projected onto the closest feasible allocation, group budgets
+included. That makes the mandate binding but the method approximate, which is
+why ``bounds_mode`` is ``"soft_iterated"`` and the distance the projection
+moved is reported alongside the weights.
 """
 
 from __future__ import annotations
 
+import warnings
+
 import numpy as np
 import pandas as pd
-from scipy.cluster.hierarchy import linkage
+from scipy.cluster.hierarchy import fcluster, linkage
 from scipy.spatial.distance import squareform
 
-from optimization_engine.optimizers._bounds import project_to_bounds_iterated
-from optimization_engine.optimizers._cvxpy_helpers import bounds_arrays
+from optimization_engine.optimizers._bounds import project_to_constraints
 from optimization_engine.optimizers.base import BaseOptimizer
+
+LINKAGE_METHODS = ("single", "average", "complete", "ward")
 
 
 def _correl_distance(corr: pd.DataFrame) -> pd.DataFrame:
@@ -86,16 +97,48 @@ class HRPOptimizer(BaseOptimizer):
     """
 
     name = "hrp"
+    bounds_mode = "soft_iterated"
 
     def __init__(self, *args, linkage_method: str = "single", **kwargs) -> None:
         super().__init__(*args, **kwargs)
+        if linkage_method not in LINKAGE_METHODS:
+            raise ValueError(
+                f"Unknown HRP linkage {linkage_method!r}. "
+                f"Available: {list(LINKAGE_METHODS)}"
+            )
         self.linkage_method = linkage_method
 
     def _solve(self) -> np.ndarray:
         if self.cov_matrix is None:
             raise ValueError("Covariance matrix required for HRP")
+        if len(self.assets) < 2:
+            raise ValueError(
+                "HRP needs at least 2 assets to build a cluster tree."
+            )
+        if self.constraints.group_bounds and self.constraints.groups:
+            warnings.warn(
+                "HRP allocates down its own correlation-derived hierarchy, "
+                "which generally disagrees with a hand-specified grouping. The "
+                "group budgets will be met by projecting the result onto the "
+                "constraint set, which moves it away from HRP's own answer — "
+                "use risk_parity or mean_variance to have them enforced inside "
+                "the solve.",
+                stacklevel=3,
+            )
+        if (np.array([self.constraints.get_bounds(a)[0] for a in self.assets]) < 0).any():
+            raise ValueError(
+                "HRP produces long-only weights by construction; a negative "
+                "minimum weight cannot be honoured."
+            )
+
         cov = self.cov_matrix
         std = np.sqrt(np.diag(cov.values))
+        if not (std > 0).all():
+            zero = [a for a, s in zip(cov.columns, std) if s <= 0]
+            raise ValueError(
+                f"Zero-variance asset(s) {zero}: the correlation distance is "
+                "undefined. Drop them from the universe."
+            )
         corr = cov.values / np.outer(std, std)
         corr = np.clip(corr, -1.0, 1.0)
         corr_df = pd.DataFrame(corr, index=cov.index, columns=cov.columns)
@@ -111,5 +154,43 @@ class HRPOptimizer(BaseOptimizer):
         w = _recursive_bisection(cov, ordered)
         w = w.reindex(self.assets).fillna(0.0)
         weights = w.values.astype(float)
-        lb, ub = bounds_arrays(self.assets, self.constraints)
-        return project_to_bounds_iterated(weights, lb, ub)
+
+        self._record_cluster_diagnostics(link, ordered, corr_df)
+
+        projected, drift = project_to_constraints(
+            weights, self.assets, self.constraints
+        )
+        self._diagnostics["projection_distance"] = drift
+        if drift > 1e-6:
+            self._diagnostics["bounds_note"] = (
+                f"Constraints moved {drift:.2%} of the book away from the raw "
+                "HRP allocation. HRP applies them by projection, so a large "
+                "distance means the mandate — not the hierarchy — is driving "
+                "the result."
+            )
+        return projected
+
+    def _record_cluster_diagnostics(
+        self, link: np.ndarray, ordered: list[str], corr: pd.DataFrame
+    ) -> None:
+        """Expose the hierarchy so the analyst can sanity-check the clustering.
+
+        HRP's whole premise is that the tree it finds is economically
+        sensible. Showing the ordering and the natural cluster split is what
+        lets someone confirm that, rather than trusting it.
+        """
+        n = len(ordered)
+        k = max(2, min(int(np.sqrt(n)), n - 1))
+        try:
+            labels = fcluster(link, t=k, criterion="maxclust")
+            members: dict[int, list[str]] = {}
+            for asset, lab in zip(corr.columns, labels):
+                members.setdefault(int(lab), []).append(str(asset))
+            self._diagnostics["hrp_clusters"] = members
+            self._diagnostics["hrp_n_clusters"] = len(members)
+        except Exception:  # pragma: no cover - scipy edge cases
+            pass
+        self._diagnostics["hrp_order"] = [str(a) for a in ordered]
+        self._diagnostics["hrp_linkage"] = self.linkage_method
+        off_diag = corr.values[~np.eye(n, dtype=bool)]
+        self._diagnostics["mean_correlation"] = float(off_diag.mean())

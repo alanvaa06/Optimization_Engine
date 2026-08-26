@@ -14,7 +14,9 @@ from optimization_engine.optimizers.black_litterman import BlackLittermanOptimiz
 from optimization_engine.optimizers.cvar import CVaROptimizer  # noqa: E402
 from optimization_engine.optimizers.factory import optimizer_factory  # noqa: E402
 from optimization_engine.optimizers.hrp import HRPOptimizer  # noqa: E402
-from optimization_engine.optimizers.max_diversification import MaxDiversificationOptimizer  # noqa: E402
+from optimization_engine.optimizers.max_diversification import (  # noqa: E402
+    MaxDiversificationOptimizer,
+)
 from optimization_engine.optimizers.mean_variance import (  # noqa: E402
     MaxSharpeOptimizer,
     MeanVarianceOptimizer,

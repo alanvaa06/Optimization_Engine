@@ -1,27 +1,50 @@
-"""Naive baselines: equal weight (1/N) and inverse volatility."""
+"""Naive baselines: equal weight (1/N) and inverse volatility.
+
+Neither method has an opinion about constraints — they produce a weight
+vector and the mandate is applied afterwards, by projecting onto the closest
+feasible allocation. The distance moved is reported, because a 1/N book that
+had to travel 15% of its weight to satisfy the mandate is no longer really
+1/N, and the analyst should be told rather than left to notice.
+"""
 
 from __future__ import annotations
 
 import numpy as np
 
-from optimization_engine.optimizers._bounds import project_to_bounds_iterated
-from optimization_engine.optimizers._cvxpy_helpers import bounds_arrays
+from optimization_engine.optimizers._bounds import project_to_constraints
 from optimization_engine.optimizers.base import BaseOptimizer
 
 
-class EqualWeightOptimizer(BaseOptimizer):
-    """Allocate 1/N to each asset, then project into bounds."""
+class _ProjectedOptimizer(BaseOptimizer):
+    """Shared plumbing for methods that allocate first and constrain after."""
+
+    bounds_mode = "soft_iterated"
+
+    def _project(self, w: np.ndarray) -> np.ndarray:
+        projected, distance = project_to_constraints(w, self.assets, self.constraints)
+        self._diagnostics["projection_distance"] = distance
+        if distance > 1e-6:
+            self._diagnostics["bounds_note"] = (
+                f"Constraints moved {distance:.2%} of the book away from the "
+                f"raw {self.name} allocation. Above roughly 10%, the mandate "
+                "rather than the method is producing the answer."
+            )
+        return projected
+
+
+class EqualWeightOptimizer(_ProjectedOptimizer):
+    """Allocate 1/N to each asset, then project into the constraint set."""
 
     name = "equal_weight"
 
     def _solve(self) -> np.ndarray:
         n = len(self.assets)
-        w = np.ones(n) / n
-        lb, ub = bounds_arrays(self.assets, self.constraints)
-        return project_to_bounds_iterated(w, lb, ub)
+        if n == 0:
+            raise ValueError("Equal weight needs at least one asset.")
+        return self._project(np.ones(n) / n)
 
 
-class InverseVolatilityOptimizer(BaseOptimizer):
+class InverseVolatilityOptimizer(_ProjectedOptimizer):
     """Weights inversely proportional to per-asset volatility (no correlations)."""
 
     name = "inverse_vol"
@@ -31,11 +54,11 @@ class InverseVolatilityOptimizer(BaseOptimizer):
         if sigma is None:
             raise ValueError("Covariance matrix required")
         std = np.sqrt(np.diag(sigma))
-        std = np.where(std <= 0, np.nan, std)
-        inv = 1.0 / std
-        inv = np.nan_to_num(inv, nan=0.0)
-        if inv.sum() <= 0:
-            raise RuntimeError("All variances are zero or NaN")
-        w = inv / inv.sum()
-        lb, ub = bounds_arrays(self.assets, self.constraints)
-        return project_to_bounds_iterated(w, lb, ub)
+        if not (std > 0).any():
+            raise RuntimeError(
+                "Every asset has zero variance; inverse-volatility weights "
+                "are undefined."
+            )
+        with np.errstate(divide="ignore"):
+            inv = np.where(std > 0, 1.0 / np.where(std > 0, std, 1.0), 0.0)
+        return self._project(inv / inv.sum())

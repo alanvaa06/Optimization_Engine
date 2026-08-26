@@ -31,7 +31,6 @@ from optimization_engine.scenarios import (  # noqa: E402
     scenario_signature,
 )
 
-
 # ---------------------------------------------------------------------------
 # Fixtures (mirrored from tests/test_optimizers.py)
 # ---------------------------------------------------------------------------
@@ -207,12 +206,22 @@ def test_delete_removes_only_target(two_scenarios: dict[str, Scenario]):
 
 
 def test_infeasible_bounds_raise(returns: pd.DataFrame, baseline_config: EngineConfig):
+    """Caps that cannot reach the budget must fail, and say why."""
+    from optimization_engine.optimizers._cvxpy_helpers import SolverFailure
+    from optimization_engine.optimizers.feasibility import InfeasibleConstraintsError
+
     bad_dict = baseline_config.to_dict()
-    # Cap every asset at 5%; with N>20 assets the sum of upper bounds < 1
+    # Cap every asset at 5%; with N < 20 assets the upper bounds sum below 1.
     bad_dict["bounds"] = {a: [0.0, 0.05] for a in bad_dict["expected_returns"]}
     bad_cfg = EngineConfig.from_dict(bad_dict)
-    with pytest.raises(Exception):
+
+    with pytest.raises((SolverFailure, InfeasibleConstraintsError, RuntimeError)):
         run_engine(returns, bad_cfg)
+
+    # And the pre-solve report names the constraint rather than leaving the
+    # analyst with a bare solver status.
+    with pytest.raises(InfeasibleConstraintsError, match="cannot reach 100%"):
+        run_engine(returns, bad_cfg, raise_on_infeasible=True)
 
 
 # ---------------------------------------------------------------------------

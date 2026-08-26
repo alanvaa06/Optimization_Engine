@@ -33,7 +33,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-ui = ["streamlit>=1.30", "ipywidgets>=8.0"]
+ui = ["streamlit>=1.49", "ipywidgets>=8.0"]
 data = ["yfinance>=0.2.40"]
 extras = ["riskfolio-lib>=5.0"]
 dev = ["pytest>=7.4", "pytest-cov>=4.1", "ruff>=0.5"]
@@ -54,3 +54,11 @@ target-version = "py39"
 [tool.ruff.lint]
 select = ["E", "F", "I", "B", "UP", "W"]
 ignore = ["E501"]
+
+[tool.ruff.lint.per-file-ignores]
+# The Streamlit app and the test modules must extend sys.path so that
+# ``src/`` is importable before the package is imported. That is a deliberate
+# late import, not an oversight.
+"app/*.py" = ["E402"]
+"tests/*.py" = ["E402"]
+"src/optimization_engine/ui_state.py" = ["E402"]

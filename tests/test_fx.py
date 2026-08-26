@@ -14,7 +14,7 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from optimization_engine.data import fred, fx  # noqa: E402
+from optimization_engine.data import fx  # noqa: E402
 from optimization_engine.data.fx import (  # noqa: E402
     FXError,
     _normalize_currencies,
@@ -23,7 +23,6 @@ from optimization_engine.data.fx import (  # noqa: E402
     fetch_fx_to_usd,
     supported_currencies,
 )
-
 
 # ---------------------------------------------------------------------------
 # Currency code validation

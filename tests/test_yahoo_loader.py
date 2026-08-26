@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
-from unittest.mock import patch
 
 import numpy as np
 import pandas as pd
@@ -24,7 +23,6 @@ from optimization_engine.data.yahoo import (  # noqa: E402
     _validate_tickers,
     load_prices_yahoo,
 )
-
 
 # ---------------------------------------------------------------------------
 # Fixtures: minimal frames matching yfinance's two output shapes.

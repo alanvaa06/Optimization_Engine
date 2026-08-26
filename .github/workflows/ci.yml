@@ -1,0 +1,86 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# A new push supersedes an in-flight run on the same ref.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: Lint (ruff)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      # Ruff needs none of the project's dependencies, so this reports style
+      # failures in seconds rather than after a full scientific-stack install.
+      - name: Install ruff
+        run: pip install "ruff>=0.5"
+      - name: Check
+        run: ruff check src app tests scripts
+
+  test:
+    name: Tests (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # The floor declared in pyproject's requires-python, the version the
+        # project is developed on, and the current release.
+        python-version: ["3.9", "3.10", "3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+      - name: Test
+        # The suite is fully offline: the Yahoo and FRED loaders are mocked,
+        # so nothing here depends on a network round-trip.
+        run: pytest -q --durations=10
+
+  smoke:
+    name: CLI smoke test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+      # Exercises the installed console-script entry point, which unit tests
+      # calling main() directly would not catch if packaging broke.
+      - name: Method registry
+        run: optengine list-optimizers
+      - name: Pre-flight the example config
+        run: optengine check --config config/example_multi_asset.yaml --sample
+      - name: End-to-end optimize
+        run: |
+          optengine optimize \
+            --config config/example_multi_asset.yaml \
+            --sample --frontier --strict \
+            --output /tmp/ci_report.xlsx
+      - name: Report was written
+        run: test -s /tmp/ci_report.xlsx

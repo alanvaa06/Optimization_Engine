@@ -1,8 +1,12 @@
 """Data loading and covariance estimation."""
 
 from optimization_engine.data.covariance import (
+    CovarianceDiagnostics,
+    covariance_diagnostics,
     covariance_matrix,
     expected_returns_from_history,
+    james_stein_shrinkage,
+    nearest_psd,
 )
 from optimization_engine.data.fred import (
     FREDError,
@@ -21,6 +25,12 @@ from optimization_engine.data.loader import (
     prices_to_returns,
     sample_dataset,
 )
+from optimization_engine.data.quality import (
+    DataIssue,
+    DataQualityReport,
+    align_panel,
+    analyze_prices,
+)
 from optimization_engine.data.yahoo import (
     YahooFinanceError,
     load_prices_yahoo,
@@ -28,7 +38,15 @@ from optimization_engine.data.yahoo import (
 
 __all__ = [
     "covariance_matrix",
+    "covariance_diagnostics",
+    "CovarianceDiagnostics",
     "expected_returns_from_history",
+    "james_stein_shrinkage",
+    "nearest_psd",
+    "DataIssue",
+    "DataQualityReport",
+    "align_panel",
+    "analyze_prices",
     "load_prices",
     "prices_to_returns",
     "sample_dataset",

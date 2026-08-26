@@ -4,8 +4,14 @@ Run with::
 
     streamlit run app/streamlit_app.py
 
-The app is intentionally driven by the same `EngineConfig` machinery as
-the CLI, so anything that works in the UI also works headless.
+The app is driven by the same `EngineConfig` machinery as the CLI, so
+anything that works here also works headless.
+
+The flow is deliberately linear — load data, check it, choose a method, set
+assumptions, state constraints, solve, then interrogate the result — and each
+step surfaces what could make the next one wrong: data-quality problems before
+estimation, constraint feasibility before solving, and the gap between the
+in-sample and walk-forward track records before anyone believes the backtest.
 """
 
 from __future__ import annotations
@@ -19,60 +25,103 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-# Make src/ importable when running ``streamlit run app/streamlit_app.py``
-ROOT = Path(__file__).resolve().parents[1]
+# Make src/ and this directory importable when running
+# ``streamlit run app/streamlit_app.py``.
+HERE = Path(__file__).resolve().parent
+ROOT = HERE.parent
 SRC = ROOT / "src"
-if str(SRC) not in sys.path:
-    sys.path.insert(0, str(SRC))
+for path in (str(SRC), str(HERE)):
+    if path not in sys.path:
+        sys.path.insert(0, path)
 
-from optimization_engine.analytics.performance import summary_stats  # noqa: E402
-from optimization_engine.analytics.relative import summary_relative  # noqa: E402
-from optimization_engine.analytics.risk import risk_contribution  # noqa: E402
+from components import (  # noqa: E402
+    format_table,
+    metric_row,
+    num,
+    pct,
+    render_assumptions,
+    render_compliance,
+    render_covariance_diagnostics,
+    render_data_quality,
+    render_feasibility,
+    render_frontier_health,
+    render_method_card,
+    render_portfolio_diagnostics,
+    render_projection_distance,
+)
+
+from optimization_engine.analytics.performance import rolling_metrics, summary_stats  # noqa: E402
+from optimization_engine.analytics.relative import (  # noqa: E402
+    active_share,
+    summary_relative,
+)
+from optimization_engine.analytics.risk import drawdown_table  # noqa: E402
 from optimization_engine.config import EngineConfig, OptimizerSpec  # noqa: E402
-from optimization_engine.data.covariance import covariance_matrix  # noqa: E402
-from optimization_engine.data.loader import (  # noqa: E402
-    load_prices,
-    prices_to_returns,
-    sample_dataset,
+from optimization_engine.data.covariance import (  # noqa: E402
+    COVARIANCE_DESCRIPTIONS,
+    EXPECTED_RETURN_DESCRIPTIONS,
+    covariance_matrix,
 )
 from optimization_engine.data.fx import (  # noqa: E402
     FXError,
     convert_prices_to_base,
-    fetch_fx_to_base,
     supported_currencies,
 )
+from optimization_engine.data.loader import (  # noqa: E402
+    prices_to_returns,
+    sample_dataset,
+)
+from optimization_engine.data.quality import align_panel, analyze_prices  # noqa: E402
 from optimization_engine.data.yahoo import (  # noqa: E402
     YahooFinanceError,
     load_prices_yahoo,
 )
-from optimization_engine.engine import apply_fx_conversion, run_engine  # noqa: E402
-from optimization_engine.optimizers.factory import available_optimizers  # noqa: E402
-from optimization_engine.reporting.exporters import write_excel_report  # noqa: E402
-from optimization_engine.scenarios import (  # noqa: E402
-    NOTES_MAX_LEN,
-    Scenario,
-    config_signature,
-    delete_scenario as _delete_scenario,
-    dump_scenarios_yaml,
-    load_scenarios_yaml,
-    now_iso,
-    rename_scenario as _rename_scenario,
-    scenario_signature,
+from optimization_engine.engine import run_engine  # noqa: E402
+from optimization_engine.optimizers.factory import (  # noqa: E402
+    available_optimizers,
+    constraints_from_config,
+    effective_expected_returns,
 )
+from optimization_engine.optimizers.feasibility import analyze_feasibility  # noqa: E402
+from optimization_engine.optimizers.requirements import requirements_for  # noqa: E402
+from optimization_engine.reporting.exporters import run_sheets  # noqa: E402
 from optimization_engine.reporting.plots import (  # noqa: E402
     plot_correlation_heatmap,
     plot_drawdown,
     plot_efficient_frontier,
+    plot_frontier_uncertainty,
     plot_portfolio_composition,
+    plot_return_distribution,
     plot_risk_contributions,
+    plot_rolling_metrics,
+    plot_walk_forward_comparison,
     plot_wealth_index,
+    plot_weight_dispersion,
+    plot_weight_evolution,
+    plot_weight_vs_risk,
+    plot_weights_bar,
+)
+from optimization_engine.resampling import bootstrap_frontier  # noqa: E402
+from optimization_engine.scenarios import (  # noqa: E402
+    NOTES_MAX_LEN,
+    Scenario,
+    config_signature,
+    dump_scenarios_yaml,
+    load_scenarios_yaml,
+    now_iso,
+    scenario_signature,
+)
+from optimization_engine.scenarios import (
+    delete_scenario as _delete_scenario,
+)
+from optimization_engine.scenarios import (
+    rename_scenario as _rename_scenario,
 )
 from optimization_engine.ui_state import (  # noqa: E402
     derive_widget_state,
     yahoo_cache_key,
     yahoo_prices_for_rerun,
 )
-
 
 # ---------------------------------------------------------------------------
 # Page setup
@@ -88,27 +137,31 @@ st.set_page_config(
 st.markdown(
     """
     <style>
-    .metric-card { background: #f7f9fc; padding: 0.75rem 1rem; border-radius: 8px;
-                   border: 1px solid #e6ebf1; }
     .small-muted { color: #6b7280; font-size: 0.85rem; }
-    .section-title { margin-top: 1.5rem; margin-bottom: 0.75rem; }
+    .step-done { color: #16a34a; }
+    div[data-testid="stMetricValue"] { font-size: 1.5rem; }
     </style>
     """,
     unsafe_allow_html=True,
 )
 
 # ---------------------------------------------------------------------------
-# Scenario state (initialized once per session) + pending Load handler
+# Session state
 # ---------------------------------------------------------------------------
 
-if "scenarios" not in st.session_state:
-    st.session_state.scenarios: dict[str, Scenario] = {}
-if "active_scenario" not in st.session_state:
-    st.session_state.active_scenario = None
-if "last_run_by_scenario" not in st.session_state:
-    st.session_state.last_run_by_scenario = {}
-if "scenario_load_warning" not in st.session_state:
-    st.session_state.scenario_load_warning = None
+_DEFAULT_STATE = {
+    "scenarios": {},
+    "active_scenario": None,
+    "last_run_by_scenario": {},
+    "scenario_load_warning": None,
+    "last_run": None,
+    "last_error": None,
+    "walk_forward": None,
+    "frontier_uncertainty": None,
+}
+for key, default in _DEFAULT_STATE.items():
+    if key not in st.session_state:
+        st.session_state[key] = default
 
 
 def _seed_table_from_config(cfg) -> None:
@@ -145,7 +198,9 @@ def _seed_table_from_config(cfg) -> None:
         st.session_state.risk_budget = pd.DataFrame(
             {"Risk Budget": pd.Series(cfg.optimizer.risk_budget)}
         )
-    if getattr(cfg.optimizer, "bl_views", None):
+    if getattr(cfg.optimizer, "bl_views", None) and isinstance(
+        cfg.optimizer.bl_views, dict
+    ):
         idx = sorted(
             set(cfg.optimizer.bl_views) | set(cfg.optimizer.bl_view_confidences or {})
         )
@@ -172,6 +227,7 @@ if _pending and _pending in st.session_state.scenarios:
     st.session_state["risk_free_rate"] = float(_cfg.optimizer.risk_free_rate)
     st.session_state["risk_aversion"] = float(_cfg.optimizer.risk_aversion)
     st.session_state["cvar_alpha"] = float(_cfg.optimizer.cvar_alpha)
+    st.session_state["long_only"] = bool(_cfg.long_only)
     if _cfg.optimizer.target_return is not None:
         st.session_state["mv_mode"] = "Target return"
         st.session_state["target_return"] = float(_cfg.optimizer.target_return)
@@ -191,7 +247,7 @@ st.caption(
 
 
 # ---------------------------------------------------------------------------
-# Data loading helpers
+# Cached data helpers
 # ---------------------------------------------------------------------------
 
 
@@ -242,6 +298,11 @@ def _historical_mu_cached(
     return (1 + _returns).prod() ** (periods_per_year / len(_returns)) - 1
 
 
+@st.cache_data(show_spinner=False, max_entries=8)
+def _quality_cached(prices_hash: str, periods_per_year: int, _prices: pd.DataFrame):
+    return analyze_prices(_prices, periods_per_year=periods_per_year)
+
+
 def _load_uploaded(file: io.BytesIO, sheet: str) -> pd.DataFrame:
     name = file.name.lower()
     if name.endswith((".xlsx", ".xls", ".xlsm")):
@@ -253,12 +314,8 @@ def _load_uploaded(file: io.BytesIO, sheet: str) -> pd.DataFrame:
     raise ValueError(f"Unsupported file: {file.name}")
 
 
-def _editable_returns(returns: pd.DataFrame) -> pd.DataFrame:
-    return returns
-
-
 # ---------------------------------------------------------------------------
-# Sidebar — data + optimizer config
+# Sidebar — step 1: data
 # ---------------------------------------------------------------------------
 
 with st.sidebar:
@@ -272,7 +329,7 @@ with st.sidebar:
 
     if data_source == "Sample":
         years = st.slider("Years of history", 2, 15, 8)
-        prices = _load_sample(years * 252)
+        raw_prices = _load_sample(years * 252)
     elif data_source == "Upload file":
         uploaded = st.file_uploader(
             "Price file (Excel/CSV/Parquet)",
@@ -282,9 +339,9 @@ with st.sidebar:
         if uploaded is None:
             st.info("Upload a file to continue, or switch to Sample data.")
             st.stop()
-        prices = _load_uploaded(uploaded, sheet)
-        prices.index = pd.to_datetime(prices.index)
-        prices = prices.sort_index().dropna(how="all")
+        raw_prices = _load_uploaded(uploaded, sheet)
+        raw_prices.index = pd.to_datetime(raw_prices.index)
+        raw_prices = raw_prices.sort_index().dropna(how="all")
     else:
         st.markdown(
             "Pull adjusted prices directly from Yahoo Finance. "
@@ -315,15 +372,11 @@ with st.sidebar:
 
         tickers_tuple = tuple(t for t in yahoo_tickers.replace(",", " ").split() if t)
         cache_key = yahoo_cache_key(
-            tickers_tuple,
-            yahoo_period,
-            yahoo_start,
-            yahoo_end,
-            yahoo_interval,
+            tickers_tuple, yahoo_period, yahoo_start, yahoo_end, yahoo_interval,
         )
 
         try:
-            prices = yahoo_prices_for_rerun(
+            raw_prices = yahoo_prices_for_rerun(
                 fetch_clicked=fetch_clicked,
                 cache_key=cache_key,
                 state=st.session_state,
@@ -341,22 +394,62 @@ with st.sidebar:
         except Exception as exc:  # network / library issues
             st.error(f"Could not load Yahoo prices: {exc}")
             st.stop()
-        if prices is None:
+        if raw_prices is None:
             st.info("Set tickers and click **Fetch from Yahoo** to download prices.")
             st.stop()
 
-    st.success(f"Loaded {prices.shape[0]} rows × {prices.shape[1]} assets")
-
     selected_assets = st.multiselect(
         "Universe (assets to include)",
-        options=list(prices.columns),
-        default=list(prices.columns),
+        options=list(raw_prices.columns),
+        default=list(raw_prices.columns),
     )
     if not selected_assets:
         st.warning("Select at least one asset.")
         st.stop()
-    prices = prices[selected_assets]
+    raw_prices = raw_prices[selected_assets]
 
+    st.caption(f"{raw_prices.shape[0]:,} rows × {raw_prices.shape[1]} assets loaded.")
+
+    missing_alignment = st.selectbox(
+        "Missing data",
+        options=["common", "ffill", "drop_assets"],
+        index=0,
+        format_func=lambda m: {
+            "common": "Use only dates where every asset is present",
+            "ffill": "Carry the last price across short gaps, then align",
+            "drop_assets": "Drop short series, then align",
+        }[m],
+        help=(
+            "How to reconcile assets with different histories. Every choice "
+            "changes the sample the covariance is estimated on, so it is "
+            "made explicitly rather than silently."
+        ),
+    )
+    max_ffill = (
+        st.number_input(
+            "Max gap to fill (periods)", min_value=1, max_value=60, value=5
+        )
+        if missing_alignment == "ffill"
+        else 5
+    )
+
+# Alignment happens outside the sidebar so its log can be shown in the tabs.
+prices, alignment_actions = align_panel(
+    raw_prices, method=missing_alignment, max_ffill=int(max_ffill)
+)
+if prices.empty or prices.shape[1] == 0:
+    st.error(
+        "No usable data after alignment. The assets' histories may not "
+        "overlap — try 'Carry the last price across short gaps' or shorten "
+        "the universe."
+    )
+    st.stop()
+
+# ---------------------------------------------------------------------------
+# Sidebar — step 2: currency
+# ---------------------------------------------------------------------------
+
+with st.sidebar:
     st.divider()
     st.header("2 · Currency")
     currency_options = supported_currencies()
@@ -371,56 +464,104 @@ with st.sidebar:
         ),
     )
 
+if "asset_currency" not in st.session_state or set(st.session_state.asset_currency) != set(prices.columns):
+    st.session_state.asset_currency = {a: base_currency for a in prices.columns}
+
+unique_currencies = {
+    st.session_state.asset_currency.get(a, base_currency) for a in prices.columns
+}
+fx_note = None
+if unique_currencies != {base_currency}:
+    try:
+        prices = convert_prices_to_base(
+            prices,
+            asset_currency=st.session_state.asset_currency,
+            base=base_currency,
+        )
+        fx_note = (
+            f"FX-converted {len(prices.columns)} series → {base_currency} via FRED."
+        )
+    except FXError as exc:
+        st.sidebar.error(f"FX conversion failed: {exc}")
+        st.stop()
+
+returns = prices_to_returns(prices).dropna(how="any")
+if returns.empty:
+    st.error("The price panel produced no usable returns.")
+    st.stop()
+
+# ---------------------------------------------------------------------------
+# Sidebar — step 3: method
+# ---------------------------------------------------------------------------
+
+_METHOD_ORDER = [
+    "mean_variance", "min_variance", "max_sharpe", "risk_parity",
+    "hrp", "black_litterman", "cvar", "max_diversification",
+    "inverse_vol", "equal_weight",
+]
+_methods = [m for m in _METHOD_ORDER if m in available_optimizers()]
+_methods += [m for m in available_optimizers() if m not in _methods]
+
+with st.sidebar:
     st.divider()
-    st.header("3 · Optimizer")
+    st.header("3 · Method")
     optimizer_name = st.selectbox(
-        "Method",
-        options=available_optimizers(),
-        index=available_optimizers().index("mean_variance"),
+        "Optimizer",
+        options=_methods,
+        index=_methods.index("mean_variance"),
+        format_func=lambda m: requirements_for(m).display_name,
         key="optimizer_name",
-        help="Choose the optimization technique.",
+        help="Ordered from most to least assumption-heavy.",
     )
+    req = requirements_for(optimizer_name)
+    st.caption(req.summary)
     ws = derive_widget_state(optimizer_name)
+
+    st.divider()
+    st.header("4 · Assumptions")
     risk_free_rate = st.number_input(
         "Risk-free rate (annual)",
         min_value=0.0, max_value=0.30,
         value=0.04, step=0.005, format="%.4f",
         key="risk_free_rate",
         disabled=not ws["risk_free_rate"]["enabled"],
-        help=ws["risk_free_rate"]["tooltip"],
+        help=ws["risk_free_rate"]["tooltip"]
+        or "Used for Sharpe, the tangency portfolio, and CAPM/Black-Litterman.",
     )
     periods_per_year = st.number_input(
         "Periods per year", min_value=1, max_value=365, value=252,
         key="periods_per_year",
+        help="252 for daily data, 52 for weekly, 12 for monthly.",
     )
+    cov_options = ["ledoit_wolf", "oas", "sample", "ewma", "semi", "shrink"]
     cov_method = st.selectbox(
         "Covariance estimator",
-        options=["ledoit_wolf", "sample", "oas", "ewma", "semi", "shrink"],
+        options=cov_options,
         index=0,
         key="cov_method",
         disabled=not ws["cov_method"]["enabled"],
-        help=ws["cov_method"]["tooltip"],
+        help=ws["cov_method"]["tooltip"] or "Shrinkage estimators first.",
     )
+    if ws["cov_method"]["enabled"]:
+        st.caption(COVARIANCE_DESCRIPTIONS.get(cov_method, ""))
     ewma_lambda = (
         st.slider(
             "EWMA λ", 0.80, 0.999, 0.94, 0.005,
             key="ewma_lambda",
-            disabled=not ws["ewma_lambda"]["enabled"],
-            help=ws["ewma_lambda"]["tooltip"],
+            help="Effective sample is about 1/(1−λ) observations.",
         )
         if cov_method == "ewma" and ws["cov_method"]["enabled"]
         else 0.94
     )
 
+    st.divider()
+    st.header("5 · Objective")
     target_return: float | None = None
     target_volatility: float | None = None
     risk_aversion = 1.0
     cvar_alpha = 0.05
     risk_budget: dict[str, float] | None = None
 
-    # The Mode radio is for methods that genuinely offer >1 mode
-    # (mean_variance and Black-Litterman). CVaR has only target_return and
-    # is handled in its own block below.
     show_mode_radio = (
         optimizer_name != "cvar"
         and (ws["target_return"]["enabled"] or ws["target_volatility"]["enabled"])
@@ -434,35 +575,89 @@ with st.sidebar:
             modes.append("Target volatility")
         if ws["risk_aversion"]["enabled"]:
             modes.append("Utility")
-        mode = st.radio(
-            "Mode", modes, horizontal=True, key="mv_mode",
-        )
+        mode = st.radio("Mode", modes, horizontal=True, key="mv_mode")
         if mode == "Target return":
             target_return = st.number_input(
                 "Target return (annual)", value=0.07, step=0.005, format="%.4f",
                 key="target_return",
+                help="Minimize risk subject to hitting exactly this return.",
             )
+            if optimizer_name == "black_litterman":
+                st.caption(
+                    "Black-Litterman targets its **equilibrium posterior**, "
+                    "which usually sits well below historical means. The "
+                    "constraints tab reports the range this method can "
+                    "actually reach."
+                )
         elif mode == "Target volatility":
             target_volatility = st.number_input(
                 "Target volatility (annual)", value=0.10, step=0.005, format="%.4f",
                 key="target_volatility",
+                help="Maximize return subject to staying under this volatility.",
             )
         else:
-            risk_aversion = st.slider("Risk aversion λ", 0.1, 20.0, 2.5, key="risk_aversion")
+            risk_aversion = st.slider(
+                "Risk aversion λ", 0.1, 20.0, 2.5, key="risk_aversion",
+                help="Maximize μ'w − λ·w'Σw. Higher λ means a safer portfolio.",
+            )
+    elif not ws["risk_aversion"]["enabled"] and optimizer_name != "cvar":
+        st.caption(
+            f"{req.display_name} has no objective to tune — it is fully "
+            "determined by the covariance and the constraints."
+        )
+
     if optimizer_name == "cvar":
         cvar_alpha = st.slider(
-            "CVaR tail prob α", 0.01, 0.20, 0.05, 0.01,
+            "CVaR tail probability α", 0.01, 0.20, 0.05, 0.01,
             key="cvar_alpha",
-            help="0.05 ⇒ 95% CVaR.",
+            help="0.05 ⇒ the 95% CVaR: the average of the worst 5% of periods.",
         )
-        target_return = st.number_input(
-            "Target return (optional)", value=0.0, step=0.005, format="%.4f",
-            key="target_return_cvar",
+        n_tail = int(cvar_alpha * len(returns))
+        st.caption(
+            f"About {n_tail} of {len(returns):,} observations drive the estimate."
+            + ("  ⚠️ That is very few." if n_tail < 10 else "")
         )
-        target_return = None if target_return == 0.0 else target_return
+        _tr = st.number_input(
+            "Minimum return (optional, 0 = none)",
+            value=0.0, step=0.005, format="%.4f", key="target_return_cvar",
+        )
+        target_return = None if _tr == 0.0 else _tr
 
     st.divider()
-    st.header("4 · Frontier")
+    st.header("6 · Exposure")
+    long_only = st.checkbox(
+        "Long only", value=True, key="long_only",
+        help="Off allows short positions, subject to each asset's minimum weight.",
+    )
+    leverage_cap: float | None = None
+    if not long_only:
+        leverage_cap = st.slider(
+            "Gross-exposure cap (Σ|w|)", 1.0, 3.0, 1.5, 0.1,
+            help="1.5 means 125% long against 25% short, or any equivalent mix.",
+        )
+    use_turnover = st.checkbox(
+        "Turnover budget",
+        value=False,
+        help=(
+            "Limit how much of the book may change versus a previous "
+            "allocation. Honoured by mean-variance and CVaR; other methods "
+            "warn instead of silently ignoring it."
+        ),
+    )
+    turnover_limit: float | None = None
+    if use_turnover:
+        turnover_limit = st.slider(
+            "Max one-way turnover", 0.01, 2.0, 0.20, 0.01,
+            help="0.20 means at most 20% of the portfolio changes hands.",
+        )
+        if not req.supports_turnover:
+            st.warning(
+                f"{req.display_name} cannot enforce a turnover budget. "
+                "Use mean-variance or CVaR to make it bind."
+            )
+
+    st.divider()
+    st.header("7 · Frontier")
     build_frontier = st.checkbox(
         "Build efficient frontier",
         value=True,
@@ -478,120 +673,154 @@ with st.sidebar:
 
 
 # ---------------------------------------------------------------------------
-# Currency conversion (apply once, before returns)
+# Tabs
 # ---------------------------------------------------------------------------
-
-if "asset_currency" not in st.session_state or set(st.session_state.asset_currency) != set(prices.columns):
-    st.session_state.asset_currency = {a: base_currency for a in prices.columns}
-
-unique_currencies = {st.session_state.asset_currency.get(a, base_currency) for a in prices.columns}
-if unique_currencies != {base_currency}:
-    try:
-        prices = convert_prices_to_base(
-            prices,
-            asset_currency=st.session_state.asset_currency,
-            base=base_currency,
-        )
-        with st.sidebar:
-            st.caption(
-                f"FX-converted {len(prices.columns)} series → {base_currency} via FRED."
-            )
-    except FXError as exc:
-        st.sidebar.error(f"FX conversion failed: {exc}")
-        st.stop()
-
-
-# ---------------------------------------------------------------------------
-# Returns + tabs
-# ---------------------------------------------------------------------------
-
-returns = prices_to_returns(prices)
 
 st.markdown("---")
 (
     tab_overview,
     tab_assets,
     tab_constraints,
+    tab_optimize,
+    tab_backtest,
     tab_compare,
     tab_whatif,
-    tab_optimize,
     tab_report,
 ) = st.tabs(
     [
-        "🌐 Overview",
+        "🌐 Data",
         "📊 Assets",
-        "⚙️ Expected returns & constraints",
+        "⚙️ Assumptions & constraints",
+        "🚀 Optimize",
+        "📉 Backtest",
         "🆚 Compare",
         "🎚️ What-if",
-        "🚀 Optimize",
         "📤 Report",
     ]
 )
-
 
 if st.session_state.scenario_load_warning:
     st.warning(st.session_state.scenario_load_warning)
     st.session_state.scenario_load_warning = None
 
 
+quality = _quality_cached(_frame_hash(raw_prices), int(periods_per_year), raw_prices)
+
+
 # ---------------------------------------------------------------------------
-# Overview
+# 🌐 Data
 # ---------------------------------------------------------------------------
 
 with tab_overview:
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Assets", returns.shape[1])
-    c2.metric("Periods", returns.shape[0])
-    c3.metric("Start", str(returns.index.min().date()))
-    c4.metric("End", str(returns.index.max().date()))
+    metric_row(
+        [
+            ("Assets", str(returns.shape[1]), None),
+            ("Periods", f"{returns.shape[0]:,}", None),
+            ("Start", str(returns.index.min().date()), None),
+            ("End", str(returns.index.max().date()), None),
+        ]
+    )
+
+    render_data_quality(quality)
+    if alignment_actions:
+        with st.expander("What alignment did to the panel", expanded=False):
+            for action in alignment_actions:
+                st.markdown(f"- {action}")
+    if fx_note:
+        st.caption(fx_note)
 
     st.subheader("Cumulative returns")
-    st.plotly_chart(plot_wealth_index(returns), use_container_width=True)
+    st.plotly_chart(plot_wealth_index(returns), width="stretch")
 
-    st.subheader("Correlation heatmap")
-    st.plotly_chart(plot_correlation_heatmap(returns.corr()), use_container_width=True)
+    left, right = st.columns([3, 2])
+    with left:
+        st.subheader("Correlation")
+        st.plotly_chart(
+            plot_correlation_heatmap(returns.corr()), width="stretch"
+        )
+    with right:
+        st.subheader("Coverage")
+        st.caption(
+            "Observations available per asset, before alignment. Wide "
+            "differences mean the common sample is much shorter than the "
+            "longest series."
+        )
+        coverage = quality.per_asset[
+            ["observations", "first_date", "last_date", "annualized_vol"]
+        ].copy()
+        coverage["annualized_vol"] = coverage["annualized_vol"].map(
+            lambda v: f"{v:.1%}" if pd.notna(v) else "—"
+        )
+        st.dataframe(coverage, width="stretch")
 
 
 # ---------------------------------------------------------------------------
-# Assets — per-asset stats
+# 📊 Assets
 # ---------------------------------------------------------------------------
 
 with tab_assets:
-    st.subheader("Per-asset summary statistics")
-    stats = summary_stats(
-        returns, periods_per_year=periods_per_year, riskfree_rate=risk_free_rate
+    st.subheader("Per-asset statistics")
+    extended = st.toggle(
+        "Show extended metrics",
+        value=False,
+        help=(
+            "Adds Calmar, Omega, tail ratio, hit rate, the Ulcer index, "
+            "drawdown duration, and the probabilistic Sharpe ratio."
+        ),
     )
-    formatter = {
-        "Annualized Return": "{:.2%}",
-        "Annualized Vol": "{:.2%}",
-        "Skewness": "{:.3f}",
-        "Kurtosis": "{:.3f}",
-        "Cornish-Fisher VaR(5%)": "{:.2%}",
-        "Historic CVaR(5%)": "{:.2%}",
-        "Sharpe Ratio": "{:.3f}",
-        "Sortino Ratio": "{:.3f}",
-        "Max Drawdown": "{:.2%}",
-    }
-    st.dataframe(stats.style.format(formatter), use_container_width=True)
+    stats = summary_stats(
+        returns,
+        periods_per_year=int(periods_per_year),
+        riskfree_rate=float(risk_free_rate),
+        extended=extended,
+    )
+    st.dataframe(format_table(stats), width="stretch")
+    if extended:
+        st.caption(
+            "**Prob. Sharpe > 0** is the probability the true Sharpe ratio is "
+            "positive, given the sample's length, skew and kurtosis. Below "
+            "~95% the headline Sharpe is not statistically distinguishable "
+            "from zero."
+        )
 
-    st.subheader("Drawdown")
+    st.subheader("Drawdowns")
     sel = st.multiselect(
-        "Series to plot", options=list(returns.columns), default=list(returns.columns[:3])
+        "Series to plot",
+        options=list(returns.columns),
+        default=list(returns.columns[:3]),
     )
     if sel:
-        st.plotly_chart(plot_drawdown(returns[sel]), use_container_width=True)
+        st.plotly_chart(plot_drawdown(returns[sel]), width="stretch")
+        focus = st.selectbox("Drawdown episodes for", options=sel, index=0)
+        episodes = drawdown_table(returns[focus], top=5)
+        if episodes.empty:
+            st.caption("No drawdown episodes in this sample.")
+        else:
+            display = episodes.copy()
+            display["max_drawdown"] = display["max_drawdown"].map("{:.2%}".format)
+            st.dataframe(
+                display[
+                    [
+                        "peak_date", "trough_date", "recovery_date",
+                        "max_drawdown", "decline_periods", "recovery_periods",
+                        "recovered",
+                    ]
+                ],
+                width="stretch", hide_index=True,
+            )
+            st.caption(
+                "Depth is only half the story — how long a portfolio stayed "
+                "underwater is what decides whether it was actually held."
+            )
 
 
 # ---------------------------------------------------------------------------
-# Expected returns + constraints — fully editable in-table
+# ⚙️ Assumptions & constraints
 # ---------------------------------------------------------------------------
 
 with tab_constraints:
-    st.subheader("Expected returns and constraints")
-    st.caption(
-        "Edit any cell. Min/Max are weight bounds; Group is used for "
-        "asset-class constraints set below."
-    )
+    render_method_card(req)
+    st.divider()
 
     historical_mu = _historical_mu_cached(
         _frame_hash(returns), int(periods_per_year), returns,
@@ -605,25 +834,37 @@ with tab_constraints:
                 "Max Weight": 1.0,
                 "Group": "Other",
                 "Currency": [
-                    st.session_state.asset_currency.get(a, base_currency) for a in returns.columns
+                    st.session_state.asset_currency.get(a, base_currency)
+                    for a in returns.columns
                 ],
             },
             index=returns.columns,
         )
     elif "Currency" not in st.session_state.config_table.columns:
         st.session_state.config_table["Currency"] = [
-            st.session_state.asset_currency.get(a, base_currency) for a in returns.columns
+            st.session_state.asset_currency.get(a, base_currency)
+            for a in returns.columns
         ]
 
     if ws["expected_returns_method"]["enabled"]:
+        st.markdown("**Expected returns**")
+        er_options = ["historical_mean", "shrunk_mean", "ema", "capm"]
         er_method = st.radio(
-            "Expected-returns method",
-            options=["historical_mean", "ema", "capm"],
-            index=["historical_mean", "ema", "capm"].index(
+            "Method",
+            options=er_options,
+            index=er_options.index(
                 st.session_state.get("expected_returns_method", "historical_mean")
-            ),
+            )
+            if st.session_state.get("expected_returns_method", "historical_mean")
+            in er_options
+            else 0,
             horizontal=True,
             key="expected_returns_method",
+        )
+        st.caption(
+            EXPECTED_RETURN_DESCRIPTIONS.get(
+                "mean" if er_method == "historical_mean" else er_method, ""
+            )
         )
         if er_method == "ema":
             st.session_state.ema_span = st.slider(
@@ -641,12 +882,13 @@ with tab_constraints:
                 key="market_return_input",
             )
             mw_idx = list(returns.columns)
-            mw_default = pd.DataFrame(
-                {"Market weight": [1.0 / len(mw_idx)] * len(mw_idx)},
-                index=mw_idx,
-            )
-            if "market_weights_table" not in st.session_state:
-                st.session_state.market_weights_table = mw_default
+            if (
+                "market_weights_table" not in st.session_state
+                or set(st.session_state.market_weights_table.index) != set(mw_idx)
+            ):
+                st.session_state.market_weights_table = pd.DataFrame(
+                    {"Market weight": [1.0 / len(mw_idx)] * len(mw_idx)}, index=mw_idx
+                )
             st.session_state.market_weights_table = st.data_editor(
                 st.session_state.market_weights_table,
                 num_rows="fixed",
@@ -666,33 +908,36 @@ with tab_constraints:
                 and "market_weights_table" in st.session_state
                 else None
             )
-            seeded = expected_returns_from_history(
-                returns,
-                method=("mean" if er_method == "historical_mean" else er_method),
-                periods_per_year=int(periods_per_year),
-                span=int(st.session_state.get("ema_span", 180)),
-                market_return=float(st.session_state.get("market_return") or 0.0) or None,
-                risk_free_rate=float(risk_free_rate),
-                market_weights=mw_for_capm,
-                cov_matrix=_covariance_cached(
-                    _frame_hash(returns),
-                    cov_method, float(ewma_lambda),
-                    int(periods_per_year), True,
+            try:
+                seeded = expected_returns_from_history(
                     returns,
-                ),
-            )
-            st.session_state.config_table["Expected Return"] = seeded.round(4)
-            st.rerun()
+                    method=("mean" if er_method == "historical_mean" else er_method),
+                    periods_per_year=int(periods_per_year),
+                    span=int(st.session_state.get("ema_span", 180)),
+                    market_return=float(st.session_state.get("market_return") or 0.0) or None,
+                    risk_free_rate=float(risk_free_rate),
+                    market_weights=mw_for_capm,
+                    cov_matrix=_covariance_cached(
+                        _frame_hash(returns), cov_method, float(ewma_lambda),
+                        int(periods_per_year), True, returns,
+                    ),
+                )
+                st.session_state.config_table["Expected Return"] = seeded.round(4)
+                st.rerun()
+            except ValueError as exc:
+                st.error(str(exc))
 
+    st.markdown("**Per-asset expected returns and weight bounds**")
+    st.caption(
+        "Edit any cell. Min/Max are weight bounds; Group drives the "
+        "asset-class constraints below."
+    )
     if ws["soft_bounds_caption"]["enabled"]:
-        st.caption(
-            "_Bounds are enforced via projection on solved weights "
-            "(soft bounds; small drift may occur for marginal cases)._"
-        )
+        st.info(req.bounds_note)
 
     edited = st.data_editor(
         st.session_state.config_table,
-        use_container_width=True,
+        width="stretch",
         num_rows="fixed",
         column_config={
             "Expected Return": st.column_config.NumberColumn(
@@ -700,8 +945,12 @@ with tab_constraints:
                 disabled=not ws["expected_returns_column"]["enabled"],
                 help=ws["expected_returns_column"]["tooltip"],
             ),
-            "Min Weight": st.column_config.NumberColumn(min_value=-1.0, max_value=1.0, step=0.01, format="%.2f"),
-            "Max Weight": st.column_config.NumberColumn(min_value=0.0, max_value=1.5, step=0.01, format="%.2f"),
+            "Min Weight": st.column_config.NumberColumn(
+                min_value=-1.0, max_value=1.0, step=0.01, format="%.2f"
+            ),
+            "Max Weight": st.column_config.NumberColumn(
+                min_value=0.0, max_value=1.5, step=0.01, format="%.2f"
+            ),
             "Group": st.column_config.TextColumn(),
             "Currency": st.column_config.SelectboxColumn(
                 "Currency",
@@ -714,13 +963,9 @@ with tab_constraints:
     st.session_state.asset_currency = {
         a: str(edited.loc[a, "Currency"]) for a in returns.columns
     }
-    st.caption(
-        f"Currencies set per asset; non-{base_currency} series are converted "
-        "via FRED FX rates the next time prices are loaded."
-    )
 
     if ws["group_bounds"]["enabled"]:
-        st.markdown("**Group constraints**")
+        st.markdown("**Group (asset-class) constraints**")
         unique_groups = sorted(edited["Group"].dropna().unique().tolist())
         if unique_groups:
             gb_default = pd.DataFrame(
@@ -730,58 +975,131 @@ with tab_constraints:
                 st.session_state.group_bounds = gb_default
             st.session_state.group_bounds = st.data_editor(
                 st.session_state.group_bounds,
-                use_container_width=True,
+                width="stretch",
                 num_rows="fixed",
                 column_config={
-                    "Min Weight": st.column_config.NumberColumn(min_value=0.0, max_value=1.5, step=0.01, format="%.2f"),
-                    "Max Weight": st.column_config.NumberColumn(min_value=0.0, max_value=1.5, step=0.01, format="%.2f"),
+                    "Min Weight": st.column_config.NumberColumn(
+                        min_value=0.0, max_value=1.5, step=0.01, format="%.2f"
+                    ),
+                    "Max Weight": st.column_config.NumberColumn(
+                        min_value=0.0, max_value=1.5, step=0.01, format="%.2f"
+                    ),
                 },
             )
     else:
         st.caption(
-            f"_{optimizer_name} does not enforce group bounds — group editor hidden._"
+            f"_{req.display_name} does not enforce group bounds — editor hidden._"
         )
 
     if optimizer_name == "risk_parity":
-        st.markdown("**Risk budgets** (each share of total variance, sums to 1)")
+        st.markdown("**Risk budgets** (each asset's target share of total risk)")
         if "risk_budget" not in st.session_state or set(st.session_state.risk_budget.index) != set(returns.columns):
             st.session_state.risk_budget = pd.DataFrame(
                 {"Risk Budget": 1.0 / len(returns.columns)}, index=returns.columns
             )
         st.session_state.risk_budget = st.data_editor(
             st.session_state.risk_budget,
-            use_container_width=True,
+            width="stretch",
             num_rows="fixed",
             column_config={
-                "Risk Budget": st.column_config.NumberColumn(min_value=0.0, max_value=1.0, step=0.01, format="%.3f"),
+                "Risk Budget": st.column_config.NumberColumn(
+                    min_value=0.001, max_value=1.0, step=0.01, format="%.3f",
+                    help="Must be strictly positive for every asset.",
+                ),
             },
         )
-        risk_budget = st.session_state.risk_budget["Risk Budget"].to_dict()
-    elif optimizer_name == "black_litterman":
-        st.markdown("**Black-Litterman views** (asset → annual expected return)")
-        if "bl_views" not in st.session_state or set(st.session_state.bl_views.index) != set(returns.columns):
-            st.session_state.bl_views = pd.DataFrame(
-                {"View": np.nan, "Confidence (variance)": np.nan},
-                index=returns.columns,
+        budget_total = float(st.session_state.risk_budget["Risk Budget"].sum())
+        if abs(budget_total - 1.0) > 1e-6:
+            st.caption(
+                f"Budgets sum to {budget_total:.3f}; they will be renormalized to 1."
             )
-        st.session_state.bl_views = st.data_editor(
-            st.session_state.bl_views,
-            use_container_width=True,
-            num_rows="fixed",
-            column_config={
-                "View": st.column_config.NumberColumn(format="%.4f"),
-                "Confidence (variance)": st.column_config.NumberColumn(format="%.6f"),
-            },
-        )
+        risk_budget = st.session_state.risk_budget["Risk Budget"].to_dict()
 
-        st.markdown("**Black-Litterman extras**")
-        st.session_state["bl_tau"] = st.slider(
-            "τ (prior uncertainty)",
-            min_value=0.01, max_value=0.5,
-            value=float(st.session_state.get("bl_tau", 0.05)),
-            step=0.01,
-            key="bl_tau_slider",
+    elif optimizer_name == "black_litterman":
+        st.markdown("**Black-Litterman views**")
+        st.caption(
+            "An **absolute** view names the return you expect from one asset. "
+            "A **relative** view names a spread — 'A beats B by 2%' — and "
+            "leaves the overall market level alone, which is usually how "
+            "opinions are actually held."
         )
+        view_kind = st.radio(
+            "View type", ["Absolute", "Relative (spread)"], horizontal=True,
+            key="bl_view_kind",
+        )
+        if view_kind == "Absolute":
+            if "bl_views" not in st.session_state or set(st.session_state.bl_views.index) != set(returns.columns):
+                st.session_state.bl_views = pd.DataFrame(
+                    {"View": np.nan, "Confidence (variance)": np.nan},
+                    index=returns.columns,
+                )
+            st.session_state.bl_views = st.data_editor(
+                st.session_state.bl_views,
+                width="stretch",
+                num_rows="fixed",
+                column_config={
+                    "View": st.column_config.NumberColumn(
+                        format="%.4f", help="Annualized expected return."
+                    ),
+                    "Confidence (variance)": st.column_config.NumberColumn(
+                        format="%.6f",
+                        help="Variance of the view's error. Blank uses the "
+                        "He-Litterman default; smaller means more confident.",
+                    ),
+                },
+            )
+        else:
+            if "bl_relative_views" not in st.session_state:
+                st.session_state.bl_relative_views = pd.DataFrame(
+                    {
+                        "Outperforms": [returns.columns[0]],
+                        "Underperforms": [returns.columns[-1]],
+                        "By (annual)": [0.02],
+                        "Confidence (variance)": [np.nan],
+                    }
+                )
+            st.session_state.bl_relative_views = st.data_editor(
+                st.session_state.bl_relative_views,
+                width="stretch",
+                num_rows="dynamic",
+                column_config={
+                    "Outperforms": st.column_config.SelectboxColumn(
+                        options=list(returns.columns)
+                    ),
+                    "Underperforms": st.column_config.SelectboxColumn(
+                        options=list(returns.columns)
+                    ),
+                    "By (annual)": st.column_config.NumberColumn(format="%.4f"),
+                    "Confidence (variance)": st.column_config.NumberColumn(
+                        format="%.6f"
+                    ),
+                },
+            )
+
+        st.markdown("**Equilibrium prior**")
+        c1, c2 = st.columns(2)
+        with c1:
+            st.session_state["bl_tau"] = st.slider(
+                "τ (prior uncertainty)", 0.01, 0.5,
+                float(st.session_state.get("bl_tau", 0.05)), 0.01,
+                key="bl_tau_slider",
+                help="Scales the prior covariance. Smaller τ means a firmer prior.",
+            )
+        with c2:
+            st.session_state["bl_calibrate"] = st.checkbox(
+                "Imply δ from a market return",
+                value=bool(st.session_state.get("bl_calibrate", False)),
+                help=(
+                    "Back the risk-aversion coefficient out of the market's "
+                    "own Sharpe ratio rather than guessing 2.5."
+                ),
+            )
+            if st.session_state["bl_calibrate"]:
+                st.session_state["bl_market_return"] = st.number_input(
+                    "Market return (annual)",
+                    value=float(st.session_state.get("bl_market_return", 0.07)),
+                    step=0.005, format="%.4f",
+                )
         if (
             "bl_market_caps_table" not in st.session_state
             or set(st.session_state.bl_market_caps_table.index) != set(returns.columns)
@@ -796,12 +1114,12 @@ with tab_constraints:
             column_config={
                 "Market cap weight": st.column_config.NumberColumn(
                     min_value=0.0, max_value=1.0, step=0.01, format="%.3f",
-                    help="Equal weights → equilibrium under no views. Set to your view of the market portfolio.",
+                    help="Equal weights → equilibrium under no views.",
                 ),
             },
         )
 
-    if optimizer_name == "hrp":
+    elif optimizer_name == "hrp":
         st.session_state["hrp_linkage"] = st.selectbox(
             "HRP linkage method",
             options=["single", "average", "complete", "ward"],
@@ -812,8 +1130,30 @@ with tab_constraints:
             help="Hierarchical clustering linkage rule.",
         )
 
+    if use_turnover:
+        st.markdown("**Previous allocation** (what the turnover budget trades from)")
+        if (
+            "previous_weights_table" not in st.session_state
+            or set(st.session_state.previous_weights_table.index) != set(returns.columns)
+        ):
+            st.session_state.previous_weights_table = pd.DataFrame(
+                {"Previous weight": [1.0 / len(returns.columns)] * len(returns.columns)},
+                index=returns.columns,
+            )
+        st.session_state.previous_weights_table = st.data_editor(
+            st.session_state.previous_weights_table,
+            width="stretch",
+            num_rows="fixed",
+            column_config={
+                "Previous weight": st.column_config.NumberColumn(
+                    min_value=-1.0, max_value=1.5, step=0.01, format="%.3f"
+                ),
+            },
+        )
+
 
 def _build_config() -> EngineConfig:
+    """Assemble the EngineConfig from every widget and editable table."""
     table = st.session_state.config_table
     bounds = {
         a: [float(table.loc[a, "Min Weight"]), float(table.loc[a, "Max Weight"])]
@@ -825,7 +1165,9 @@ def _build_config() -> EngineConfig:
         for g, row in st.session_state.group_bounds.iterrows():
             group_bounds[str(g)] = [float(row["Min Weight"]), float(row["Max Weight"])]
 
-    expected_returns = {a: float(table.loc[a, "Expected Return"]) for a in returns.columns}
+    expected_returns = {
+        a: float(table.loc[a, "Expected Return"]) for a in returns.columns
+    }
 
     spec = OptimizerSpec(
         name=optimizer_name,
@@ -842,7 +1184,8 @@ def _build_config() -> EngineConfig:
         spec.risk_budget = st.session_state.risk_budget["Risk Budget"].to_dict()
 
     if optimizer_name == "black_litterman":
-        if "bl_views" in st.session_state:
+        kind = st.session_state.get("bl_view_kind", "Absolute")
+        if kind == "Absolute" and "bl_views" in st.session_state:
             v = st.session_state.bl_views
             spec.bl_views = {
                 a: float(v.loc[a, "View"])
@@ -854,10 +1197,32 @@ def _build_config() -> EngineConfig:
                 for a in v.index
                 if pd.notna(v.loc[a, "Confidence (variance)"])
             }
+        elif "bl_relative_views" in st.session_state:
+            rows = []
+            for _, row in st.session_state.bl_relative_views.iterrows():
+                over, under = row.get("Outperforms"), row.get("Underperforms")
+                spread = row.get("By (annual)")
+                if pd.isna(over) or pd.isna(under) or pd.isna(spread):
+                    continue
+                if over == under:
+                    continue
+                entry = {
+                    "weights": {str(over): 1.0, str(under): -1.0},
+                    "expected_return": float(spread),
+                    "label": f"{over} > {under}",
+                }
+                conf = row.get("Confidence (variance)")
+                if pd.notna(conf):
+                    entry["confidence"] = float(conf)
+                rows.append(entry)
+            spec.bl_views = rows or None
         if "bl_market_caps_table" in st.session_state:
             spec.bl_market_caps = (
                 st.session_state.bl_market_caps_table["Market cap weight"].to_dict()
             )
+        if st.session_state.get("bl_calibrate"):
+            spec.bl_calibrate_risk_aversion = True
+            spec.bl_market_return = float(st.session_state.get("bl_market_return", 0.07))
 
     market_weights = None
     if (
@@ -866,6 +1231,12 @@ def _build_config() -> EngineConfig:
     ):
         market_weights = (
             st.session_state.market_weights_table["Market weight"].to_dict()
+        )
+
+    previous_weights = None
+    if use_turnover and "previous_weights_table" in st.session_state:
+        previous_weights = (
+            st.session_state.previous_weights_table["Previous weight"].to_dict()
         )
 
     return EngineConfig(
@@ -890,7 +1261,45 @@ def _build_config() -> EngineConfig:
         ),
         market_weights=market_weights,
         optimizer=spec,
+        long_only=bool(long_only),
+        leverage=leverage_cap,
+        previous_weights=previous_weights,
+        turnover_limit=turnover_limit,
     )
+
+
+@st.cache_data(show_spinner=False, max_entries=16)
+def _feasibility_cached(signature: str, returns_hash: str, _returns: pd.DataFrame):
+    cfg = EngineConfig.from_dict(json.loads(signature))
+    cov = covariance_matrix(
+        _returns,
+        method=cfg.covariance_method,
+        periods_per_year=cfg.periods_per_year,
+        ewma_lambda=cfg.ewma_lambda,
+    )
+    mu = pd.Series(cfg.expected_returns).reindex(_returns.columns).fillna(0.0)
+    return analyze_feasibility(
+        list(_returns.columns),
+        constraints_from_config(cfg),
+        expected_returns=effective_expected_returns(cfg, cov, mu),
+        cov_matrix=cov,
+    )
+
+
+# The live feasibility panel closes the loop on the constraints tab: the
+# analyst sees whether what they just typed can be solved, before solving.
+with tab_constraints:
+    st.divider()
+    st.markdown("**Feasibility check**")
+    try:
+        live_config = _build_config()
+        live_feasibility = _feasibility_cached(
+            config_signature(live_config), _frame_hash(returns), returns
+        )
+        render_feasibility(live_feasibility)
+    except Exception as exc:  # a half-edited table should not crash the tab
+        live_feasibility = None
+        st.info(f"Feasibility check unavailable: {exc}")
 
 
 # ---------------------------------------------------------------------------
@@ -908,12 +1317,15 @@ def _solve_scenario_cached(signature: str, returns_df: pd.DataFrame):
 def _summarize_run(name: str, run) -> dict:
     w = run.result.weights.sort_values(ascending=False)
     top3 = ", ".join(f"{a}: {v:.1%}" for a, v in w.head(3).items())
+    diag = run.diagnostics
     return {
         "Scenario": name,
         "Optimizer": run.config.optimizer.name,
         "Expected Return": run.result.expected_return,
         "Expected Vol": run.result.expected_volatility,
         "Sharpe": run.result.sharpe_ratio,
+        "Effective N": diag.effective_n if diag else float("nan"),
+        "Div. ratio": diag.diversification_ratio if diag else float("nan"),
         "Active": int((w.abs() > 1e-4).sum()),
         "Top 3 holdings": top3,
     }
@@ -927,19 +1339,684 @@ def _scenario_returns_subset(scn: Scenario, full_returns: pd.DataFrame) -> pd.Da
 
 
 # ---------------------------------------------------------------------------
+# 🚀 Optimize
+# ---------------------------------------------------------------------------
+
+with tab_optimize:
+    head_l, head_r = st.columns([3, 1])
+    with head_l:
+        st.subheader("Run optimization")
+        st.caption(
+            f"{req.display_name} · {cov_method} covariance · "
+            f"{returns.shape[1]} assets · {returns.shape[0]:,} periods"
+        )
+    with head_r:
+        solve_clicked = st.button(
+            "Optimize portfolio", type="primary", width="stretch"
+        )
+
+    if live_feasibility is not None and not live_feasibility.is_feasible:
+        # Show the fix here rather than pointing at another tab: the analyst is
+        # about to press Optimize, and the next click should be the correction,
+        # not navigation.
+        render_feasibility(live_feasibility, show_ok=False)
+
+    if solve_clicked:
+        st.session_state.walk_forward = None
+        try:
+            config = _build_config()
+            with st.spinner("Solving…"):
+                st.session_state["last_run"] = run_engine(
+                    returns,
+                    config,
+                    build_frontier=build_frontier,
+                    n_frontier_points=n_frontier_points,
+                )
+            st.session_state["last_error"] = None
+        except Exception as exc:
+            st.session_state["last_run"] = None
+            st.session_state["last_error"] = str(exc)
+
+    if st.session_state.get("last_error"):
+        st.error(f"Optimization failed: {st.session_state['last_error']}")
+        if live_feasibility is not None and live_feasibility.issues:
+            st.markdown("**Most likely cause:**")
+            render_feasibility(live_feasibility, show_ok=False)
+
+    run = st.session_state.get("last_run")
+    if run is None:
+        st.info(
+            "Set the method and assumptions in the sidebar, review the "
+            "constraints tab, then click **Optimize portfolio**."
+        )
+    else:
+        render_compliance(run.result)
+        for warning in run.warnings:
+            if warning not in run.result.violations:
+                st.warning(warning)
+
+        weights = run.result.weights
+        metric_row(
+            [
+                ("Expected Return", pct(run.result.expected_return), None),
+                ("Expected Volatility", pct(run.result.expected_volatility), None),
+                (
+                    "Sharpe Ratio",
+                    num(run.result.sharpe_ratio),
+                    f"Excess of the {risk_free_rate:.2%} risk-free rate over volatility.",
+                ),
+                (
+                    "Solve time",
+                    f"{run.result.extras.get('solve_seconds', 0):.2f}s",
+                    f"Solver: {run.result.extras.get('solver', '—')}",
+                ),
+            ]
+        )
+        render_portfolio_diagnostics(run.diagnostics)
+        render_projection_distance(run.result)
+
+        st.divider()
+        left, right = st.columns([1, 1])
+        with left:
+            st.markdown("**Weights**")
+            st.plotly_chart(
+                plot_weights_bar(
+                    weights[weights.abs() > 1e-4],
+                    title="Allocation",
+                    bounds=st.session_state.config_table,
+                ),
+                width="stretch",
+            )
+        with right:
+            st.markdown("**Capital vs. risk**")
+            decomposition = run.risk_decomposition()
+            st.plotly_chart(
+                plot_weight_vs_risk(
+                    decomposition[decomposition["weight"].abs() > 1e-4]
+                ),
+                width="stretch",
+            )
+            st.caption(
+                "A position can be small in capital and large in risk. The gap "
+                "between the bars is what risk budgeting exists to close."
+            )
+
+        with st.expander("Full risk decomposition (Euler)", expanded=False):
+            table = run.risk_decomposition()
+            display = table.copy()
+            for col in ("weight", "contribution", "share_of_risk", "standalone_vol"):
+                display[col] = display[col].map("{:.2%}".format)
+            display["marginal_risk"] = table["marginal_risk"].map("{:.4f}".format)
+            st.dataframe(display, width="stretch")
+            st.caption(
+                "`contribution` is in annualized volatility units and sums "
+                f"exactly to the portfolio's {run.result.expected_volatility:.2%}."
+            )
+            groups_rc = run.group_risk_contributions()
+            if len(groups_rc) > 1:
+                st.markdown("**Risk by group**")
+                st.dataframe(
+                    groups_rc.to_frame("Share of risk").style.format(
+                        {"Share of risk": "{:.2%}"}
+                    ),
+                    width="stretch",
+                )
+
+        if run.frontier is not None and ws["frontier"]["enabled"]:
+            st.divider()
+            st.markdown("### Efficient frontier")
+            c1, c2 = st.columns([1, 1])
+            with c1:
+                show_cal = st.checkbox(
+                    "Show capital allocation line", value=True,
+                    help="Risk/return reachable by mixing the tangency "
+                    "portfolio with cash at the risk-free rate.",
+                )
+            with c2:
+                show_dominated = st.checkbox(
+                    "Show dominated branch", value=False,
+                    help="Portfolios below the minimum-variance point: same "
+                    "risk, less return.",
+                )
+            render_frontier_health(run.frontier)
+            on_cvar_axis = run.frontier.risk_measure == "CVaR"
+            if on_cvar_axis:
+                st.caption(
+                    "The x-axis is Conditional VaR, the risk measure this "
+                    "frontier was traced against. The minimum-variance and "
+                    "tangency anchors and the capital allocation line live in "
+                    "volatility space and have no position here."
+                )
+            st.plotly_chart(
+                plot_efficient_frontier(
+                    run.frontier,
+                    risk_free_rate=(
+                        float(risk_free_rate) if show_cal and not on_cvar_axis else None
+                    ),
+                    current_portfolio=(
+                        None
+                        if on_cvar_axis
+                        else (
+                            run.result.expected_volatility,
+                            run.result.expected_return,
+                            "Your portfolio",
+                        )
+                    ),
+                    show_dominated=show_dominated,
+                ),
+                width="stretch",
+            )
+
+            with st.expander(
+                "How much can you trust this frontier?", expanded=False
+            ):
+                st.caption(
+                    "The frontier is a point estimate of a curve. Resampling "
+                    "the return history and re-tracing it shows how far that "
+                    "curve moves when the sample changes — differences "
+                    "narrower than the band are not distinguishable from "
+                    "estimation noise. This re-solves the whole frontier once "
+                    "per draw, so it is deliberately opt-in."
+                )
+                u1, u2 = st.columns([2, 1])
+                with u1:
+                    n_draws = st.slider(
+                        "Resampled histories", 10, 200, 40, 10,
+                        help="More draws give a smoother band at linear cost.",
+                    )
+                with u2:
+                    resample_method = st.selectbox(
+                        "Resampling",
+                        options=["block", "iid", "parametric"],
+                        index=0,
+                        format_func=lambda m: {
+                            "block": "Block bootstrap",
+                            "iid": "IID bootstrap",
+                            "parametric": "Parametric (normal)",
+                        }[m],
+                        help=(
+                            "Block preserves volatility clustering and is the "
+                            "right default for returns; IID destroys it; "
+                            "parametric imposes normality."
+                        ),
+                    )
+                if st.button("Estimate frontier uncertainty", key="run_bootstrap"):
+                    with st.spinner(f"Re-tracing the frontier {n_draws} times…"):
+                        try:
+                            st.session_state["frontier_uncertainty"] = (
+                                bootstrap_frontier(
+                                    returns,
+                                    _build_config(),
+                                    n_draws=int(n_draws),
+                                    n_points=max(int(n_frontier_points) // 2, 6),
+                                    method=resample_method,
+                                )
+                            )
+                        except Exception as exc:
+                            st.session_state["frontier_uncertainty"] = None
+                            st.error(f"Resampling failed: {exc}")
+
+                uncertainty = st.session_state.get("frontier_uncertainty")
+                if uncertainty is not None:
+                    st.info(uncertainty.summary())
+                    if uncertainty.n_failed:
+                        st.caption(
+                            f"{uncertainty.n_failed} draw(s) could not be "
+                            "traced and were dropped."
+                        )
+                    st.plotly_chart(
+                        plot_frontier_uncertainty(uncertainty), width="stretch"
+                    )
+                    band = uncertainty.volatility
+                    st.caption(
+                        f"The band covers {band.min():.1%} to {band.max():.1%} "
+                        "volatility — the risk levels every resampled history "
+                        "could reach. Outside that range the draws disagree on "
+                        "what is even attainable, which is its own kind of "
+                        "uncertainty."
+                    )
+                    if not uncertainty.weight_dispersion.empty:
+                        st.plotly_chart(
+                            plot_weight_dispersion(
+                                uncertainty.weight_dispersion.head(15)
+                            ),
+                            width="stretch",
+                        )
+                        st.caption(
+                            "Positions at the top of this chart are ones the "
+                            "optimizer sizes differently on every resampled "
+                            "history — its conviction there comes from this "
+                            "particular sample, not from the asset."
+                        )
+
+            f1, f2 = st.columns(2)
+            with f1:
+                st.plotly_chart(
+                    plot_portfolio_composition(
+                        run.frontier.weights, "Weights along the frontier"
+                    ),
+                    width="stretch",
+                )
+            with f2:
+                if (
+                    run.frontier.group_weights is not None
+                    and not run.frontier.group_weights.empty
+                ):
+                    st.plotly_chart(
+                        plot_portfolio_composition(
+                            run.frontier.group_weights, "Group weights along the frontier"
+                        ),
+                        width="stretch",
+                    )
+
+        with st.expander("Estimation quality", expanded=False):
+            render_covariance_diagnostics(run.covariance_diagnostics)
+            st.markdown("**Expected returns used**")
+            st.dataframe(
+                run.expected_returns.to_frame("Annualized").style.format(
+                    {"Annualized": "{:.2%}"}
+                ),
+                width="stretch",
+            )
+            if "bl_posterior_returns" in run.result.extras:
+                st.markdown("**Black-Litterman: prior vs. posterior**")
+                bl = pd.DataFrame(
+                    {
+                        "Equilibrium (prior)": run.result.extras["bl_prior_returns"],
+                        "Posterior": run.result.extras["bl_posterior_returns"],
+                        "View impact": run.result.extras["bl_view_impact"],
+                    }
+                )
+                st.dataframe(
+                    bl.style.format("{:.2%}"), width="stretch"
+                )
+                for v in run.result.extras.get("bl_views", []):
+                    st.caption(f"View: {v}")
+            if "hrp_clusters" in run.result.extras:
+                st.markdown("**HRP clusters**")
+                for label, members in run.result.extras["hrp_clusters"].items():
+                    st.caption(f"Cluster {label}: {', '.join(members)}")
+            if "risk_budget_achieved" in run.result.extras:
+                st.markdown("**Risk budget: target vs. achieved**")
+                st.dataframe(
+                    pd.DataFrame(
+                        {
+                            "Target": run.result.extras["risk_budget_target"],
+                            "Achieved": run.result.extras["risk_budget_achieved"],
+                        }
+                    ).style.format("{:.2%}"),
+                    width="stretch",
+                )
+
+        with st.expander("Assumptions behind this result", expanded=False):
+            render_assumptions(run.assumptions())
+
+
+# ---------------------------------------------------------------------------
+# 📉 Backtest
+# ---------------------------------------------------------------------------
+
+with tab_backtest:
+    run = st.session_state.get("last_run")
+    if run is None:
+        st.info("Run an optimization first — the backtest replays its weights.")
+    else:
+        st.subheader("How would this allocation have behaved?")
+        st.warning(
+            "**Everything on this page except the walk-forward section is "
+            "in-sample.** The optimizer estimated its inputs from these same "
+            "returns, so it already knew which assets won. Treat these "
+            "numbers as a description of the fit, not as a forecast."
+        )
+
+        c1, c2 = st.columns(2)
+        with c1:
+            frequency = st.selectbox(
+                "Rebalancing",
+                options=["none", "monthly", "quarterly", "annual", "weekly", "daily"],
+                index=1,
+                format_func=lambda f: f.title() if f != "none" else "Buy and hold",
+                help=(
+                    "Between rebalances, weights drift with performance. "
+                    "Assuming constant weights silently assumes free, "
+                    "continuous rebalancing."
+                ),
+            )
+        with c2:
+            cost_bps = st.slider(
+                "Transaction cost (bps, one-way)", 0, 100, 10,
+                help="Charged on traded notional at each rebalance.",
+            )
+
+        bt = run.backtest(frequency=frequency, transaction_cost_bps=float(cost_bps))
+        metric_row(
+            [
+                (
+                    "Annualized return (net)",
+                    pct(
+                        float(
+                            (1 + bt.returns).prod() ** (periods_per_year / len(bt.returns)) - 1
+                        )
+                    ),
+                    None,
+                ),
+                ("Turnover per year", num(bt.annualized_turnover, 2), "One-way."),
+                ("Total cost", pct(bt.total_cost), None),
+                (
+                    "Cost drag",
+                    pct(bt.cost_drag(int(periods_per_year))),
+                    "Annualized return given up to trading.",
+                ),
+            ]
+        )
+
+        st.plotly_chart(
+            plot_wealth_index(
+                bt.returns.to_frame("portfolio"), "Portfolio wealth (start = 1)"
+            ),
+            width="stretch",
+        )
+        b1, b2 = st.columns(2)
+        with b1:
+            st.plotly_chart(
+                plot_drawdown(bt.returns, "Drawdown"), width="stretch"
+            )
+        with b2:
+            st.plotly_chart(
+                plot_return_distribution(
+                    bt.returns,
+                    var=float(np.percentile(bt.returns, 5)),
+                    cvar=float(bt.returns[bt.returns <= np.percentile(bt.returns, 5)].mean()),
+                    title="Return distribution with tail cuts",
+                ),
+                width="stretch",
+            )
+
+        st.markdown("**Summary**")
+        st.dataframe(
+            format_table(
+                bt.summary(int(periods_per_year), float(risk_free_rate))
+            ),
+            width="stretch",
+        )
+
+        st.divider()
+        st.markdown("### Versus a benchmark")
+        bench_kind = st.selectbox(
+            "Benchmark",
+            options=["None", "Equal weight (1/N)", "Single asset", "Custom weights"],
+            index=1,
+            help=(
+                "Absolute numbers say what happened; relative numbers say "
+                "whether the optimizer earned its fee. Alpha, tracking error "
+                "and active share all need something to be active against."
+            ),
+        )
+        benchmark_returns = None
+        benchmark_weights = None
+        if bench_kind == "Equal weight (1/N)":
+            benchmark_weights = pd.Series(
+                1.0 / returns.shape[1], index=returns.columns
+            )
+        elif bench_kind == "Single asset":
+            bench_asset = st.selectbox(
+                "Benchmark asset", options=list(returns.columns)
+            )
+            benchmark_weights = pd.Series(0.0, index=returns.columns)
+            benchmark_weights[bench_asset] = 1.0
+        elif bench_kind == "Custom weights":
+            if (
+                "benchmark_weights_table" not in st.session_state
+                or set(st.session_state.benchmark_weights_table.index)
+                != set(returns.columns)
+            ):
+                st.session_state.benchmark_weights_table = pd.DataFrame(
+                    {"Weight": [1.0 / returns.shape[1]] * returns.shape[1]},
+                    index=returns.columns,
+                )
+            st.session_state.benchmark_weights_table = st.data_editor(
+                st.session_state.benchmark_weights_table,
+                num_rows="fixed",
+                column_config={
+                    "Weight": st.column_config.NumberColumn(
+                        min_value=-1.0, max_value=1.5, step=0.01, format="%.3f"
+                    ),
+                },
+                key="bench_editor",
+            )
+            benchmark_weights = st.session_state.benchmark_weights_table["Weight"]
+
+        if benchmark_weights is not None:
+            total = float(benchmark_weights.sum())
+            if abs(total) < 1e-9:
+                st.warning("Benchmark weights sum to zero — pick a different mix.")
+            else:
+                benchmark_returns = (returns * (benchmark_weights / total)).sum(axis=1)
+
+        if benchmark_returns is not None:
+            relative = summary_relative(
+                bt.returns.to_frame("portfolio"),
+                benchmark_returns.reindex(bt.returns.index),
+                periods_per_year=int(periods_per_year),
+                riskfree_rate=float(risk_free_rate),
+                extended=True,
+            ).T
+            share = active_share(run.result.weights, benchmark_weights / total)
+            metric_row(
+                [
+                    (
+                        "Annualized excess",
+                        pct(float(relative.loc["Annualized Excess", "portfolio"])),
+                        None,
+                    ),
+                    (
+                        "Tracking error",
+                        pct(float(relative.loc["Annualized T.E.", "portfolio"])),
+                        None,
+                    ),
+                    (
+                        "Information ratio",
+                        num(float(relative.loc["Information Ratio", "portfolio"])),
+                        "Excess return per unit of tracking error.",
+                    ),
+                    (
+                        "Active share",
+                        pct(share),
+                        "Half the sum of absolute weight differences. 0 is the "
+                        "benchmark; 1 shares no holding with it.",
+                    ),
+                ]
+            )
+            st.plotly_chart(
+                plot_wealth_index(
+                    pd.concat(
+                        {
+                            "Portfolio": bt.returns,
+                            "Benchmark": benchmark_returns.reindex(bt.returns.index),
+                        },
+                        axis=1,
+                    ),
+                    "Portfolio vs. benchmark",
+                ),
+                width="stretch",
+            )
+            st.dataframe(
+                relative.style.format("{:.4f}"), width="stretch"
+            )
+            t_stat = float(relative.loc["Alpha t-stat", "portfolio"])
+            alpha = float(relative.loc["Alpha (annualized)", "portfolio"])
+            if abs(t_stat) < 2:
+                st.info(
+                    f"CAPM alpha is {alpha:.2%} with a t-statistic of "
+                    f"{t_stat:.2f}. Below |2| the alpha is not statistically "
+                    "distinguishable from zero on this sample — and this is "
+                    "still the in-sample fit."
+                )
+            else:
+                st.success(
+                    f"CAPM alpha of {alpha:.2%} (t = {t_stat:.2f}) is "
+                    "statistically significant in sample. Confirm it survives "
+                    "the walk-forward below before believing it."
+                )
+
+        if frequency != "daily":
+            with st.expander("Weight drift between rebalances", expanded=False):
+                st.plotly_chart(
+                    plot_weight_evolution(bt.weights, "Actual held weights"),
+                    width="stretch",
+                )
+
+        window = st.slider(
+            "Rolling window (periods)",
+            min_value=int(periods_per_year // 4),
+            max_value=min(int(periods_per_year * 3), max(len(bt.returns) - 1, 2)),
+            value=min(int(periods_per_year), max(len(bt.returns) - 1, 2)),
+            help=(
+                "A full-sample Sharpe cannot tell a strategy that worked "
+                "throughout from one that earned everything in a single window."
+            ),
+        )
+        st.plotly_chart(
+            plot_rolling_metrics(
+                rolling_metrics(
+                    bt.returns, window, float(risk_free_rate), int(periods_per_year)
+                )
+            ),
+            width="stretch",
+        )
+
+        st.divider()
+        st.markdown("### Out-of-sample walk-forward")
+        st.caption(
+            "Re-estimates and re-solves on a rolling window, then holds each "
+            "solution over returns the optimizer never saw. The gap against "
+            "the in-sample curve is how much of the backtest was hindsight."
+        )
+        w1, w2, w3 = st.columns(3)
+        with w1:
+            lookback = st.number_input(
+                "Estimation window (periods)",
+                min_value=int(periods_per_year // 2),
+                max_value=max(int(len(returns) - periods_per_year // 4), 10),
+                value=min(int(periods_per_year * 2), max(len(returns) // 2, 10)),
+            )
+        with w2:
+            rebalance_every = st.number_input(
+                "Re-solve every (periods)",
+                min_value=1, max_value=int(periods_per_year * 2),
+                value=max(int(periods_per_year // 4), 1),
+            )
+        with w3:
+            expanding = st.checkbox(
+                "Expanding window", value=False,
+                help="Grow the sample from inception instead of rolling it.",
+            )
+
+        if st.button("Run walk-forward", key="run_wf"):
+            with st.spinner("Re-solving through history…"):
+                try:
+                    st.session_state.walk_forward = run.walk_forward(
+                        lookback=int(lookback),
+                        rebalance_every=int(rebalance_every),
+                        transaction_cost_bps=float(cost_bps),
+                        expanding=expanding,
+                    )
+                except Exception as exc:
+                    st.session_state.walk_forward = None
+                    st.error(f"Walk-forward failed: {exc}")
+
+        wf = st.session_state.get("walk_forward")
+        if wf is not None:
+            metric_row(
+                [
+                    ("Re-solves", str(wf.n_rebalances), None),
+                    (
+                        "OOS annualized return",
+                        pct(
+                            float(
+                                (1 + wf.returns).prod()
+                                ** (periods_per_year / len(wf.returns))
+                                - 1
+                            )
+                        ),
+                        None,
+                    ),
+                    ("Turnover per year", num(wf.backtest.annualized_turnover, 2), None),
+                    (
+                        "Failed solves",
+                        str(len(wf.failures)),
+                        "Failed re-solves carry the previous book forward.",
+                    ),
+                ]
+            )
+            in_sample = bt.returns.reindex(wf.returns.index)
+            st.plotly_chart(
+                plot_walk_forward_comparison(in_sample, wf.returns),
+                width="stretch",
+            )
+            comparison = run.in_vs_out_of_sample(wf, float(risk_free_rate))
+            st.markdown("**In-sample vs. out-of-sample**")
+            st.dataframe(format_table(comparison), width="stretch")
+            degradation = comparison.loc["Sharpe Ratio", "Degradation"]
+            if degradation > 0.5:
+                st.error(
+                    f"The Sharpe ratio falls by {degradation:.2f} out of sample. "
+                    "Most of the in-sample result was fitted, not earned — "
+                    "consider a more robust method (HRP, minimum variance, "
+                    "risk parity) or shrunk expected returns."
+                )
+            elif degradation > 0.2:
+                st.warning(
+                    f"The Sharpe ratio falls by {degradation:.2f} out of sample — "
+                    "a normal amount of optimism, but size positions on the "
+                    "out-of-sample number."
+                )
+            else:
+                st.success(
+                    f"The Sharpe ratio holds up out of sample (gap "
+                    f"{degradation:.2f})."
+                )
+
+            stability = wf.weight_stability()
+            if not stability.empty:
+                with st.expander("Weight stability across re-solves", expanded=False):
+                    st.caption(
+                        "Average absolute change in each asset's weight between "
+                        "re-solves. Large values mean the optimizer is chasing "
+                        "estimation noise, and the turnover it implies is real."
+                    )
+                    st.dataframe(
+                        stability.sort_values(ascending=False)
+                        .to_frame("Mean absolute change")
+                        .style.format("{:.2%}"),
+                        width="stretch",
+                    )
+            if wf.failures:
+                with st.expander(f"{len(wf.failures)} failed re-solve(s)"):
+                    for f in wf.failures[:20]:
+                        st.text(f)
+
+
+# ---------------------------------------------------------------------------
 # 🆚 Compare
 # ---------------------------------------------------------------------------
 
 with tab_compare:
     if not st.session_state.scenarios:
-        st.info("Save at least one scenario from the **📚 Scenarios** sidebar block to compare.")
+        st.info(
+            "Save at least one scenario from the **📚 Scenarios** sidebar block "
+            "to compare."
+        )
     else:
         names_all = sorted(st.session_state.scenarios.keys())
-        default_sel = (
-            [st.session_state.active_scenario]
-            if st.session_state.active_scenario in names_all
-            else names_all[:1]
-        )
+        # Default to everything saved (up to the cap): a comparison tab that
+        # opens on a single scenario is not comparing anything.
+        default_sel = names_all[:5]
+        if (
+            st.session_state.active_scenario in names_all
+            and st.session_state.active_scenario not in default_sel
+        ):
+            default_sel = [st.session_state.active_scenario] + default_sel[:4]
         chosen = st.multiselect(
             "Scenarios to compare",
             options=names_all,
@@ -950,35 +2027,39 @@ with tab_compare:
         if not chosen:
             st.info("Pick one or more scenarios.")
         else:
-            runs: dict[str, "object"] = {}
+            runs: dict[str, object] = {}
             for n in chosen:
                 scn = st.session_state.scenarios[n]
                 try:
                     sub = _scenario_returns_subset(scn, returns)
                     runs[n] = _solve_scenario_cached(scenario_signature(scn), sub)
-                    coverage = (
-                        len([c for c in returns.columns if c in scn.config.expected_returns]),
-                        len(scn.config.expected_returns),
+                    covered = len(
+                        [c for c in returns.columns if c in scn.config.expected_returns]
                     )
-                    if coverage[0] != coverage[1]:
+                    total = len(scn.config.expected_returns)
+                    if covered != total:
                         st.caption(
-                            f"_{n}: covers {coverage[0]}/{coverage[1]} of its assets in the loaded data._"
+                            f"_{n}: covers {covered}/{total} of its assets in the "
+                            "loaded data._"
                         )
                 except Exception as exc:
                     st.error(f"{n}: {exc}")
 
             if runs:
-                summary_rows = [_summarize_run(n, r) for n, r in runs.items()]
-                summary_df = pd.DataFrame(summary_rows).set_index("Scenario")
+                summary_df = pd.DataFrame(
+                    [_summarize_run(n, r) for n, r in runs.items()]
+                ).set_index("Scenario")
                 st.dataframe(
                     summary_df.style.format(
                         {
                             "Expected Return": "{:.2%}",
                             "Expected Vol": "{:.2%}",
                             "Sharpe": "{:.3f}",
+                            "Effective N": "{:.1f}",
+                            "Div. ratio": "{:.2f}",
                         }
                     ),
-                    use_container_width=True,
+                    width="stretch",
                 )
 
                 weights_df = pd.DataFrame(
@@ -986,21 +2067,24 @@ with tab_compare:
                 ).fillna(0.0)
                 st.plotly_chart(
                     plot_portfolio_composition(weights_df, title="Weights by scenario"),
-                    use_container_width=True,
+                    width="stretch",
                 )
-
                 grouped = plot_risk_contributions(weights_df)
                 grouped.update_layout(title="Per-asset weights")
-                st.plotly_chart(grouped, use_container_width=True)
+                st.plotly_chart(grouped, width="stretch")
 
-                bt_frames = {}
-                for n, r in runs.items():
-                    bt = r.backtest_returns()["portfolio"]
-                    bt_frames[n] = bt
-                bt_df = pd.concat(bt_frames, axis=1)
+                st.markdown("**Backtest comparison**")
+                st.caption(
+                    "In-sample, costless, rebalanced every period — a like-for-"
+                    "like comparison, not a forecast for any of them."
+                )
+                bt_df = pd.concat(
+                    {n: r.backtest_returns()["portfolio"] for n, r in runs.items()},
+                    axis=1,
+                )
                 st.plotly_chart(
                     plot_wealth_index(bt_df, "Backtest comparison"),
-                    use_container_width=True,
+                    width="stretch",
                 )
 
 
@@ -1019,13 +2103,10 @@ with tab_whatif:
             else 0
         )
         anchor_name = st.selectbox(
-            "Anchor scenario",
-            options=names_all,
-            index=default_idx,
+            "Anchor scenario", options=names_all, index=default_idx,
             key="whatif_anchor",
         )
 
-        # Reset overrides on anchor change.
         if st.session_state.get("whatif_last_anchor") != anchor_name:
             st.session_state.whatif_overrides = {}
             st.session_state.whatif_extra = {}
@@ -1041,39 +2122,38 @@ with tab_whatif:
 
         if is_slow:
             st.info(
-                f"Live re-solve disabled (optimizer='{anchor_cfg.optimizer.name}', "
-                f"{n_assets} assets > 25). Drag sliders, then press **Recompute**."
+                f"Live re-solve is off (optimizer='{anchor_cfg.optimizer.name}', "
+                f"{n_assets} assets). Drag sliders, then press **Recompute**."
             )
 
         st.markdown("**Per-asset weight bounds**")
         cols = st.columns(2)
-        overrides: dict[str, tuple[float, float]] = dict(st.session_state.whatif_overrides)
+        overrides: dict[str, tuple[float, float]] = dict(
+            st.session_state.get("whatif_overrides", {})
+        )
         for i, a in enumerate(anchor_assets):
             lo0, hi0 = anchor_cfg.bounds.get(a, [0.0, 1.0])
             current = overrides.get(a, (float(lo0), float(hi0)))
             with cols[i % 2]:
                 lo, hi = st.slider(
-                    f"{a}",
-                    min_value=-1.0, max_value=1.5, step=0.01,
+                    f"{a}", min_value=-1.0, max_value=1.5, step=0.01,
                     value=(float(current[0]), float(current[1])),
                     key=f"whatif_bnd_{anchor_name}_{a}",
                 )
             overrides[a] = (lo, hi)
         st.session_state.whatif_overrides = overrides
 
-        st.markdown("**Optimizer extras**")
-        from optimization_engine.optimizers.requirements import requirements_for as _req_for
+        st.markdown("**Optimizer settings**")
+        anchor_req = requirements_for(anchor_cfg.optimizer.name)
+        extras: dict[str, object] = dict(st.session_state.get("whatif_extra", {}))
 
-        req = _req_for(anchor_cfg.optimizer.name)
-        extras: dict[str, object] = dict(st.session_state.whatif_extra)
-
-        if req.supports_target_return or req.supports_target_volatility:
+        if anchor_req.supports_target_return or anchor_req.supports_target_volatility:
             modes = []
-            if req.supports_target_return:
+            if anchor_req.supports_target_return:
                 modes.append("Target return")
-            if req.supports_target_volatility:
+            if anchor_req.supports_target_volatility:
                 modes.append("Target volatility")
-            if req.supports_risk_aversion:
+            if anchor_req.supports_risk_aversion:
                 modes.append("Utility")
             if anchor_cfg.optimizer.target_return is not None:
                 default_mode = "Target return"
@@ -1084,23 +2164,20 @@ with tab_whatif:
             wf_mode = st.radio(
                 "Mode", modes,
                 index=modes.index(default_mode) if default_mode in modes else 0,
-                horizontal=True,
-                key="whatif_mv_mode",
+                horizontal=True, key="whatif_mv_mode",
             )
             if wf_mode == "Target return":
                 tr = st.number_input(
                     "Target return (annual)",
                     value=float(anchor_cfg.optimizer.target_return or 0.07),
-                    step=0.005, format="%.4f",
-                    key="whatif_target_return",
+                    step=0.005, format="%.4f", key="whatif_target_return",
                 )
                 extras = {"target_return": float(tr), "target_volatility": None}
             elif wf_mode == "Target volatility":
                 tv = st.number_input(
                     "Target volatility (annual)",
                     value=float(anchor_cfg.optimizer.target_volatility or 0.10),
-                    step=0.005, format="%.4f",
-                    key="whatif_target_vol",
+                    step=0.005, format="%.4f", key="whatif_target_vol",
                 )
                 extras = {"target_return": None, "target_volatility": float(tv)}
             else:
@@ -1115,60 +2192,63 @@ with tab_whatif:
                     "risk_aversion": float(ra),
                 }
 
-        for extra in req.extras:
+        for extra in anchor_req.extras:
             if extra.kind == "scalar" and extra.key == "cvar_alpha":
-                ca = st.slider(
-                    "CVaR tail prob α", 0.01, 0.20,
-                    float(anchor_cfg.optimizer.cvar_alpha or 0.05), 0.01,
-                    key="whatif_cvar_alpha",
+                extras["cvar_alpha"] = float(
+                    st.slider(
+                        "CVaR tail probability α", 0.01, 0.20,
+                        float(anchor_cfg.optimizer.cvar_alpha or 0.05), 0.01,
+                        key="whatif_cvar_alpha",
+                    )
                 )
-                extras["cvar_alpha"] = float(ca)
             elif extra.kind == "scalar" and extra.key == "bl_tau":
-                tau = st.slider(
-                    "τ (prior uncertainty)", 0.01, 0.5,
-                    float(anchor_cfg.optimizer.bl_tau or 0.05), 0.01,
-                    key="whatif_bl_tau",
+                extras["bl_tau"] = float(
+                    st.slider(
+                        "τ (prior uncertainty)", 0.01, 0.5,
+                        float(anchor_cfg.optimizer.bl_tau or 0.05), 0.01,
+                        key="whatif_bl_tau",
+                    )
                 )
-                extras["bl_tau"] = float(tau)
             elif extra.kind == "choice" and extra.key == "hrp_linkage":
-                lk = st.selectbox(
-                    "HRP linkage", list(extra.choices or ()),
-                    index=(extra.choices or ("single",)).index(
-                        anchor_cfg.optimizer.hrp_linkage or "single"
-                    ),
-                    key="whatif_hrp_linkage",
+                extras["hrp_linkage"] = str(
+                    st.selectbox(
+                        "HRP linkage", list(extra.choices or ()),
+                        index=(extra.choices or ("single",)).index(
+                            anchor_cfg.optimizer.hrp_linkage or "single"
+                        ),
+                        key="whatif_hrp_linkage",
+                    )
                 )
-                extras["hrp_linkage"] = str(lk)
             elif extra.kind == "per_asset" and extra.key == "risk_budget":
-                # Editable risk budget as a small frame.
                 rb_idx = list(anchor_cfg.expected_returns.keys())
                 default_rb = anchor_cfg.optimizer.risk_budget or {
                     a: 1.0 / len(rb_idx) for a in rb_idx
                 }
-                rb_df = pd.DataFrame(
-                    {"Risk Budget": [default_rb.get(a, 0.0) for a in rb_idx]},
-                    index=rb_idx,
-                )
                 rb_df = st.data_editor(
-                    rb_df, num_rows="fixed",
+                    pd.DataFrame(
+                        {"Risk Budget": [default_rb.get(a, 0.0) for a in rb_idx]},
+                        index=rb_idx,
+                    ),
+                    num_rows="fixed",
                     column_config={
                         "Risk Budget": st.column_config.NumberColumn(
-                            min_value=0.0, max_value=1.0, step=0.01, format="%.3f",
+                            min_value=0.001, max_value=1.0, step=0.01, format="%.3f",
                         ),
                     },
                     key="whatif_rb_editor",
                 )
                 extras["risk_budget"] = rb_df["Risk Budget"].to_dict()
-            # view tables and market caps are skipped in What-if to keep it light;
-            # users can edit those in the constraints tab.
 
         st.session_state.whatif_extra = extras
 
-        # Build the live config from anchor + overrides + extras.
         def _live_config():
             cfg_dict = anchor_cfg.to_dict()
             cfg_dict["bounds"] = {
-                a: list(st.session_state.whatif_overrides.get(a, anchor_cfg.bounds.get(a, [0.0, 1.0])))
+                a: list(
+                    st.session_state.whatif_overrides.get(
+                        a, anchor_cfg.bounds.get(a, [0.0, 1.0])
+                    )
+                )
                 for a in anchor_assets
             }
             opt = dict(cfg_dict["optimizer"])
@@ -1177,51 +2257,78 @@ with tab_whatif:
             cfg_dict["optimizer"] = opt
             return EngineConfig.from_dict(cfg_dict)
 
-        if is_slow:
-            should_solve = st.button("Recompute", type="primary", key="whatif_recompute")
-        else:
-            should_solve = True
+        should_solve = (
+            st.button("Recompute", type="primary", key="whatif_recompute")
+            if is_slow
+            else True
+        )
 
         if should_solve:
             try:
-                live_cfg = _live_config()
+                cfg_live = _live_config()
                 sub = returns[[c for c in returns.columns if c in anchor_assets]]
                 st.session_state.whatif_run = _solve_scenario_cached(
-                    config_signature(live_cfg), sub
+                    config_signature(cfg_live), sub
                 )
                 st.session_state.whatif_error = None
             except Exception as exc:
                 st.session_state.whatif_run = None
                 st.session_state.whatif_error = str(exc)
 
-        wf_run = st.session_state.whatif_run
-        if st.session_state.whatif_error:
+        wf_run = st.session_state.get("whatif_run")
+        if st.session_state.get("whatif_error"):
             st.error(f"Solver: {st.session_state.whatif_error}")
+            try:
+                cfg_live = _live_config()
+                sub = returns[[c for c in returns.columns if c in anchor_assets]]
+                render_feasibility(
+                    _feasibility_cached(
+                        config_signature(cfg_live), _frame_hash(sub), sub
+                    ),
+                    show_ok=False,
+                )
+            except Exception:
+                pass
             if st.button("Reset to anchor", key="whatif_reset"):
                 st.session_state.whatif_overrides = {}
                 st.session_state.whatif_extra = {}
                 st.session_state.whatif_error = None
                 st.rerun()
         elif wf_run is not None:
-            c1, c2, c3, c4 = st.columns(4)
-            c1.metric("Expected Return", f"{wf_run.result.expected_return:.2%}")
-            c2.metric("Expected Vol", f"{wf_run.result.expected_volatility:.2%}")
-            c3.metric("Sharpe", f"{wf_run.result.sharpe_ratio:.2f}")
-            c4.metric("Active", f"{int((wf_run.result.weights.abs() > 1e-4).sum())}")
-
+            metric_row(
+                [
+                    ("Expected Return", pct(wf_run.result.expected_return), None),
+                    ("Expected Vol", pct(wf_run.result.expected_volatility), None),
+                    ("Sharpe", num(wf_run.result.sharpe_ratio), None),
+                    (
+                        "Effective N",
+                        num(wf_run.diagnostics.effective_n, 1)
+                        if wf_run.diagnostics
+                        else "—",
+                        None,
+                    ),
+                ]
+            )
             try:
                 anchor_run = _solve_scenario_cached(
                     scenario_signature(anchor_scn),
                     _scenario_returns_subset(anchor_scn, returns),
                 )
                 weights_df = pd.DataFrame(
-                    {"Anchor": anchor_run.result.weights, "What-if": wf_run.result.weights}
+                    {
+                        "Anchor": anchor_run.result.weights,
+                        "What-if": wf_run.result.weights,
+                    }
                 ).fillna(0.0)
+                delta = weights_df["What-if"] - weights_df["Anchor"]
+                st.caption(
+                    f"One-way turnover versus the anchor: {delta.abs().sum():.2%}"
+                )
             except Exception:
                 weights_df = pd.DataFrame({"What-if": wf_run.result.weights}).fillna(0.0)
             st.plotly_chart(
-                plot_portfolio_composition(weights_df, title="Anchor vs What-if"),
-                use_container_width=True,
+                plot_portfolio_composition(weights_df, title="Anchor vs. What-if"),
+                width="stretch",
             )
 
             if st.button("Save these as new scenario", key="whatif_save"):
@@ -1229,8 +2336,7 @@ with tab_whatif:
 
             if st.session_state.get("whatif_save_pending"):
                 new_name = st.text_input(
-                    "Scenario name",
-                    key="whatif_save_name",
+                    "Scenario name", key="whatif_save_name",
                     placeholder="e.g. Anchor + tighter equities",
                 )
                 cA, cB = st.columns(2)
@@ -1240,10 +2346,9 @@ with tab_whatif:
                     elif new_name in st.session_state.scenarios:
                         st.error(f"Scenario {new_name!r} already exists.")
                     else:
-                        live_cfg = _live_config()
                         st.session_state.scenarios[new_name] = Scenario(
                             name=new_name,
-                            config=live_cfg,
+                            config=_live_config(),
                             notes=f"Forked from {anchor_name}",
                             created_at=now_iso(),
                             updated_at=now_iso(),
@@ -1258,58 +2363,52 @@ with tab_whatif:
 
 
 # ---------------------------------------------------------------------------
-# Sidebar — 📚 Scenarios block (rendered after _build_config exists)
+# Sidebar — 📚 Scenarios (rendered after _build_config exists)
 # ---------------------------------------------------------------------------
 
 with st.sidebar.expander("📚 Scenarios", expanded=False):
     names_in_state = sorted(st.session_state.scenarios.keys())
-    default_idx = 0
     sel_options = ["—"] + names_in_state
-    if st.session_state.active_scenario in names_in_state:
-        default_idx = sel_options.index(st.session_state.active_scenario)
+    default_idx = (
+        sel_options.index(st.session_state.active_scenario)
+        if st.session_state.active_scenario in names_in_state
+        else 0
+    )
     selected = st.selectbox(
-        "Active scenario",
-        options=sel_options,
-        index=default_idx,
-        key="scn_select",
+        "Active scenario", options=sel_options, index=default_idx, key="scn_select"
     )
     has_selection = selected != "—"
 
     new_name = st.text_input("Name", key="scn_new_name").strip()
     notes = st.text_area(
-        "Notes (optional)",
-        key="scn_notes",
-        height=70,
-        max_chars=NOTES_MAX_LEN,
+        "Notes (optional)", key="scn_notes", height=70, max_chars=NOTES_MAX_LEN
     )
     cA, cB = st.columns(2)
-    save_clicked = cA.button("Save", use_container_width=True, key="scn_save")
+    save_clicked = cA.button("Save", width="stretch", key="scn_save")
     update_clicked = cB.button(
-        "Update", disabled=not has_selection, use_container_width=True, key="scn_update"
+        "Update", disabled=not has_selection, width="stretch", key="scn_update"
     )
     cC, cD = st.columns(2)
     load_clicked = cC.button(
-        "Load", disabled=not has_selection, use_container_width=True, key="scn_load"
+        "Load", disabled=not has_selection, width="stretch", key="scn_load"
     )
     delete_clicked = cD.button(
-        "Delete", disabled=not has_selection, use_container_width=True, key="scn_delete"
+        "Delete", disabled=not has_selection, width="stretch", key="scn_delete"
     )
 
     rename_to = st.text_input(
-        "Rename to",
-        key="scn_rename_to",
-        disabled=not has_selection,
+        "Rename to", key="scn_rename_to", disabled=not has_selection
     ).strip()
     rename_clicked = st.button(
-        "Rename",
-        disabled=(not has_selection) or (not rename_to),
-        key="scn_rename",
+        "Rename", disabled=(not has_selection) or (not rename_to), key="scn_rename"
     )
 
     st.divider()
     st.download_button(
         "⬇ Download all (YAML)",
-        data=dump_scenarios_yaml(st.session_state.scenarios) if st.session_state.scenarios else "",
+        data=dump_scenarios_yaml(st.session_state.scenarios)
+        if st.session_state.scenarios
+        else "",
         file_name="scenarios.yaml",
         mime="text/yaml",
         disabled=not st.session_state.scenarios,
@@ -1324,17 +2423,18 @@ with st.sidebar.expander("📚 Scenarios", expanded=False):
         key="scn_merge_mode",
     )
 
-    # Handlers
     if save_clicked:
         if not new_name:
             st.error("Name is required.")
         elif new_name in st.session_state.scenarios:
-            st.error(f"Scenario {new_name!r} already exists. Use Update or pick another name.")
+            st.error(
+                f"Scenario {new_name!r} already exists. Use Update or pick "
+                "another name."
+            )
         else:
-            cfg_now = _build_config()
             ts = now_iso()
             st.session_state.scenarios[new_name] = Scenario(
-                name=new_name, config=cfg_now, notes=notes,
+                name=new_name, config=_build_config(), notes=notes,
                 created_at=ts, updated_at=ts,
             )
             st.session_state.active_scenario = new_name
@@ -1342,11 +2442,10 @@ with st.sidebar.expander("📚 Scenarios", expanded=False):
             st.rerun()
 
     if update_clicked and has_selection:
-        cfg_now = _build_config()
         prev = st.session_state.scenarios[selected]
         st.session_state.scenarios[selected] = Scenario(
             name=selected,
-            config=cfg_now,
+            config=_build_config(),
             notes=notes or prev.notes,
             created_at=prev.created_at or now_iso(),
             updated_at=now_iso(),
@@ -1357,15 +2456,14 @@ with st.sidebar.expander("📚 Scenarios", expanded=False):
 
     if load_clicked and has_selection:
         target_cfg = st.session_state.scenarios[selected].config
-        target_assets = set(target_cfg.expected_returns)
         loaded_assets = set(returns.columns)
-        missing = sorted(target_assets - loaded_assets)
+        missing = sorted(set(target_cfg.expected_returns) - loaded_assets)
         if missing:
-            # Drop missing assets from the scenario before applying (Decision #1).
             kept = [a for a in target_cfg.expected_returns if a in loaded_assets]
             if not kept:
                 st.error(
-                    f"Cannot load {selected!r}: none of its assets are in the loaded data."
+                    f"Cannot load {selected!r}: none of its assets are in the "
+                    "loaded data."
                 )
             else:
                 trimmed_dict = target_cfg.to_dict()
@@ -1382,18 +2480,17 @@ with st.sidebar.expander("📚 Scenarios", expanded=False):
                     a: trimmed_dict["currencies"].get(a, trimmed_dict["base_currency"])
                     for a in kept
                 }
-                # Stash a temporary trimmed scenario keyed by name → reload normally.
-                trimmed_scn = Scenario(
+                prev = st.session_state.scenarios[selected]
+                st.session_state.scenarios[selected] = Scenario(
                     name=selected,
                     config=EngineConfig.from_dict(trimmed_dict),
-                    notes=st.session_state.scenarios[selected].notes,
-                    created_at=st.session_state.scenarios[selected].created_at,
-                    updated_at=st.session_state.scenarios[selected].updated_at,
+                    notes=prev.notes,
+                    created_at=prev.created_at,
+                    updated_at=prev.updated_at,
                 )
-                st.session_state.scenarios[selected] = trimmed_scn
                 st.session_state.scenario_load_warning = (
-                    f"Loaded {selected!r}; dropped {len(missing)} missing asset(s): "
-                    + ", ".join(missing)
+                    f"Loaded {selected!r}; dropped {len(missing)} missing "
+                    "asset(s): " + ", ".join(missing)
                 )
                 st.session_state.pending_scenario_load = selected
                 st.rerun()
@@ -1428,8 +2525,7 @@ with st.sidebar.expander("📚 Scenarios", expanded=False):
 
     if upl is not None:
         try:
-            text = upl.read().decode("utf-8")
-            incoming = load_scenarios_yaml(text)
+            incoming = load_scenarios_yaml(upl.read().decode("utf-8"))
             applied = 0
             for k, v in incoming.items():
                 if k in st.session_state.scenarios:
@@ -1439,20 +2535,16 @@ with st.sidebar.expander("📚 Scenarios", expanded=False):
                         st.session_state.scenarios[k] = v
                         st.session_state.last_run_by_scenario.pop(k, None)
                         applied += 1
-                    else:  # Suffix
+                    else:
                         suffix = 2
                         candidate = f"{k} ({suffix})"
                         while candidate in st.session_state.scenarios:
                             suffix += 1
                             candidate = f"{k} ({suffix})"
-                        new_v = Scenario(
-                            name=candidate,
-                            config=v.config,
-                            notes=v.notes,
-                            created_at=v.created_at,
-                            updated_at=v.updated_at,
+                        st.session_state.scenarios[candidate] = Scenario(
+                            name=candidate, config=v.config, notes=v.notes,
+                            created_at=v.created_at, updated_at=v.updated_at,
                         )
-                        st.session_state.scenarios[candidate] = new_v
                         applied += 1
                 else:
                     st.session_state.scenarios[k] = v
@@ -1463,150 +2555,51 @@ with st.sidebar.expander("📚 Scenarios", expanded=False):
 
 
 # ---------------------------------------------------------------------------
-# Optimize
-# ---------------------------------------------------------------------------
-
-with tab_optimize:
-    st.subheader("Run optimization")
-    if st.button("Optimize portfolio", type="primary"):
-        config = _build_config()
-        with st.spinner("Solving…"):
-            try:
-                run = run_engine(
-                    returns,
-                    config,
-                    build_frontier=build_frontier,
-                    n_frontier_points=n_frontier_points,
-                )
-            except Exception as exc:
-                st.error(f"Optimization failed: {exc}")
-                st.stop()
-        st.session_state["last_run"] = run
-        st.success("Done.")
-
-    run = st.session_state.get("last_run")
-    if run is None:
-        st.info("Configure the optimizer in the sidebar and the constraints tab, then click **Optimize portfolio**.")
-        st.stop()
-
-    weights = run.result.weights
-    nonzero = weights[weights.abs() > 1e-4].sort_values(ascending=False)
-
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Expected Return", f"{run.result.expected_return:.2%}")
-    c2.metric("Expected Volatility", f"{run.result.expected_volatility:.2%}")
-    c3.metric("Sharpe Ratio", f"{run.result.sharpe_ratio:.2f}")
-    c4.metric("Active Positions", f"{int((weights.abs() > 1e-4).sum())}")
-
-    left, right = st.columns([1, 1])
-
-    with left:
-        st.markdown("**Weights**")
-        st.dataframe(
-            nonzero.to_frame("Weight").style.format({"Weight": "{:.2%}"}),
-            use_container_width=True,
-        )
-
-    with right:
-        rc = run.risk_contributions().rename("Risk Contribution")
-        rc_nz = rc[rc.abs() > 1e-4].sort_values(ascending=False)
-        st.markdown("**Risk contributions** (% of variance)")
-        st.dataframe(
-            rc_nz.to_frame().style.format({"Risk Contribution": "{:.2%}"}),
-            use_container_width=True,
-        )
-
-    if run.frontier is not None and ws["frontier"]["enabled"]:
-        st.markdown("### Efficient Frontier")
-        st.plotly_chart(
-            plot_efficient_frontier(run.frontier.summary, run.frontier.max_sharpe_index),
-            use_container_width=True,
-        )
-
-        c1, c2 = st.columns(2)
-        with c1:
-            st.plotly_chart(
-                plot_portfolio_composition(run.frontier.weights, "Weights along frontier"),
-                use_container_width=True,
-            )
-        with c2:
-            if run.frontier.group_weights is not None and not run.frontier.group_weights.empty:
-                st.plotly_chart(
-                    plot_portfolio_composition(
-                        run.frontier.group_weights, "Group weights along frontier"
-                    ),
-                    use_container_width=True,
-                )
-
-    bt = run.backtest_returns()
-    st.markdown("### Backtest")
-    st.plotly_chart(plot_wealth_index(bt, "Portfolio wealth (1 = inception)"), use_container_width=True)
-    st.plotly_chart(plot_drawdown(bt["portfolio"], "Portfolio drawdown"), use_container_width=True)
-
-    abs_summary = run.absolute_summary(riskfree_rate=risk_free_rate)
-    st.markdown("**Backtest summary**")
-    st.dataframe(
-        abs_summary.style.format(
-            {
-                "Annualized Return": "{:.2%}",
-                "Annualized Vol": "{:.2%}",
-                "Skewness": "{:.3f}",
-                "Kurtosis": "{:.3f}",
-                "Cornish-Fisher VaR(5%)": "{:.2%}",
-                "Historic CVaR(5%)": "{:.2%}",
-                "Sharpe Ratio": "{:.3f}",
-                "Sortino Ratio": "{:.3f}",
-                "Max Drawdown": "{:.2%}",
-            }
-        ),
-        use_container_width=True,
-    )
-
-
-# ---------------------------------------------------------------------------
-# Report
+# 📤 Report
 # ---------------------------------------------------------------------------
 
 with tab_report:
     run = st.session_state.get("last_run")
     if run is None:
         st.info("Run an optimization first.")
-        st.stop()
+    else:
+        st.subheader("Export")
+        st.caption(
+            "The workbook carries the assumptions and diagnostics alongside "
+            "the weights, so a reader can see what the numbers rest on."
+        )
 
-    sheets: dict[str, pd.DataFrame] = {
-        "weights": run.result.weights.to_frame("weight"),
-        "summary": pd.DataFrame(
-            [
-                {
-                    "expected_return": run.result.expected_return,
-                    "expected_volatility": run.result.expected_volatility,
-                    "sharpe_ratio": run.result.sharpe_ratio,
-                }
-            ]
-        ),
-        "risk_contributions": run.risk_contributions().to_frame("share_of_variance"),
-        "expected_returns": run.expected_returns.to_frame("annualized"),
-        "cov_matrix": run.cov_matrix,
-        "absolute_summary": run.absolute_summary(riskfree_rate=risk_free_rate),
-    }
-    if run.frontier is not None:
-        sheets["frontier_summary"] = run.frontier.summary
-        sheets["frontier_weights"] = run.frontier.weights
-        if run.frontier.group_weights is not None and not run.frontier.group_weights.empty:
-            sheets["frontier_groups"] = run.frontier.group_weights
+        assumptions = run.assumptions()
+        # Same builder the CLI uses, so a workbook exported from the app and
+        # one written by `optengine optimize` carry identical sheets.
+        sheets = run_sheets(
+            run,
+            riskfree_rate=float(risk_free_rate),
+            data_quality=quality,
+            walk_forward=st.session_state.get("walk_forward"),
+            frontier_uncertainty=st.session_state.get("frontier_uncertainty"),
+        )
 
-    buf = io.BytesIO()
-    with pd.ExcelWriter(buf, engine="xlsxwriter") as writer:
-        for name, df in sheets.items():
-            df.to_excel(writer, sheet_name=name[:31], index=True)
-    buf.seek(0)
-    st.download_button(
-        label="📥 Download Excel report",
-        data=buf,
-        file_name="optimization_report.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    )
+        buf = io.BytesIO()
+        with pd.ExcelWriter(buf, engine="xlsxwriter") as writer:
+            for name, df in sheets.items():
+                df.to_excel(writer, sheet_name=name[:31], index=True)
+        buf.seek(0)
+        st.download_button(
+            label="📥 Download Excel report",
+            data=buf,
+            file_name="optimization_report.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            type="primary",
+        )
+        st.caption(f"{len(sheets)} sheets: {', '.join(sheets)}")
 
-    st.markdown("**Config used (YAML)**")
-    import yaml as _yaml
-    st.code(_yaml.safe_dump(run.config.to_dict(), sort_keys=False), language="yaml")
+        st.markdown("**Assumptions**")
+        render_assumptions(assumptions)
+
+        st.markdown("**Config used (YAML)**")
+        import yaml as _yaml
+
+        st.code(
+            _yaml.safe_dump(run.config.to_dict(), sort_keys=False), language="yaml"
+        )
