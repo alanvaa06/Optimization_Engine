@@ -7,6 +7,7 @@ future refactor cannot quietly reintroduce it.
 from __future__ import annotations
 
 import sys
+import warnings
 from pathlib import Path
 
 import numpy as np
@@ -646,3 +647,39 @@ def test_run_engine_diagnoses_an_unreachable_black_litterman_target(returns, mu)
     )
     with pytest.raises(InfeasibleConstraintsError, match="above the"):
         run_engine(returns, cfg, raise_on_infeasible=True)
+
+
+def test_wealth_accumulation_is_overflow_proof():
+    """A rolling product over a long high-return window overflows float64.
+
+    Compounding in log space keeps the same answer where cumprod works, and
+    keeps working where it does not.
+    """
+    from optimization_engine.analytics.performance import rolling_metrics
+    from optimization_engine.analytics.risk import drawdown_series
+
+    idx = pd.date_range("2000-01-01", periods=3000, freq="D")
+    normal = pd.Series(np.linspace(-0.01, 0.01, 3000), index=idx)
+    reference = (1 + normal).cumprod()
+    reference_dd = reference / reference.cummax() - 1
+    np.testing.assert_allclose(
+        drawdown_series(normal).values, reference_dd.values, atol=1e-12
+    )
+
+    extreme = pd.Series(np.full(3000, 0.5), index=idx)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", RuntimeWarning)
+        rolling = rolling_metrics(extreme, 2000)
+        dd = drawdown_series(extreme)
+    assert np.isfinite(rolling["rolling_return"].iloc[-1])
+    assert float(dd.min()) == pytest.approx(0.0)
+
+
+def test_total_loss_is_reported_not_warned():
+    from optimization_engine.analytics.risk import drawdown_series
+
+    s = pd.Series([0.1, -1.0, 0.5], index=pd.date_range("2020-01-01", periods=3))
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", RuntimeWarning)
+        dd = drawdown_series(s)
+    assert dd.iloc[1] == pytest.approx(-1.0)

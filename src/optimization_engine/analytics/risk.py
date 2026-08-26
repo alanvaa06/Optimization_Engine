@@ -150,11 +150,28 @@ def omega_ratio(
 # ---------------------------------------------------------------------------
 
 
+def log_wealth(returns: pd.Series | pd.DataFrame) -> pd.Series | pd.DataFrame:
+    """Cumulative log growth, ``Σ log(1 + r)``.
+
+    Accumulating in log space rather than with ``cumprod`` keeps long or
+    high-return series from overflowing float64, and removes the rounding
+    that a product of thousands of terms accumulates. A return of exactly
+    −100% yields ``-inf``, which is the correct reading: the capital is gone,
+    and no later return brings it back. That is a deliberate result rather
+    than a numerical accident, so the divide-by-zero it raises is silenced.
+    """
+    with np.errstate(divide="ignore"):
+        return np.log1p(returns).cumsum()
+
+
 def drawdown_series(returns: pd.Series) -> pd.Series:
-    """Drawdown from the running peak, as a negative fraction."""
-    wealth = (1 + returns).cumprod()
-    peak = wealth.cummax()
-    return (wealth - peak) / peak
+    """Drawdown from the running peak, as a negative fraction.
+
+    Computed as ``expm1(log_wealth − cummax(log_wealth))`` so that the peak
+    ratio is evaluated without ever materializing the wealth level itself.
+    """
+    growth = log_wealth(returns)
+    return pd.Series(np.expm1(growth - growth.cummax()), index=returns.index)
 
 
 def drawdown_table(returns: pd.Series, top: int = 5) -> pd.DataFrame:
@@ -167,7 +184,7 @@ def drawdown_table(returns: pd.Series, top: int = 5) -> pd.DataFrame:
     and is flagged.
     """
     dd = drawdown_series(returns)
-    wealth = (1 + returns).cumprod()
+    wealth = wealth_index(returns)
     peak = wealth.cummax()
 
     underwater = dd < -1e-12
@@ -231,6 +248,11 @@ def max_drawdown_duration(returns: pd.Series) -> float:
     if table.empty:
         return 0.0
     return float(table["total_periods"].max())
+
+
+def wealth_index(returns: pd.Series, starting: float = 1.0) -> pd.Series:
+    """Cumulative wealth, accumulated in log space for numerical safety."""
+    return starting * np.exp(log_wealth(returns))
 
 
 def ulcer_index(returns: pd.Series) -> float:

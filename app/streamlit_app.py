@@ -50,6 +50,10 @@ from components import (  # noqa: E402
 )
 
 from optimization_engine.analytics.performance import rolling_metrics, summary_stats  # noqa: E402
+from optimization_engine.analytics.relative import (  # noqa: E402
+    active_share,
+    summary_relative,
+)
 from optimization_engine.analytics.risk import drawdown_table  # noqa: E402
 from optimization_engine.config import EngineConfig, OptimizerSpec  # noqa: E402
 from optimization_engine.data.covariance import (  # noqa: E402
@@ -1632,6 +1636,125 @@ with tab_backtest:
             ),
             width="stretch",
         )
+
+        st.divider()
+        st.markdown("### Versus a benchmark")
+        bench_kind = st.selectbox(
+            "Benchmark",
+            options=["None", "Equal weight (1/N)", "Single asset", "Custom weights"],
+            index=1,
+            help=(
+                "Absolute numbers say what happened; relative numbers say "
+                "whether the optimizer earned its fee. Alpha, tracking error "
+                "and active share all need something to be active against."
+            ),
+        )
+        benchmark_returns = None
+        benchmark_weights = None
+        if bench_kind == "Equal weight (1/N)":
+            benchmark_weights = pd.Series(
+                1.0 / returns.shape[1], index=returns.columns
+            )
+        elif bench_kind == "Single asset":
+            bench_asset = st.selectbox(
+                "Benchmark asset", options=list(returns.columns)
+            )
+            benchmark_weights = pd.Series(0.0, index=returns.columns)
+            benchmark_weights[bench_asset] = 1.0
+        elif bench_kind == "Custom weights":
+            if (
+                "benchmark_weights_table" not in st.session_state
+                or set(st.session_state.benchmark_weights_table.index)
+                != set(returns.columns)
+            ):
+                st.session_state.benchmark_weights_table = pd.DataFrame(
+                    {"Weight": [1.0 / returns.shape[1]] * returns.shape[1]},
+                    index=returns.columns,
+                )
+            st.session_state.benchmark_weights_table = st.data_editor(
+                st.session_state.benchmark_weights_table,
+                num_rows="fixed",
+                column_config={
+                    "Weight": st.column_config.NumberColumn(
+                        min_value=-1.0, max_value=1.5, step=0.01, format="%.3f"
+                    ),
+                },
+                key="bench_editor",
+            )
+            benchmark_weights = st.session_state.benchmark_weights_table["Weight"]
+
+        if benchmark_weights is not None:
+            total = float(benchmark_weights.sum())
+            if abs(total) < 1e-9:
+                st.warning("Benchmark weights sum to zero — pick a different mix.")
+            else:
+                benchmark_returns = (returns * (benchmark_weights / total)).sum(axis=1)
+
+        if benchmark_returns is not None:
+            relative = summary_relative(
+                bt.returns.to_frame("portfolio"),
+                benchmark_returns.reindex(bt.returns.index),
+                periods_per_year=int(periods_per_year),
+                riskfree_rate=float(risk_free_rate),
+                extended=True,
+            ).T
+            share = active_share(run.result.weights, benchmark_weights / total)
+            metric_row(
+                [
+                    (
+                        "Annualized excess",
+                        pct(float(relative.loc["Annualized Excess", "portfolio"])),
+                        None,
+                    ),
+                    (
+                        "Tracking error",
+                        pct(float(relative.loc["Annualized T.E.", "portfolio"])),
+                        None,
+                    ),
+                    (
+                        "Information ratio",
+                        num(float(relative.loc["Information Ratio", "portfolio"])),
+                        "Excess return per unit of tracking error.",
+                    ),
+                    (
+                        "Active share",
+                        pct(share),
+                        "Half the sum of absolute weight differences. 0 is the "
+                        "benchmark; 1 shares no holding with it.",
+                    ),
+                ]
+            )
+            st.plotly_chart(
+                plot_wealth_index(
+                    pd.concat(
+                        {
+                            "Portfolio": bt.returns,
+                            "Benchmark": benchmark_returns.reindex(bt.returns.index),
+                        },
+                        axis=1,
+                    ),
+                    "Portfolio vs. benchmark",
+                ),
+                width="stretch",
+            )
+            st.dataframe(
+                relative.style.format("{:.4f}"), width="stretch"
+            )
+            t_stat = float(relative.loc["Alpha t-stat", "portfolio"])
+            alpha = float(relative.loc["Alpha (annualized)", "portfolio"])
+            if abs(t_stat) < 2:
+                st.info(
+                    f"CAPM alpha is {alpha:.2%} with a t-statistic of "
+                    f"{t_stat:.2f}. Below |2| the alpha is not statistically "
+                    "distinguishable from zero on this sample — and this is "
+                    "still the in-sample fit."
+                )
+            else:
+                st.success(
+                    f"CAPM alpha of {alpha:.2%} (t = {t_stat:.2f}) is "
+                    "statistically significant in sample. Confirm it survives "
+                    "the walk-forward below before believing it."
+                )
 
         if frequency != "daily":
             with st.expander("Weight drift between rebalances", expanded=False):

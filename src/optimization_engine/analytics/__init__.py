@@ -22,12 +22,16 @@ from optimization_engine.analytics.performance import (
     summary_stats,
 )
 from optimization_engine.analytics.relative import (
+    active_share,
     beta,
     capture_ratio,
+    conditional_beta,
     down_capture,
     information_ratio,
+    regression_stats,
     spread,
     summary_relative,
+    tracking_error,
     up_capture,
 )
 from optimization_engine.analytics.risk import (
@@ -68,12 +72,16 @@ __all__ = [
     "sharpe_ratio",
     "sortino_ratio",
     "summary_stats",
+    "active_share",
     "beta",
     "capture_ratio",
+    "conditional_beta",
     "down_capture",
     "information_ratio",
+    "regression_stats",
     "spread",
     "summary_relative",
+    "tracking_error",
     "up_capture",
     "cvar_historic",
     "downside_deviation",

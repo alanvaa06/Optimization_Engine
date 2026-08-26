@@ -9,6 +9,7 @@ from optimization_engine.analytics.risk import (
     cvar_historic,
     downside_deviation,
     drawdown_series,
+    wealth_index,
     kurtosis,
     max_drawdown_duration,
     omega_ratio,
@@ -21,12 +22,19 @@ from optimization_engine.analytics.risk import (
 
 
 def drawdown(return_series: pd.Series, starting_wealth: float = 1000.0) -> pd.DataFrame:
-    """Wealth index, running peak, and drawdown for a return series."""
-    wealth_index = starting_wealth * (1 + return_series).cumprod()
-    previous_peaks = wealth_index.cummax()
-    drawdowns = (wealth_index - previous_peaks) / previous_peaks
+    """Wealth index, running peak, and drawdown for a return series.
+
+    The drawdown column comes from :func:`drawdown_series`, which works in
+    log space, so it stays exact even where the wealth level itself would
+    overflow.
+    """
+    wealth = wealth_index(return_series, starting_wealth)
     return pd.DataFrame(
-        {"Wealth": wealth_index, "Peaks": previous_peaks, "Drawdown": drawdowns}
+        {
+            "Wealth": wealth,
+            "Peaks": wealth.cummax(),
+            "Drawdown": drawdown_series(return_series),
+        }
     )
 
 
@@ -185,9 +193,11 @@ def rolling_metrics(
         raise ValueError(f"Rolling window must be at least 2 periods; got {window}.")
     rf = _rf_per_period(riskfree_rate, periods_per_year)
     roll = r.rolling(window)
-    ann_ret = (1 + r).rolling(window).apply(np.prod, raw=True) ** (
-        periods_per_year / window
-    ) - 1
+    # Compound in log space. A rolling np.prod over a long window can overflow
+    # float64 on high-return series, and it accumulates rounding besides;
+    # summing logs is exact to machine precision and cannot overflow.
+    growth = np.log1p(r.clip(lower=-1 + 1e-12))
+    ann_ret = np.expm1(growth.rolling(window).sum() * (periods_per_year / window))
     ann_vol = roll.std() * np.sqrt(periods_per_year)
     excess_mean = (r - rf).rolling(window).mean() * periods_per_year
     return pd.DataFrame(
