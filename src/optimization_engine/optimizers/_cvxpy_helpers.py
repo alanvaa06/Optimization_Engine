@@ -86,12 +86,18 @@ class SolverFailure(RuntimeError):
         super().__init__(message)
 
 
-def _snapshot(problem: cp.Problem) -> dict[int, object]:
+VariableSnapshot = dict[int, "tuple[cp.Variable, np.ndarray | None]"]
+
+
+def _snapshot(problem: cp.Problem) -> VariableSnapshot:
     """Capture the current value of every variable in ``problem``."""
-    return {id(v): (v, None if v.value is None else np.array(v.value)) for v in problem.variables()}
+    return {
+        id(v): (v, None if v.value is None else np.array(v.value))
+        for v in problem.variables()
+    }
 
 
-def _restore(snapshot: dict[int, object]) -> None:
+def _restore(snapshot: VariableSnapshot) -> None:
     """Put a snapshotted solution back onto the problem's variables.
 
     Needed because CVXPY overwrites ``variable.value`` on every solve: once a
@@ -130,7 +136,7 @@ def solve_problem(
     attempts: list[str] = []
     last_status = "unknown"
     last_error: Exception | None = None
-    inaccurate: tuple[SolveInfo, dict[int, object]] | None = None
+    inaccurate: tuple[SolveInfo, VariableSnapshot] | None = None
     installed = set(cp.installed_solvers())
 
     candidates = [s for s in solvers if s in installed] or [None]

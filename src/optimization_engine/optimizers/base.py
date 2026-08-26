@@ -234,14 +234,14 @@ class BaseOptimizer(ABC):
         """Zero out dust, restore the budget, and keep the result inside the box.
 
         Renormalizing after truncation can push a weight through its bound,
-        so the result is re-projected onto ``{lb ≤ w ≤ ub, Σw = 1}`` whenever
-        the naive rescale would breach it. Portfolios that are not fully
-        invested (or that net to ~0, where rescaling is meaningless) are
-        returned as-is apart from the dust removal.
+        so the result is re-projected onto the feasible set — group budgets
+        included — whenever the naive rescale would breach it. Portfolios that
+        are not fully invested (or that net to ~0, where rescaling is
+        meaningless) are returned as-is apart from the dust removal.
         """
         from optimization_engine.optimizers._bounds import (
             InfeasibleBoundsError,
-            project_to_bounds_iterated,
+            project_to_constraints,
         )
 
         w = np.where(np.abs(w) < tol, 0.0, w)
@@ -258,7 +258,7 @@ class BaseOptimizer(ABC):
         if (rescaled >= lb - tol).all() and (rescaled <= ub + tol).all():
             return rescaled
         try:
-            return project_to_bounds_iterated(rescaled, lb, ub)
+            return project_to_constraints(rescaled, self.assets, self.constraints)[0]
         except (InfeasibleBoundsError, RuntimeError):
             # Bounds and budget are mutually impossible; the feasibility
             # report is the right place to explain that, so keep the solver's

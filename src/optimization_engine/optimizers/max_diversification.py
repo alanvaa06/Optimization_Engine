@@ -107,7 +107,6 @@ class MaxDiversificationOptimizer(BaseOptimizer):
         w, distance = project_to_constraints(w / total, self.assets, self.constraints)
         self._diagnostics.update(info.as_dict())
         self._diagnostics["projection_distance"] = distance
-        self._diagnostics["bounds_mode"] = "soft_iterated"
         self._diagnostics["fallback_reason"] = (
             f"Exact bounded solve failed ({cause}); bounds were applied by "
             "projection, so the diversification ratio is below the true "

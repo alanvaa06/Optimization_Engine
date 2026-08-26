@@ -9,8 +9,8 @@ unconstrained answer into the mandate. Two routines do that here:
   together. Closest matters: it keeps as much of the method's own answer as
   the mandate allows.
 * :func:`project_to_bounds_iterated` handles per-asset bounds and the budget
-  only, by clipping and redistributing. It is the fallback when no QP solver
-  is available, and it cannot see group budgets at all.
+  only, by clipping and redistributing. It is the cheaper path taken when no
+  group budgets are set, and it cannot see them at all.
 """
 
 from __future__ import annotations
@@ -117,7 +117,7 @@ def project_to_constraints(
 
     if not (constraints.groups and constraints.group_bounds):
         projected = project_to_bounds_iterated(w, lb, ub)
-        return projected, float(np.abs(projected - w).sum()) / 2.0 / 2.0
+        return projected, float(np.abs(projected - w).sum()) / 2.0
 
     try:
         import cvxpy as cp
@@ -137,9 +137,5 @@ def project_to_constraints(
             "No allocation satisfies the weight bounds, the budget and the "
             f"group budgets at once. ({exc})"
         ) from exc
-    except ImportError:
-        # No usable QP solver: fall back to the bounds-only projection, which
-        # is better than nothing but cannot see group budgets.
-        projected = project_to_bounds_iterated(w, lb, ub)
 
     return projected, float(np.abs(projected - w).sum()) / 2.0

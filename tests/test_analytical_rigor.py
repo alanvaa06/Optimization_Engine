@@ -935,3 +935,63 @@ def test_bounds_only_projection_still_used_without_groups(cov):
     projected, _ = project_to_constraints(np.ones(len(assets)) / len(assets), assets, cons)
     assert projected.max() <= 0.10 + 1e-9
     assert projected.sum() == pytest.approx(1.0)
+
+
+@pytest.mark.parametrize("with_groups", [False, True])
+def test_projection_distance_is_one_way_on_both_paths(cov, with_groups):
+    """The grouped and ungrouped branches must report the same measure.
+
+    They are separate code paths, and a distance that means "one-way" on one
+    and something else on the other silently rescales the number the UI
+    escalates a warning on.
+    """
+    from optimization_engine.optimizers._bounds import project_to_constraints
+
+    assets = list(cov.columns)
+    n = len(assets)
+    kwargs = {"bounds": {a: (0.0, 0.15) for a in assets}}
+    if with_groups:
+        kwargs["groups"] = {a: ("A" if i < 3 else "B") for i, a in enumerate(assets)}
+        kwargs["group_bounds"] = {"A": (0.0, 0.20)}
+    cons = PortfolioConstraints(**kwargs)
+
+    start = np.zeros(n)
+    start[0] = 0.6
+    start[1:] = 0.4 / (n - 1)
+    projected, distance = project_to_constraints(start, assets, cons)
+
+    assert distance == pytest.approx(
+        float(np.abs(projected - start).sum()) / 2.0, rel=1e-12
+    )
+    # Both vectors sum to 1, so one-way distance can never exceed 1.
+    assert 0.0 <= distance <= 1.0
+    assert distance > 0.0, "the constraints should have bound here"
+
+
+def test_weight_cleaning_respects_group_budgets_too():
+    """Dust removal plus rescaling must not push a group over its cap."""
+    from optimization_engine.optimizers.base import BaseOptimizer
+
+    class Dusty(BaseOptimizer):
+        name = "dusty"
+
+        def _solve(self):
+            # Sub-tolerance dust on the last name; rescaling the rest would
+            # take group G from 0.50 to 0.80 against a 0.60 cap.
+            return np.array([0.4999995, 0.3, 0.2, 5e-7])
+
+    assets = ["a", "b", "c", "d"]
+    cov = pd.DataFrame(np.eye(4) * 0.04, index=assets, columns=assets)
+    constraints = PortfolioConstraints(
+        bounds={a: (0.0, 0.45) for a in assets},
+        groups={"a": "G", "b": "G", "c": "H", "d": "H"},
+        group_bounds={"G": (0.0, 0.60)},
+    )
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        result = Dusty(cov_matrix=cov, constraints=constraints).optimize()
+
+    assert result.weights.sum() == pytest.approx(1.0)
+    assert result.weights[["a", "b"]].sum() <= 0.60 + 1e-6
+    assert result.weights.max() <= 0.45 + 1e-6
+    assert result.is_compliant, result.violations
