@@ -1911,6 +1911,19 @@ with tab_backtest:
                 "Expanding window", value=False,
                 help="Grow the sample from inception instead of rolling it.",
             )
+            reestimate_mu = st.checkbox(
+                "Re-estimate expected returns per window",
+                value=True,
+                help=(
+                    "On by default, and leaving it on is what makes this "
+                    "out-of-sample. The expected returns in the constraints "
+                    "tab are seeded from the whole history, so reusing them "
+                    "would hand every window an estimate built partly from its "
+                    "own future. Turn it off only if your expected returns are "
+                    "genuine forward-looking assumptions rather than estimates "
+                    "from this data."
+                ),
+            )
 
         if st.button("Run walk-forward", key="run_wf"):
             with st.spinner("Re-solving through history…"):
@@ -1949,6 +1962,13 @@ with tab_backtest:
                     ),
                 ]
             )
+            if not wf.backtest.metadata.get("reestimated_expected_returns", True):
+                st.warning(
+                    "Expected returns were held fixed across every window. If "
+                    "they came from this history rather than from forward-"
+                    "looking assumptions, the numbers below are not fully "
+                    "out-of-sample."
+                )
             in_sample = bt.returns.reindex(wf.returns.index)
             st.plotly_chart(
                 plot_walk_forward_comparison(in_sample, wf.returns),
