@@ -1352,10 +1352,10 @@ with tab_optimize:
         )
 
     if live_feasibility is not None and not live_feasibility.is_feasible:
-        st.error(
-            "The current constraints have no solution — see the "
-            "**Assumptions & constraints** tab for what to change."
-        )
+        # Show the fix here rather than pointing at another tab: the analyst is
+        # about to press Optimize, and the next click should be the correction,
+        # not navigation.
+        render_feasibility(live_feasibility, show_ok=False)
 
     if solve_clicked:
         st.session_state.walk_forward = None
