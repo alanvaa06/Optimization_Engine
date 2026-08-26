@@ -76,6 +76,24 @@ benchmark-relative statistics: tracking error, information ratio, CAPM alpha
 with its t-statistic and R², up/down capture, conditional (up/down) beta, and
 active share.
 
+**Estimation error**
+
+The engine spends a lot of effort saying that expected returns and
+covariances are noisy — condition numbers, T/N ratios, walk-forward
+degradation — so it does not then draw the frontier as a single crisp line and
+leave it there:
+
+* `bootstrap_frontier()` resamples the return history (block, IID or
+  parametric), re-estimates and re-traces the frontier on each draw, and
+  returns the resulting confidence band plus the per-asset weight dispersion.
+  On the sample panel the frontier's expected return spans a ~7% band at a
+  typical risk level — differences narrower than that are not distinguishable
+  from noise.
+* `resampled_efficient_frontier()` implements Michaud-style resampling:
+  averaging weights across draws at each frontier rank, which lifts the mean
+  effective N from 3.3 to 5.2 on the sample panel because the optimizer stops
+  acting on differences the data cannot resolve.
+
 **Backtesting**
 
 Two things a constant-weight in-sample replay hides, and this doesn't:
@@ -147,7 +165,8 @@ could make the next one wrong.
    diversification measures, a capital-vs-risk chart, the full Euler
    decomposition, and a frontier marked with the minimum-variance and
    tangency portfolios, the capital allocation line, and where your portfolio
-   actually sits.
+   actually sits — plus an opt-in panel that redraws the frontier as a
+   confidence band and names the positions the sample cannot pin down.
 5. **Backtest** — choose a rebalancing cadence and transaction costs; see
    weight drift, cost drag, rolling performance, the return distribution with
    its VaR/CVaR cuts, benchmark-relative statistics, and a walk-forward run
@@ -173,7 +192,7 @@ optengine check --config config/example_multi_asset.yaml --sample
 
 # Solve, and refuse rather than fail obscurely if the mandate is impossible.
 optengine optimize --config config/example_multi_asset.yaml --sample \
-    --frontier --walk-forward --cost-bps 10 --strict
+    --frontier --resample 50 --walk-forward --cost-bps 10 --strict
 ```
 
 `check` exits non-zero when the data has errors or the constraints have no

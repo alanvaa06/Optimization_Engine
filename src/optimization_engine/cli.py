@@ -66,6 +66,11 @@ def _build_parser() -> argparse.ArgumentParser:
         help="One-way transaction cost in basis points, applied to the backtest.",
     )
     optimize.add_argument(
+        "--resample", type=int, metavar="N",
+        help="Estimate the frontier's confidence band from N resampled "
+             "histories. Requires --frontier.",
+    )
+    optimize.add_argument(
         "--strict", action="store_true",
         help="Refuse to run when the constraints are infeasible, naming the "
              "constraint instead of letting the solver fail.",
@@ -174,11 +179,32 @@ def _cmd_optimize(args: argparse.Namespace) -> int:
         except ValueError as exc:
             print(f"Walk-forward skipped: {exc}", file=sys.stderr)
 
+    uncertainty = None
+    if args.resample:
+        if not args.frontier:
+            print(
+                "--resample needs --frontier; skipping the uncertainty band.",
+                file=sys.stderr,
+            )
+        else:
+            from optimization_engine.resampling import bootstrap_frontier
+
+            try:
+                uncertainty = bootstrap_frontier(
+                    returns, config,
+                    n_draws=int(args.resample),
+                    n_points=max(args.frontier_points // 2, 6),
+                )
+                print(f"  {uncertainty.summary()}")
+            except ValueError as exc:
+                print(f"Frontier resampling skipped: {exc}", file=sys.stderr)
+
     sheets = run_sheets(
         run,
         riskfree_rate=config.optimizer.risk_free_rate,
         data_quality=quality,
         walk_forward=walk_forward,
+        frontier_uncertainty=uncertainty,
     )
     out = write_excel_report(args.output, sheets)
 

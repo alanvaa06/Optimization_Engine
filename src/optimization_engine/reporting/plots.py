@@ -526,3 +526,108 @@ def plot_return_distribution(
         xaxis_tickformat=".1%", showlegend=False, **_LAYOUT,
     )
     return fig
+
+
+def plot_frontier_uncertainty(
+    uncertainty,
+    title: str = "How much can you trust this frontier?",
+) -> go.Figure:
+    """The efficient frontier as a confidence band rather than a single line.
+
+    The point estimate is drawn on top of the quantile band from resampled
+    histories. Where the band is wide, two portfolios that look different on
+    the point-estimate curve are not distinguishable given the data.
+    """
+    q = uncertainty.quantiles
+    x = list(q.index)
+    fig = go.Figure()
+
+    for lo, hi, opacity, label in (
+        ("q05", "q95", 0.14, "5th-95th percentile"),
+        ("q25", "q75", 0.24, "25th-75th percentile"),
+    ):
+        if lo not in q.columns or hi not in q.columns:
+            continue
+        fig.add_trace(
+            go.Scatter(
+                x=x + x[::-1],
+                y=list(q[hi]) + list(q[lo])[::-1],
+                fill="toself",
+                fillcolor=f"rgba(76, 120, 168, {opacity})",
+                line=dict(width=0),
+                name=label,
+                hoverinfo="skip",
+            )
+        )
+
+    if "q50" in q.columns:
+        fig.add_trace(
+            go.Scatter(
+                x=x, y=q["q50"], mode="lines",
+                line=dict(color="#4C78A8", width=2, dash="dot"),
+                name="Median across draws",
+                hovertemplate="Vol: %{x:.2%}<br>Median return: %{y:.2%}<extra></extra>",
+            )
+        )
+
+    point = uncertainty.point_estimate.plot_frame()
+    if not point.empty and x:
+        # Clip the point estimate to the band's range. The band spans only the
+        # risk levels *every* draw could reach, so drawing the full
+        # point-estimate curve beside it makes the band look truncated when it
+        # is simply the region where a comparison is defined.
+        lo, hi = min(x), max(x)
+        clipped = point[
+            (point["expected_volatility"] >= lo - 1e-12)
+            & (point["expected_volatility"] <= hi + 1e-12)
+        ]
+        if clipped.empty:
+            clipped = point
+        fig.add_trace(
+            go.Scatter(
+                x=clipped["expected_volatility"], y=clipped["expected_return"],
+                mode="lines+markers",
+                line=dict(color="#E45756", width=2.5),
+                marker=dict(size=6),
+                name="Point estimate (observed sample)",
+                hovertemplate="Vol: %{x:.2%}<br>Return: %{y:.2%}<extra></extra>",
+            )
+        )
+
+    fig.update_layout(
+        title=title,
+        xaxis_title="Volatility (annualized)",
+        yaxis_title="Expected Return (annualized)",
+        xaxis_tickformat=".1%",
+        yaxis_tickformat=".1%",
+        legend=dict(orientation="h", y=-0.2),
+        **_LAYOUT,
+    )
+    return fig
+
+
+def plot_weight_dispersion(
+    dispersion: pd.Series, title: str = "Which weights the data cannot pin down"
+) -> go.Figure:
+    """Standard deviation of each asset's weight across resampled frontiers.
+
+    A large bar means the optimizer's conviction in that position comes from
+    the particular sample it was handed, not from the asset.
+    """
+    d = dispersion.sort_values()
+    fig = go.Figure(
+        go.Bar(
+            x=d.values * 100,
+            y=[str(i) for i in d.index],
+            orientation="h",
+            marker_color=PALETTE[1],
+            hovertemplate="%{y}: ±%{x:.2f}pp across draws<extra></extra>",
+        )
+    )
+    fig.update_layout(
+        title=title,
+        xaxis_title="Weight standard deviation across resampled histories (pp)",
+        yaxis_title="", showlegend=False,
+        height=max(300, 24 * len(d)), **_LAYOUT,
+    )
+    return fig

@@ -76,6 +76,12 @@ from optimization_engine.optimizers.feasibility import (
     InfeasibleConstraintsError,
     analyze_feasibility,
 )
+from optimization_engine.resampling import (
+    FrontierUncertainty,
+    bootstrap_frontier,
+    resample_returns,
+    resampled_efficient_frontier,
+)
 from optimization_engine.scenarios import (
     Scenario,
     config_signature,
@@ -137,6 +143,10 @@ __all__ = [
     "run_engine",
     "FrontierResult",
     "efficient_frontier",
+    "FrontierUncertainty",
+    "bootstrap_frontier",
+    "resample_returns",
+    "resampled_efficient_frontier",
     "Scenario",
     "config_signature",
     "delete_scenario",

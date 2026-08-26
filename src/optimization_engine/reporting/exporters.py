@@ -59,6 +59,7 @@ def run_sheets(
     riskfree_rate: float = 0.0,
     data_quality=None,
     walk_forward=None,
+    frontier_uncertainty=None,
 ) -> dict[str, pd.DataFrame]:
     """Assemble the standard workbook contents for an :class:`EngineRun`.
 
@@ -70,6 +71,8 @@ def run_sheets(
         data_quality: Optional :class:`DataQualityReport` for the input panel.
         walk_forward: Optional :class:`WalkForwardResult` to include the
             out-of-sample track record and its degradation table.
+        frontier_uncertainty: Optional :class:`FrontierUncertainty` to include
+            the resampled confidence band and per-asset weight dispersion.
     """
     sheets: dict[str, pd.DataFrame] = {
         "weights": run.result.weights.to_frame("weight"),
@@ -149,6 +152,11 @@ def run_sheets(
             and not run.frontier.group_weights.empty
         ):
             sheets["frontier_groups"] = run.frontier.group_weights
+    if frontier_uncertainty is not None:
+        sheets["frontier_uncertainty"] = frontier_uncertainty.quantiles
+        sheets["weight_dispersion"] = frontier_uncertainty.weight_dispersion.to_frame(
+            "weight_sd_across_draws"
+        )
     if walk_forward is not None:
         sheets["walk_forward_weights"] = walk_forward.weights_history
         sheets["walk_forward_windows"] = walk_forward.windows

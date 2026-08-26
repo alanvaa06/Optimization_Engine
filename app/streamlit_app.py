@@ -89,16 +89,19 @@ from optimization_engine.reporting.plots import (  # noqa: E402
     plot_correlation_heatmap,
     plot_drawdown,
     plot_efficient_frontier,
+    plot_frontier_uncertainty,
     plot_portfolio_composition,
     plot_return_distribution,
     plot_risk_contributions,
     plot_rolling_metrics,
     plot_walk_forward_comparison,
     plot_wealth_index,
+    plot_weight_dispersion,
     plot_weight_evolution,
     plot_weight_vs_risk,
     plot_weights_bar,
 )
+from optimization_engine.resampling import bootstrap_frontier  # noqa: E402
 from optimization_engine.scenarios import (  # noqa: E402
     NOTES_MAX_LEN,
     Scenario,
@@ -154,6 +157,7 @@ _DEFAULT_STATE = {
     "last_run": None,
     "last_error": None,
     "walk_forward": None,
+    "frontier_uncertainty": None,
 }
 for key, default in _DEFAULT_STATE.items():
     if key not in st.session_state:
@@ -1503,6 +1507,88 @@ with tab_optimize:
                 width="stretch",
             )
 
+            with st.expander(
+                "How much can you trust this frontier?", expanded=False
+            ):
+                st.caption(
+                    "The frontier is a point estimate of a curve. Resampling "
+                    "the return history and re-tracing it shows how far that "
+                    "curve moves when the sample changes — differences "
+                    "narrower than the band are not distinguishable from "
+                    "estimation noise. This re-solves the whole frontier once "
+                    "per draw, so it is deliberately opt-in."
+                )
+                u1, u2 = st.columns([2, 1])
+                with u1:
+                    n_draws = st.slider(
+                        "Resampled histories", 10, 200, 40, 10,
+                        help="More draws give a smoother band at linear cost.",
+                    )
+                with u2:
+                    resample_method = st.selectbox(
+                        "Resampling",
+                        options=["block", "iid", "parametric"],
+                        index=0,
+                        format_func=lambda m: {
+                            "block": "Block bootstrap",
+                            "iid": "IID bootstrap",
+                            "parametric": "Parametric (normal)",
+                        }[m],
+                        help=(
+                            "Block preserves volatility clustering and is the "
+                            "right default for returns; IID destroys it; "
+                            "parametric imposes normality."
+                        ),
+                    )
+                if st.button("Estimate frontier uncertainty", key="run_bootstrap"):
+                    with st.spinner(f"Re-tracing the frontier {n_draws} times…"):
+                        try:
+                            st.session_state["frontier_uncertainty"] = (
+                                bootstrap_frontier(
+                                    returns,
+                                    _build_config(),
+                                    n_draws=int(n_draws),
+                                    n_points=max(int(n_frontier_points) // 2, 6),
+                                    method=resample_method,
+                                )
+                            )
+                        except Exception as exc:
+                            st.session_state["frontier_uncertainty"] = None
+                            st.error(f"Resampling failed: {exc}")
+
+                uncertainty = st.session_state.get("frontier_uncertainty")
+                if uncertainty is not None:
+                    st.info(uncertainty.summary())
+                    if uncertainty.n_failed:
+                        st.caption(
+                            f"{uncertainty.n_failed} draw(s) could not be "
+                            "traced and were dropped."
+                        )
+                    st.plotly_chart(
+                        plot_frontier_uncertainty(uncertainty), width="stretch"
+                    )
+                    band = uncertainty.volatility
+                    st.caption(
+                        f"The band covers {band.min():.1%} to {band.max():.1%} "
+                        "volatility — the risk levels every resampled history "
+                        "could reach. Outside that range the draws disagree on "
+                        "what is even attainable, which is its own kind of "
+                        "uncertainty."
+                    )
+                    if not uncertainty.weight_dispersion.empty:
+                        st.plotly_chart(
+                            plot_weight_dispersion(
+                                uncertainty.weight_dispersion.head(15)
+                            ),
+                            width="stretch",
+                        )
+                        st.caption(
+                            "Positions at the top of this chart are ones the "
+                            "optimizer sizes differently on every resampled "
+                            "history — its conviction there comes from this "
+                            "particular sample, not from the asset."
+                        )
+
             f1, f2 = st.columns(2)
             with f1:
                 st.plotly_chart(
@@ -2491,6 +2577,7 @@ with tab_report:
             riskfree_rate=float(risk_free_rate),
             data_quality=quality,
             walk_forward=st.session_state.get("walk_forward"),
+            frontier_uncertainty=st.session_state.get("frontier_uncertainty"),
         )
 
         buf = io.BytesIO()
