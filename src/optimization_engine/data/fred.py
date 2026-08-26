@@ -25,7 +25,7 @@ import io
 import re
 import urllib.error
 import urllib.request
-from typing import Iterable, Sequence
+from collections.abc import Iterable, Sequence
 
 import pandas as pd
 

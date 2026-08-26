@@ -2,8 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, MutableMapping
-from typing import Hashable
+from collections.abc import Callable, Hashable, MutableMapping
 
 import pandas as pd
 
@@ -50,7 +49,6 @@ from optimization_engine.optimizers.requirements import (  # noqa: E402
     MethodRequirements,
     requirements_for,
 )
-
 
 _NOT_USED = "Not used by this optimizer."
 

@@ -148,6 +148,55 @@ def _decode_views(raw):
     return out
 
 
+def effective_expected_returns(
+    config: EngineConfig,
+    cov_matrix: pd.DataFrame,
+    expected_returns: pd.Series | None = None,
+) -> pd.Series | None:
+    """The expected-return vector the optimizer will *actually* use.
+
+    For most methods this is just the configured vector. Black-Litterman is
+    the exception: it discards the supplied returns and optimizes against an
+    equilibrium posterior, which sits at a different level entirely. Checking
+    a return target against the configured vector therefore passes for
+    targets Black-Litterman cannot reach — the feasibility report says
+    "feasible" and the solve then comes back infeasible.
+
+    Returns ``None`` when the method needs no expected returns at all.
+    """
+    if expected_returns is None and config.expected_returns:
+        expected_returns = pd.Series(config.expected_returns)
+    if config.optimizer.name != "black_litterman":
+        return expected_returns
+
+    from optimization_engine.optimizers.black_litterman import (
+        black_litterman_posterior,
+    )
+
+    assets = list(cov_matrix.columns)
+    caps = config.optimizer.bl_market_caps
+    if caps:
+        market = pd.Series(caps).reindex(assets).fillna(0.0)
+        total = float(market.sum())
+        market = market / total if total > 0 else pd.Series(1.0 / len(assets), index=assets)
+    else:
+        market = pd.Series(1.0 / len(assets), index=assets)
+    try:
+        posterior, _ = black_litterman_posterior(
+            cov_matrix,
+            market,
+            _decode_views(config.optimizer.bl_views),
+            config.optimizer.bl_view_confidences,
+            tau=config.optimizer.bl_tau,
+            risk_aversion=config.optimizer.risk_aversion,
+            risk_free_rate=config.optimizer.risk_free_rate,
+        )
+        posterior.name = "black_litterman_posterior"
+        return posterior
+    except Exception:
+        return expected_returns
+
+
 def optimizer_factory(
     config: EngineConfig,
     cov_matrix: pd.DataFrame,

@@ -156,7 +156,7 @@ class EngineConfig:
         }
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "EngineConfig":
+    def from_dict(cls, data: dict[str, Any]) -> EngineConfig:
         opt_raw = data.get("optimizer") or {}
         if isinstance(opt_raw, str):
             opt_raw = {"name": opt_raw}

@@ -14,11 +14,9 @@ if str(SRC) not in sys.path:
 
 from optimization_engine.optimizers.factory import available_optimizers
 from optimization_engine.optimizers.requirements import (
-    REQUIREMENTS,
     MethodRequirements,
     requirements_for,
 )
-
 
 EXPECTED_FLAGS = {
     "mean_variance": dict(

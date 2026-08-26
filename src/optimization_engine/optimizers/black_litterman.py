@@ -73,7 +73,7 @@ class View:
 
 
 def normalize_views(
-    views: "dict[str, float] | list[View] | None",
+    views: dict[str, float] | list[View] | None,
     view_confidences: dict[str, float] | None = None,
 ) -> list[View]:
     """Accept either the simple ``asset -> return`` mapping or full ``View``s.
@@ -170,7 +170,7 @@ def implied_equilibrium_returns(
 def black_litterman_posterior(
     cov_matrix: pd.DataFrame,
     market_weights: pd.Series,
-    views: "dict[str, float] | list[View] | None" = None,
+    views: dict[str, float] | list[View] | None = None,
     view_confidences: dict[str, float] | None = None,
     tau: float = 0.05,
     risk_aversion: float = 2.5,
@@ -257,7 +257,7 @@ class BlackLittermanOptimizer(BaseOptimizer):
         self,
         *args,
         market_weights: pd.Series | dict[str, float] | None = None,
-        views: "dict[str, float] | list[View] | None" = None,
+        views: dict[str, float] | list[View] | None = None,
         view_confidences: dict[str, float] | None = None,
         tau: float = 0.05,
         risk_aversion: float = 2.5,

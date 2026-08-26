@@ -592,3 +592,57 @@ def test_plot_frame_index_matches_the_highlighted_row(returns, mu):
     frame = fr.plot_frame()
     best = frame["sharpe_ratio"].idxmax()
     assert frame.loc[best, "sharpe_ratio"] == frame["sharpe_ratio"].max()
+
+
+def test_black_litterman_target_checked_against_its_own_posterior(returns, cov, mu):
+    """A BL return target must be judged against the equilibrium posterior.
+
+    Checking it against the configured historical means passes for targets BL
+    cannot reach, so the feasibility report says "feasible" and the solve then
+    fails with a bare `infeasible`.
+    """
+    from optimization_engine.optimizers.factory import (
+        constraints_from_config,
+        effective_expected_returns,
+    )
+
+    cfg = EngineConfig(
+        expected_returns=mu.to_dict(),
+        bounds={a: [0.0, 1.0] for a in mu.index},
+        optimizer=OptimizerSpec(
+            name="black_litterman", target_return=float(mu.max()), risk_free_rate=0.04
+        ),
+    )
+    posterior = effective_expected_returns(cfg, cov, mu)
+    # The posterior is a different vector living at a different level.
+    assert posterior.max() < mu.max()
+
+    report = analyze_feasibility(
+        list(cov.columns), constraints_from_config(cfg), posterior, cov
+    )
+    assert not report.is_feasible
+    issue = next(i for i in report.issues if i.code == "target_return_too_high")
+    assert "equilibrium posterior" in issue.suggestion
+
+
+def test_effective_expected_returns_passes_other_methods_through(cov, mu):
+    from optimization_engine.optimizers.factory import effective_expected_returns
+
+    cfg = EngineConfig(
+        expected_returns=mu.to_dict(), optimizer=OptimizerSpec(name="mean_variance")
+    )
+    pd.testing.assert_series_equal(effective_expected_returns(cfg, cov, mu), mu)
+
+
+def test_run_engine_diagnoses_an_unreachable_black_litterman_target(returns, mu):
+    from optimization_engine.optimizers.feasibility import InfeasibleConstraintsError
+
+    cfg = EngineConfig(
+        expected_returns=mu.to_dict(),
+        bounds={a: [0.0, 1.0] for a in mu.index},
+        optimizer=OptimizerSpec(
+            name="black_litterman", target_return=float(mu.max()), risk_free_rate=0.04
+        ),
+    )
+    with pytest.raises(InfeasibleConstraintsError, match="above the"):
+        run_engine(returns, cfg, raise_on_infeasible=True)

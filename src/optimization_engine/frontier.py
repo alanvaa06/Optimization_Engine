@@ -22,9 +22,10 @@ set, but they are flagged and excluded from the efficient frontier by default.
 from __future__ import annotations
 
 import copy
+from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from typing import Iterable, Literal
+from typing import Literal
 
 import numpy as np
 import pandas as pd

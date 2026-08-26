@@ -57,16 +57,16 @@ from optimization_engine.data.covariance import (  # noqa: E402
     EXPECTED_RETURN_DESCRIPTIONS,
     covariance_matrix,
 )
-from optimization_engine.data.loader import (  # noqa: E402
-    prices_to_returns,
-    sample_dataset,
-)
-from optimization_engine.data.quality import align_panel, analyze_prices  # noqa: E402
 from optimization_engine.data.fx import (  # noqa: E402
     FXError,
     convert_prices_to_base,
     supported_currencies,
 )
+from optimization_engine.data.loader import (  # noqa: E402
+    prices_to_returns,
+    sample_dataset,
+)
+from optimization_engine.data.quality import align_panel, analyze_prices  # noqa: E402
 from optimization_engine.data.yahoo import (  # noqa: E402
     YahooFinanceError,
     load_prices_yahoo,
@@ -75,20 +75,10 @@ from optimization_engine.engine import run_engine  # noqa: E402
 from optimization_engine.optimizers.factory import (  # noqa: E402
     available_optimizers,
     constraints_from_config,
+    effective_expected_returns,
 )
 from optimization_engine.optimizers.feasibility import analyze_feasibility  # noqa: E402
 from optimization_engine.optimizers.requirements import requirements_for  # noqa: E402
-from optimization_engine.scenarios import (  # noqa: E402
-    NOTES_MAX_LEN,
-    Scenario,
-    config_signature,
-    delete_scenario as _delete_scenario,
-    dump_scenarios_yaml,
-    load_scenarios_yaml,
-    now_iso,
-    rename_scenario as _rename_scenario,
-    scenario_signature,
-)
 from optimization_engine.reporting.plots import (  # noqa: E402
     plot_correlation_heatmap,
     plot_drawdown,
@@ -103,12 +93,26 @@ from optimization_engine.reporting.plots import (  # noqa: E402
     plot_weight_vs_risk,
     plot_weights_bar,
 )
+from optimization_engine.scenarios import (  # noqa: E402
+    NOTES_MAX_LEN,
+    Scenario,
+    config_signature,
+    dump_scenarios_yaml,
+    load_scenarios_yaml,
+    now_iso,
+    scenario_signature,
+)
+from optimization_engine.scenarios import (
+    delete_scenario as _delete_scenario,
+)
+from optimization_engine.scenarios import (
+    rename_scenario as _rename_scenario,
+)
 from optimization_engine.ui_state import (  # noqa: E402
     derive_widget_state,
     yahoo_cache_key,
     yahoo_prices_for_rerun,
 )
-
 
 # ---------------------------------------------------------------------------
 # Page setup
@@ -568,6 +572,13 @@ with st.sidebar:
                 key="target_return",
                 help="Minimize risk subject to hitting exactly this return.",
             )
+            if optimizer_name == "black_litterman":
+                st.caption(
+                    "Black-Litterman targets its **equilibrium posterior**, "
+                    "which usually sits well below historical means. The "
+                    "constraints tab reports the range this method can "
+                    "actually reach."
+                )
         elif mode == "Target volatility":
             target_volatility = st.number_input(
                 "Target volatility (annual)", value=0.10, step=0.005, format="%.4f",
@@ -1260,7 +1271,7 @@ def _feasibility_cached(signature: str, returns_hash: str, _returns: pd.DataFram
     return analyze_feasibility(
         list(_returns.columns),
         constraints_from_config(cfg),
-        expected_returns=mu,
+        expected_returns=effective_expected_returns(cfg, cov, mu),
         cov_matrix=cov,
     )
 

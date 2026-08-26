@@ -11,7 +11,6 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
-import numpy as np
 import pandas as pd
 
 from optimization_engine.analytics.backtest import (
@@ -40,7 +39,11 @@ from optimization_engine.optimizers.diagnostics import (
     PortfolioDiagnostics,
     risk_decomposition,
 )
-from optimization_engine.optimizers.factory import constraints_from_config, optimizer_factory
+from optimization_engine.optimizers.factory import (
+    constraints_from_config,
+    effective_expected_returns,
+    optimizer_factory,
+)
 from optimization_engine.optimizers.feasibility import (
     FeasibilityReport,
     InfeasibleConstraintsError,
@@ -334,10 +337,13 @@ def run_engine(
 
     feasibility: FeasibilityReport | None = None
     if check_feasibility:
+        # Black-Litterman optimizes against its equilibrium posterior, not the
+        # configured vector, so a return target has to be checked against the
+        # returns the solver will really see.
         feasibility = analyze_feasibility(
             list(returns.columns),
             constraints_from_config(config),
-            expected_returns=expected_returns,
+            expected_returns=effective_expected_returns(config, cov, expected_returns),
             cov_matrix=cov,
         )
         if raise_on_infeasible and not feasibility.is_feasible:

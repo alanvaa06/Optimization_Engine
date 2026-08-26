@@ -18,8 +18,8 @@ from optimization_engine.config import EngineConfig, OptimizerSpec
 from optimization_engine.data.covariance import covariance_matrix
 from optimization_engine.data.loader import prices_to_returns, sample_dataset
 from optimization_engine.engine import run_engine
-from optimization_engine.optimizers.factory import available_optimizers
 from optimization_engine.optimizers import ConfigurationError
+from optimization_engine.optimizers.factory import available_optimizers
 
 
 @pytest.fixture(scope="module")

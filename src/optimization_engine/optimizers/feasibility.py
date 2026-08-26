@@ -368,6 +368,17 @@ def analyze_feasibility(
                             suggestion=(
                                 f"Lower the target to at most {hi:.2%}, or raise the "
                                 "caps on the highest-return assets."
+                                + (
+                                    " Note that Black-Litterman optimizes "
+                                    "against its equilibrium posterior, which "
+                                    "usually sits well below historical means "
+                                    "— so a target that suits mean-variance "
+                                    "can be unreachable here."
+                                    if expected_returns is not None
+                                    and getattr(expected_returns, "name", "")
+                                    == "black_litterman_posterior"
+                                    else ""
+                                )
                             ),
                         )
                     )
