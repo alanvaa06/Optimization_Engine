@@ -12,10 +12,11 @@ The result is robust to ill-conditioned covariance matrices and to noisy
 estimates — particularly useful with many assets or limited history, and the
 natural choice when ``T/N`` is too small for mean-variance to mean anything.
 
-Bounds are *not* part of the recursion: HRP allocates top-down and then the
-result is projected into the box. That makes bounds approximate by
-construction, which is why ``bounds_mode`` is ``"soft_iterated"`` and group
-budgets are refused rather than silently ignored.
+Constraints are *not* part of the recursion: HRP allocates top-down and the
+result is then projected onto the closest feasible allocation, group budgets
+included. That makes the mandate binding but the method approximate, which is
+why ``bounds_mode`` is ``"soft_iterated"`` and the distance the projection
+moved is reported alongside the weights.
 """
 
 from __future__ import annotations
@@ -27,8 +28,7 @@ import pandas as pd
 from scipy.cluster.hierarchy import fcluster, linkage
 from scipy.spatial.distance import squareform
 
-from optimization_engine.optimizers._bounds import project_to_bounds_iterated
-from optimization_engine.optimizers._cvxpy_helpers import bounds_arrays
+from optimization_engine.optimizers._bounds import project_to_constraints
 from optimization_engine.optimizers.base import BaseOptimizer
 
 LINKAGE_METHODS = ("single", "average", "complete", "ward")
@@ -117,13 +117,14 @@ class HRPOptimizer(BaseOptimizer):
             )
         if self.constraints.group_bounds and self.constraints.groups:
             warnings.warn(
-                "HRP does not enforce group budgets: it allocates down its own "
-                "correlation-derived hierarchy, which generally disagrees with "
-                "a hand-specified grouping. Use risk_parity or mean_variance "
-                "when group budgets must hold.",
+                "HRP allocates down its own correlation-derived hierarchy, "
+                "which generally disagrees with a hand-specified grouping. The "
+                "group budgets will be met by projecting the result onto the "
+                "constraint set, which moves it away from HRP's own answer — "
+                "use risk_parity or mean_variance to have them enforced inside "
+                "the solve.",
                 stacklevel=3,
             )
-            self._diagnostics["ignored_constraints"] = ["group_bounds"]
         if (np.array([self.constraints.get_bounds(a)[0] for a in self.assets]) < 0).any():
             raise ValueError(
                 "HRP produces long-only weights by construction; a negative "
@@ -156,16 +157,16 @@ class HRPOptimizer(BaseOptimizer):
 
         self._record_cluster_diagnostics(link, ordered, corr_df)
 
-        lb, ub = bounds_arrays(self.assets, self.constraints)
-        projected = project_to_bounds_iterated(weights, lb, ub)
-        drift = float(np.abs(projected - weights).sum())
+        projected, drift = project_to_constraints(
+            weights, self.assets, self.constraints
+        )
+        self._diagnostics["projection_distance"] = drift
         if drift > 1e-6:
-            self._diagnostics["bounds_projection_drift"] = drift
             self._diagnostics["bounds_note"] = (
-                f"Weight bounds moved {drift:.2%} of the book away from the raw "
-                "HRP allocation. HRP applies bounds by projection, so a large "
-                "drift means the bounds — not the hierarchy — are driving the "
-                "result."
+                f"Constraints moved {drift:.2%} of the book away from the raw "
+                "HRP allocation. HRP applies them by projection, so a large "
+                "distance means the mandate — not the hierarchy — is driving "
+                "the result."
             )
         return projected
 

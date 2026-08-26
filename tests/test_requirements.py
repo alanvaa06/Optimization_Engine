@@ -51,7 +51,7 @@ EXPECTED_FLAGS = {
         requires_mu=False, requires_cov=True, requires_returns=False,
         supports_target_return=False, supports_target_volatility=False,
         supports_risk_aversion=False, supports_risk_free_rate=False,
-        supports_group_bounds=False, bounds_mode="soft_iterated",
+        supports_group_bounds=True, bounds_mode="soft_iterated",
         supports_frontier=False,
     ),
     "black_litterman": dict(
@@ -79,14 +79,14 @@ EXPECTED_FLAGS = {
         requires_mu=False, requires_cov=False, requires_returns=False,
         supports_target_return=False, supports_target_volatility=False,
         supports_risk_aversion=False, supports_risk_free_rate=False,
-        supports_group_bounds=False, bounds_mode="soft_iterated",
+        supports_group_bounds=True, bounds_mode="soft_iterated",
         supports_frontier=False,
     ),
     "inverse_vol": dict(
         requires_mu=False, requires_cov=True, requires_returns=False,
         supports_target_return=False, supports_target_volatility=False,
         supports_risk_aversion=False, supports_risk_free_rate=False,
-        supports_group_bounds=False, bounds_mode="soft_iterated",
+        supports_group_bounds=True, bounds_mode="soft_iterated",
         supports_frontier=False,
     ),
 }

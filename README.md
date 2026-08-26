@@ -38,11 +38,15 @@ what it assumes — the same text the UI shows next to the method picker.
 * Target return, target volatility, or risk-aversion utility.
 * Turnover budget against a previous allocation.
 
-Methods that *cannot* honour a constraint say so rather than ignoring it
-silently: HRP warns when group budgets are set, and the homogeneous solves
-(max-Sharpe, max-diversification, risk parity) warn when a turnover budget is.
-After every solve the weights are checked against every constraint and any
-breach is reported.
+Every constraint is honoured by every method, but not always the same way.
+Convex solves impose them directly; the allocate-then-constrain methods (1/N,
+inverse volatility, HRP) project onto the *closest* feasible allocation and
+report how far the mandate moved their answer — because a 1/N book that had
+to shift 15% of its weight is no longer really 1/N. Where a constraint truly
+cannot bind (a turnover budget on the homogeneous max-Sharpe,
+max-diversification and risk-parity solves), the method warns rather than
+ignoring it silently. After every solve the weights are checked against every
+constraint and any breach is reported.
 
 **Covariance estimators**
 

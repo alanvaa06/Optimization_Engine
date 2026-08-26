@@ -767,3 +767,171 @@ def test_solvers_do_not_leak_inaccuracy_warnings_to_callers(returns, mu):
         run = run_engine(returns, cfg, build_frontier=True, n_frontier_points=6)
     assert not [c for c in caught if "may be inaccurate" in str(c.message)]
     assert run.result.extras["solver_status"] in ("optimal", "optimal_inaccurate")
+
+
+def test_cvar_frontier_is_plotted_against_cvar(returns, mu):
+    """A mean-CVaR frontier drawn on a volatility axis is not the curve solved."""
+    from optimization_engine.reporting.plots import plot_efficient_frontier
+
+    cfg = EngineConfig(
+        expected_returns=mu.to_dict(),
+        bounds={a: [0.0, 0.3] for a in mu.index},
+        optimizer=OptimizerSpec(name="cvar", cvar_alpha=0.05, risk_free_rate=0.03),
+    )
+    frontier = run_engine(
+        returns, cfg, build_frontier=True, n_frontier_points=6
+    ).frontier
+    assert frontier.risk_measure == "CVaR"
+    assert frontier.n_failed == 0, frontier.failures
+    assert frontier.summary["cvar"].notna().all()
+
+    fig = plot_efficient_frontier(frontier, risk_free_rate=0.03)
+    assert "Conditional VaR" in fig.layout.xaxis.title.text
+    # Anchors and the CAL live in volatility space; they must not be drawn here.
+    names = {t.name for t in fig.data}
+    assert "Capital allocation line" not in " ".join(names)
+    assert "Minimum variance" not in names
+
+    x = list(fig.data[0].x)
+    np.testing.assert_allclose(
+        x, frontier.plot_frame()["cvar"].values, rtol=1e-9
+    )
+
+
+def test_mean_variance_frontier_still_uses_volatility(returns, mu):
+    from optimization_engine.reporting.plots import plot_efficient_frontier
+
+    cfg = EngineConfig(
+        expected_returns=mu.to_dict(),
+        bounds={a: [0.0, 0.3] for a in mu.index},
+        optimizer=OptimizerSpec(name="mean_variance", risk_free_rate=0.03),
+    )
+    frontier = run_engine(
+        returns, cfg, build_frontier=True, n_frontier_points=6
+    ).frontier
+    fig = plot_efficient_frontier(frontier, risk_free_rate=0.03)
+    assert "Volatility" in fig.layout.xaxis.title.text
+    assert "Minimum variance" in {t.name for t in fig.data}
+
+
+# ---------------------------------------------------------------------------
+# Constraint projection for allocate-then-constrain methods
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(scope="module")
+def grouped_constraints(cov):
+    groups = {}
+    for asset in cov.columns:
+        if "Equity" in asset:
+            groups[asset] = "Equity"
+        elif asset in ("US_Treasuries", "TIPS", "IG_Credit", "HY_Credit", "EM_Debt", "Cash"):
+            groups[asset] = "FixedIncome"
+        else:
+            groups[asset] = "Alternatives"
+    return groups
+
+
+@pytest.mark.parametrize("method", ["equal_weight", "inverse_vol", "hrp"])
+def test_projection_methods_now_honour_group_budgets(
+    returns, mu, grouped_constraints, method
+):
+    """1/N used to sail past an alternatives cap because projection ignored groups."""
+    cfg = EngineConfig(
+        expected_returns=mu.to_dict(),
+        bounds={a: [0.0, 0.5] for a in mu.index},
+        groups=grouped_constraints,
+        group_bounds={
+            "Equity": [0.2, 0.7],
+            "FixedIncome": [0.2, 0.7],
+            "Alternatives": [0.0, 0.3],
+        },
+        optimizer=OptimizerSpec(name=method),
+    )
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        run = run_engine(returns, cfg)
+    assert run.result.is_compliant, run.result.violations
+    grouped = run.result.weights.groupby(
+        run.result.weights.index.map(grouped_constraints)
+    ).sum()
+    assert grouped["Alternatives"] <= 0.30 + 1e-6
+    assert grouped["Equity"] >= 0.20 - 1e-6
+
+
+def test_projection_reports_how_far_the_mandate_moved_the_answer(
+    returns, mu, grouped_constraints
+):
+    loose = EngineConfig(
+        expected_returns=mu.to_dict(),
+        bounds={a: [0.0, 1.0] for a in mu.index},
+        optimizer=OptimizerSpec(name="equal_weight"),
+    )
+    tight = EngineConfig(
+        expected_returns=mu.to_dict(),
+        bounds={a: [0.0, 0.5] for a in mu.index},
+        groups=grouped_constraints,
+        group_bounds={"Alternatives": [0.0, 0.10]},
+        optimizer=OptimizerSpec(name="equal_weight"),
+    )
+    assert run_engine(returns, loose).result.extras["projection_distance"] == pytest.approx(
+        0.0, abs=1e-9
+    )
+    moved = run_engine(returns, tight).result.extras["projection_distance"]
+    assert moved > 0.1
+    assert "moved" in run_engine(returns, tight).result.extras["bounds_note"].lower()
+
+
+def test_projection_finds_the_closest_feasible_point(cov):
+    """Not just *a* feasible point — the nearest one."""
+    import cvxpy as cp
+
+    from optimization_engine.optimizers._bounds import project_to_constraints
+
+    assets = list(cov.columns)
+    groups = {a: ("A" if i < 4 else "B") for i, a in enumerate(assets)}
+    cons = PortfolioConstraints(
+        bounds={a: (0.0, 1.0) for a in assets},
+        groups=groups,
+        group_bounds={"A": (0.0, 0.20)},
+    )
+    w0 = np.ones(len(assets)) / len(assets)
+    projected, distance = project_to_constraints(w0, assets, cons)
+
+    x = cp.Variable(len(assets))
+    group_a = [i for i, a in enumerate(assets) if groups[a] == "A"]
+    cp.Problem(
+        cp.Minimize(cp.sum_squares(x - w0)),
+        [cp.sum(x) == 1, x >= 0, x <= 1, cp.sum(x[group_a]) <= 0.20],
+    ).solve()
+    np.testing.assert_allclose(projected, np.asarray(x.value).flatten(), atol=1e-6)
+    assert distance == pytest.approx(
+        float(np.abs(projected - w0).sum()) / 2.0, rel=1e-9
+    )
+
+
+def test_projection_raises_when_nothing_is_feasible(cov):
+    from optimization_engine.optimizers._bounds import (
+        InfeasibleBoundsError,
+        project_to_constraints,
+    )
+
+    assets = list(cov.columns)
+    groups = {a: "A" for a in assets}
+    cons = PortfolioConstraints(
+        bounds={a: (0.0, 1.0) for a in assets},
+        groups=groups,
+        group_bounds={"A": (0.0, 0.20)},  # every asset is in A, but Sum(w)=1
+    )
+    with pytest.raises(InfeasibleBoundsError):
+        project_to_constraints(np.ones(len(assets)) / len(assets), assets, cons)
+
+
+def test_bounds_only_projection_still_used_without_groups(cov):
+    from optimization_engine.optimizers._bounds import project_to_constraints
+
+    assets = list(cov.columns)
+    cons = PortfolioConstraints(bounds={a: (0.0, 0.10) for a in assets})
+    projected, _ = project_to_constraints(np.ones(len(assets)) / len(assets), assets, cons)
+    assert projected.max() <= 0.10 + 1e-9
+    assert projected.sum() == pytest.approx(1.0)

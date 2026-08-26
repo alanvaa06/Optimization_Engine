@@ -47,6 +47,7 @@ from components import (  # noqa: E402
     render_frontier_health,
     render_method_card,
     render_portfolio_diagnostics,
+    render_projection_distance,
 )
 
 from optimization_engine.analytics.performance import rolling_metrics, summary_stats  # noqa: E402
@@ -1408,6 +1409,7 @@ with tab_optimize:
             ]
         )
         render_portfolio_diagnostics(run.diagnostics)
+        render_projection_distance(run.result)
 
         st.divider()
         left, right = st.columns([1, 1])
@@ -1473,14 +1475,28 @@ with tab_optimize:
                     "risk, less return.",
                 )
             render_frontier_health(run.frontier)
+            on_cvar_axis = run.frontier.risk_measure == "CVaR"
+            if on_cvar_axis:
+                st.caption(
+                    "The x-axis is Conditional VaR, the risk measure this "
+                    "frontier was traced against. The minimum-variance and "
+                    "tangency anchors and the capital allocation line live in "
+                    "volatility space and have no position here."
+                )
             st.plotly_chart(
                 plot_efficient_frontier(
                     run.frontier,
-                    risk_free_rate=float(risk_free_rate) if show_cal else None,
+                    risk_free_rate=(
+                        float(risk_free_rate) if show_cal and not on_cvar_axis else None
+                    ),
                     current_portfolio=(
-                        run.result.expected_volatility,
-                        run.result.expected_return,
-                        "Your portfolio",
+                        None
+                        if on_cvar_axis
+                        else (
+                            run.result.expected_volatility,
+                            run.result.expected_return,
+                            "Your portfolio",
+                        )
                     ),
                     show_dominated=show_dominated,
                 ),

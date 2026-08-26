@@ -69,9 +69,11 @@ class MethodRequirements:
                 "clipped afterwards."
             ),
             "soft_iterated": (
-                "This method allocates first and applies bounds by projection "
-                "afterwards, so a binding bound moves the result away from the "
-                "method's own answer."
+                "This method allocates first and applies the constraints "
+                "afterwards, by projecting onto the closest feasible "
+                "allocation. Bounds and group budgets do hold, but a binding "
+                "one moves the result away from the method's own answer — the "
+                "distance moved is reported with the result."
             ),
         }[self.bounds_mode]
 
@@ -210,7 +212,7 @@ REQUIREMENTS: dict[str, MethodRequirements] = {
         requires_mu=False, requires_cov=True, requires_returns=False,
         supports_target_return=False, supports_target_volatility=False,
         supports_risk_aversion=False, supports_risk_free_rate=False,
-        supports_group_bounds=False, bounds_mode="soft_iterated",
+        supports_group_bounds=True, bounds_mode="soft_iterated",
         supports_frontier=False, supports_turnover=False,
         extras=(_HRP_LINKAGE,),
         summary=(
@@ -309,7 +311,7 @@ REQUIREMENTS: dict[str, MethodRequirements] = {
         requires_mu=False, requires_cov=False, requires_returns=False,
         supports_target_return=False, supports_target_volatility=False,
         supports_risk_aversion=False, supports_risk_free_rate=False,
-        supports_group_bounds=False, bounds_mode="soft_iterated",
+        supports_group_bounds=True, bounds_mode="soft_iterated",
         supports_frontier=False, supports_turnover=False, extras=(),
         summary="Allocate 1/N to every asset.",
         when_to_use=(
@@ -319,6 +321,8 @@ REQUIREMENTS: dict[str, MethodRequirements] = {
         assumptions=(
             "The universe is deliberately constructed — 1/N inherits whatever "
             "concentration is in the asset list itself.",
+            "Bounds and group budgets are applied by projection afterwards, so "
+            "a binding one makes the result something other than 1/N.",
         ),
     ),
     "inverse_vol": MethodRequirements(
@@ -327,7 +331,7 @@ REQUIREMENTS: dict[str, MethodRequirements] = {
         requires_mu=False, requires_cov=True, requires_returns=False,
         supports_target_return=False, supports_target_volatility=False,
         supports_risk_aversion=False, supports_risk_free_rate=False,
-        supports_group_bounds=False, bounds_mode="soft_iterated",
+        supports_group_bounds=True, bounds_mode="soft_iterated",
         supports_frontier=False, supports_turnover=False, extras=(),
         summary="Weight each asset by the inverse of its own volatility.",
         when_to_use=(
@@ -337,6 +341,7 @@ REQUIREMENTS: dict[str, MethodRequirements] = {
         assumptions=(
             "Correlations are ignored entirely — this equals true risk parity "
             "only when every pair is equally correlated.",
+            "Bounds and group budgets are applied by projection afterwards.",
         ),
     ),
 }

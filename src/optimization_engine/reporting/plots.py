@@ -50,9 +50,11 @@ def plot_efficient_frontier(
         risk_free_rate: When given, draws the capital allocation line from
             ``rf`` through the tangency portfolio — the set of risk/return
             combinations reachable by mixing it with cash.
-        current_portfolio: ``(volatility, return, label)`` for the allocation
+        current_portfolio: ``(risk, return, label)`` for the allocation
             actually chosen, so the analyst can see where it sits relative to
-            the frontier.
+            the frontier. ``risk`` must be measured on the same axis the
+            frontier uses — pass ``None`` rather than a volatility when the
+            frontier is drawn against CVaR.
         show_dominated: Also draw the inefficient branch below the
             minimum-variance point, dashed and greyed.
     """
@@ -66,6 +68,22 @@ def plot_efficient_frontier(
             subset=["expected_volatility", "expected_return"]
         ).reset_index(drop=True)
 
+    # Plot the risk measure the frontier was actually traced against. Drawing
+    # a mean-CVaR frontier on a volatility axis shows a curve that was never
+    # optimized, and the shapes differ wherever returns are skewed.
+    risk_measure = getattr(frontier, "risk_measure", "volatility") if is_result else "volatility"
+    if risk_measure == "CVaR" and "cvar" in df.columns and df["cvar"].notna().any():
+        risk_col = "cvar"
+        risk_label = "Conditional VaR (annualized)"
+        # The minimum-variance and tangency anchors, and the capital
+        # allocation line, are defined in volatility space. They have no
+        # position on a CVaR axis, so they are not drawn there.
+        show_anchors = False
+    else:
+        risk_col = "expected_volatility"
+        risk_label = "Volatility (annualized)"
+        show_anchors = True
+
     fig = go.Figure()
 
     if show_dominated and is_result and "is_efficient" in summary.columns:
@@ -75,7 +93,7 @@ def plot_efficient_frontier(
         if not dominated.empty:
             fig.add_trace(
                 go.Scatter(
-                    x=dominated["expected_volatility"],
+                    x=dominated[risk_col],
                     y=dominated["expected_return"],
                     mode="markers+lines",
                     line=dict(dash="dot", color="#BAB0AC"),
@@ -92,7 +110,7 @@ def plot_efficient_frontier(
     if not df.empty:
         fig.add_trace(
             go.Scatter(
-                x=df["expected_volatility"],
+                x=df[risk_col],
                 y=df["expected_return"],
                 mode="markers+lines",
                 line=dict(color="#4C78A8", width=2),
@@ -105,14 +123,14 @@ def plot_efficient_frontier(
                 ),
                 name="Efficient frontier",
                 hovertemplate=(
-                    "Vol: %{x:.2%}<br>"
+                    f"{risk_label.split(' (')[0]}: %{{x:.2%}}<br>"
                     "Return: %{y:.2%}<br>"
                     "Sharpe: %{marker.color:.3f}<extra></extra>"
                 ),
             )
         )
 
-        has_exact_tangency = is_result and frontier.tangency is not None
+        has_exact_tangency = is_result and show_anchors and frontier.tangency is not None
         if highlight_index is None and not has_exact_tangency and "sharpe_ratio" in df.columns:
             valid = df["sharpe_ratio"].dropna()
             highlight_index = int(valid.idxmax()) if len(valid) else None
@@ -120,7 +138,7 @@ def plot_efficient_frontier(
             row = df.iloc[highlight_index]
             fig.add_trace(
                 go.Scatter(
-                    x=[row["expected_volatility"]],
+                    x=[row[risk_col]],
                     y=[row["expected_return"]],
                     mode="markers",
                     marker=dict(size=16, color="#E45756", symbol="star"),
@@ -132,7 +150,7 @@ def plot_efficient_frontier(
                 )
             )
 
-    if is_result:
+    if is_result and show_anchors:
         for anchor, symbol, color in (
             (frontier.min_variance, "diamond", "#54A24B"),
             (frontier.tangency, "circle", "#F58518"),
@@ -200,7 +218,7 @@ def plot_efficient_frontier(
 
     fig.update_layout(
         title=title,
-        xaxis_title="Volatility (annualized)",
+        xaxis_title=risk_label,
         yaxis_title="Expected Return (annualized)",
         xaxis_tickformat=".1%",
         yaxis_tickformat=".1%",

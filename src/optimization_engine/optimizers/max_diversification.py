@@ -24,12 +24,8 @@ import warnings
 import cvxpy as cp
 import numpy as np
 
-from optimization_engine.optimizers._bounds import (
-    InfeasibleBoundsError,
-    project_to_bounds_iterated,
-)
+from optimization_engine.optimizers._bounds import project_to_constraints
 from optimization_engine.optimizers._cvxpy_helpers import (
-    bounds_arrays,
     build_scaled_constraints,
     solve_problem,
 )
@@ -108,13 +104,9 @@ class MaxDiversificationOptimizer(BaseOptimizer):
         total = w.sum()
         if total <= 0:
             raise RuntimeError("Degenerate Max-Diversification solution")
-        w = w / total
-        lb, ub = bounds_arrays(self.assets, self.constraints)
-        try:
-            w = project_to_bounds_iterated(w, lb, ub)
-        except InfeasibleBoundsError:
-            raise
+        w, distance = project_to_constraints(w / total, self.assets, self.constraints)
         self._diagnostics.update(info.as_dict())
+        self._diagnostics["projection_distance"] = distance
         self._diagnostics["bounds_mode"] = "soft_iterated"
         self._diagnostics["fallback_reason"] = (
             f"Exact bounded solve failed ({cause}); bounds were applied by "

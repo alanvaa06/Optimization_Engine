@@ -208,7 +208,11 @@ def render_compliance(result) -> None:
         )
     note = result.extras.get("bounds_note") or result.extras.get("fallback_reason")
     if note:
-        st.info(note)
+        distance = result.extras.get("projection_distance")
+        if distance is not None and distance > 0.10:
+            st.warning(note)
+        else:
+            st.info(note)
     rb_note = result.extras.get("risk_budget_note")
     if rb_note:
         st.info(rb_note)
@@ -260,6 +264,24 @@ def render_portfolio_diagnostics(diag) -> None:
             )
         )
     metric_row(extra)
+
+
+def render_projection_distance(result) -> None:
+    """Show how far the mandate moved a projection-based method's answer."""
+    distance = result.extras.get("projection_distance")
+    if distance is None:
+        return
+    metric_row(
+        [
+            (
+                "Moved by constraints",
+                pct(distance),
+                "One-way fraction of the book the mandate shifted away from "
+                "this method's own allocation. Large values mean the "
+                "constraints, not the method, produced the result.",
+            )
+        ]
+    )
 
 
 def render_method_card(req) -> None:
