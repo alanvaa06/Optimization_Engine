@@ -1,5 +1,7 @@
-# Example multi-asset configuration. Mirrors the spirit of the original
-# Mexican-fund optimizer, with a global multi-asset universe.
+# Illustrative example configuration.
+# These values are made-up round numbers for documentation and CLI demos.
+# They are not a capital-market assumption and are not an allocation
+# constraint from any mandate or firm.
 
 periods_per_year: 252
 covariance_method: ledoit_wolf

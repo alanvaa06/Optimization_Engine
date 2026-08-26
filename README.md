@@ -51,7 +51,7 @@ src/optimization_engine/
 ├── frontier.py       # efficient frontier sweep
 └── cli.py            # `optengine` entrypoint
 app/streamlit_app.py  # interactive UI
-config/               # example configs (multi-asset + legacy)
+config/               # example configs
 notebooks/            # quickstart notebook
 scripts/              # batch runners
 tests/                # pytest smoke tests
@@ -125,29 +125,6 @@ config = EngineConfig(
 run = run_engine(returns, config, build_frontier=True)
 print(run.result.weights.round(3))
 print(run.absolute_summary())
-```
-
-## Migration from the original notebook
-
-The original notebook used a single `optimize_portfolio` function with
-hard-coded constraints and a target-return sweep. Equivalents:
-
-| Old | New |
-| --- | --- |
-| `optimize_portfolio(0.057, ...)` | `MeanVarianceOptimizer(...).optimize()` with `target_return=0.057` |
-| `efficient_frontier(start, end, steps)` | `efficient_frontier(config, cov, returns, n_points=...)` or `run_engine(..., build_frontier=True)` |
-| `summary_stats`, `summary_relative` | unchanged names in `optimization_engine.analytics` |
-| `risk_contribution(w, Σ)` | `optimization_engine.analytics.risk_contribution` |
-| Excel export at the end | `optimization_engine.reporting.write_excel_report` |
-
-A drop-in YAML for the original universe lives at
-`config/legacy_optluis.yaml` — drop `Precios_OptLuis_USD.xlsx` into
-`data/` and run:
-
-```bash
-optengine optimize --config config/legacy_optluis.yaml \
-                   --prices data/Precios_OptLuis_USD.xlsx \
-                   --frontier
 ```
 
 ## Tests
