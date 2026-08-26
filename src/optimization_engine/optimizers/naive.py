@@ -13,6 +13,7 @@ class EqualWeightOptimizer(BaseOptimizer):
     """Allocate 1/N to each asset, then project into bounds."""
 
     name = "equal_weight"
+    bounds_mode = "soft_iterated"
 
     def _solve(self) -> np.ndarray:
         n = len(self.assets)
@@ -25,6 +26,7 @@ class InverseVolatilityOptimizer(BaseOptimizer):
     """Weights inversely proportional to per-asset volatility (no correlations)."""
 
     name = "inverse_vol"
+    bounds_mode = "soft_iterated"
 
     def _solve(self) -> np.ndarray:
         sigma = self._sigma_matrix()

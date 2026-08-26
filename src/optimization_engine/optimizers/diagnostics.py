@@ -1,0 +1,293 @@
+"""Post-solve diagnostics: does the answer actually respect what was asked?
+
+An optimizer that returns weights is not the same as an optimizer that
+returned *valid* weights. Methods that solve unconstrained and project
+(HRP, max-diversification, the naive baselines) can only approximate group
+budgets; convex solvers can return ``optimal_inaccurate`` and drift outside
+the box by more than a rounding error. These helpers make that visible
+instead of leaving it for the analyst to discover in the weights table.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+
+import numpy as np
+import pandas as pd
+
+from optimization_engine.optimizers.base import PortfolioConstraints
+
+#: Weight drift below this is floating-point noise, not a real violation.
+DEFAULT_TOLERANCE = 1e-6
+
+
+@dataclass(frozen=True)
+class ConstraintViolation:
+    """One breached constraint, with the size of the breach."""
+
+    kind: str
+    label: str
+    limit: float
+    actual: float
+
+    @property
+    def magnitude(self) -> float:
+        return abs(self.actual - self.limit)
+
+    def describe(self) -> str:
+        return (
+            f"{self.label}: {self.actual:.4%} vs limit {self.limit:.4%} "
+            f"(off by {self.magnitude:.4%})"
+        )
+
+
+def check_constraints(
+    weights: pd.Series,
+    constraints: PortfolioConstraints,
+    tolerance: float = DEFAULT_TOLERANCE,
+) -> list[ConstraintViolation]:
+    """List every constraint the solved ``weights`` breach beyond ``tolerance``.
+
+    Returns an empty list when the allocation is fully compliant.
+    """
+    out: list[ConstraintViolation] = []
+
+    for asset, w in weights.items():
+        lo, hi = constraints.get_bounds(str(asset))
+        if w < lo - tolerance:
+            out.append(ConstraintViolation("bound", f"{asset} lower bound", lo, float(w)))
+        if w > hi + tolerance:
+            out.append(ConstraintViolation("bound", f"{asset} upper bound", hi, float(w)))
+
+    if constraints.fully_invested:
+        total = float(weights.sum())
+        if abs(total - 1.0) > tolerance:
+            out.append(ConstraintViolation("budget", "Sum of weights", 1.0, total))
+
+    if constraints.long_only:
+        negative = float(weights[weights < -tolerance].sum())
+        if negative < 0:
+            out.append(
+                ConstraintViolation("long_only", "Short exposure", 0.0, negative)
+            )
+
+    if constraints.leverage is not None:
+        gross = float(weights.abs().sum())
+        if gross > constraints.leverage + tolerance:
+            out.append(
+                ConstraintViolation(
+                    "leverage", "Gross exposure", float(constraints.leverage), gross
+                )
+            )
+
+    if constraints.groups and constraints.group_bounds:
+        group_sum: dict[str, float] = {}
+        for asset, w in weights.items():
+            g = constraints.groups.get(str(asset))
+            if g is not None:
+                group_sum[g] = group_sum.get(g, 0.0) + float(w)
+        for group, (lo, hi) in constraints.group_bounds.items():
+            total = group_sum.get(group, 0.0)
+            if total < float(lo) - tolerance:
+                out.append(
+                    ConstraintViolation("group", f"Group {group!r} lower bound", float(lo), total)
+                )
+            if total > float(hi) + tolerance:
+                out.append(
+                    ConstraintViolation("group", f"Group {group!r} upper bound", float(hi), total)
+                )
+
+    if constraints.previous_weights and constraints.turnover_limit is not None:
+        prev = pd.Series(constraints.previous_weights).reindex(weights.index).fillna(0.0)
+        turnover = float((weights - prev).abs().sum())
+        if turnover > float(constraints.turnover_limit) + tolerance:
+            out.append(
+                ConstraintViolation(
+                    "turnover", "Turnover", float(constraints.turnover_limit), turnover
+                )
+            )
+
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Concentration / diversification
+# ---------------------------------------------------------------------------
+
+
+def herfindahl_index(weights: pd.Series | np.ndarray) -> float:
+    """Sum of squared weights. ``1/N`` when equally weighted, ``1`` at a corner."""
+    w = np.asarray(weights, dtype=float)
+    return float(np.sum(w**2))
+
+
+def effective_n(weights: pd.Series | np.ndarray) -> float:
+    """Inverse Herfindahl: how many equally-weighted positions this is worth.
+
+    A 10-asset portfolio with 90% in one name has an effective N near 1.2,
+    not 10 — this is the number to look at before calling a book diversified.
+    """
+    hhi = herfindahl_index(weights)
+    return float(1.0 / hhi) if hhi > 0 else float("nan")
+
+
+def diversification_ratio(weights: pd.Series, cov_matrix: pd.DataFrame) -> float:
+    """Weighted-average asset volatility divided by portfolio volatility.
+
+    ``1.0`` means correlations bought you nothing; higher is better. This is
+    the objective the max-diversification optimizer maximizes.
+    """
+    assets = list(weights.index)
+    sigma = cov_matrix.reindex(assets, axis=0).reindex(assets, axis=1).values
+    w = weights.values.astype(float)
+    weighted_avg_vol = float(np.abs(w) @ np.sqrt(np.diag(sigma)))
+    port_vol = float(np.sqrt(max(w @ sigma @ w, 0.0)))
+    return weighted_avg_vol / port_vol if port_vol > 0 else float("nan")
+
+
+def effective_n_risk(weights: pd.Series, cov_matrix: pd.DataFrame) -> float:
+    """Effective number of *risk* bets: inverse Herfindahl of risk contributions.
+
+    Weight diversification and risk diversification are different things — a
+    60/40 book is diversified by weight and concentrated in equity risk.
+    """
+    rc = risk_contributions(weights, cov_matrix)
+    return effective_n(rc.values)
+
+
+def risk_contributions(
+    weights: pd.Series, cov_matrix: pd.DataFrame
+) -> pd.Series:
+    """Per-asset share of total portfolio variance (sums to 1)."""
+    assets = list(weights.index)
+    sigma = cov_matrix.reindex(assets, axis=0).reindex(assets, axis=1).values
+    w = weights.values.astype(float)
+    total = float(w @ sigma @ w)
+    if total <= 0:
+        return pd.Series(np.zeros(len(assets)), index=assets)
+    return pd.Series(w * (sigma @ w) / total, index=assets)
+
+
+def risk_decomposition(
+    weights: pd.Series, cov_matrix: pd.DataFrame
+) -> pd.DataFrame:
+    """Full Euler risk decomposition of portfolio volatility.
+
+    Columns:
+        ``weight``            — the allocation.
+        ``marginal_risk``     — ∂σ_p/∂w_i, the volatility added by one more unit.
+        ``contribution``      — w_i · ∂σ_p/∂w_i, in annualized volatility units.
+                                These sum exactly to portfolio volatility.
+        ``share_of_risk``     — contribution as a fraction of portfolio volatility.
+        ``standalone_vol``    — the asset's own volatility, for reference.
+
+    Reporting contributions in volatility units (not just shares) is what lets
+    an analyst say "this sleeve costs me 4.2% of vol", which is the sentence
+    a risk committee actually needs.
+    """
+    assets = list(weights.index)
+    sigma = cov_matrix.reindex(assets, axis=0).reindex(assets, axis=1).values
+    w = weights.values.astype(float)
+    port_vol = float(np.sqrt(max(w @ sigma @ w, 0.0)))
+    if port_vol <= 0:
+        zeros = np.zeros(len(assets))
+        return pd.DataFrame(
+            {
+                "weight": w,
+                "marginal_risk": zeros,
+                "contribution": zeros,
+                "share_of_risk": zeros,
+                "standalone_vol": np.sqrt(np.diag(sigma)),
+            },
+            index=assets,
+        )
+    marginal = (sigma @ w) / port_vol
+    contribution = w * marginal
+    return pd.DataFrame(
+        {
+            "weight": w,
+            "marginal_risk": marginal,
+            "contribution": contribution,
+            "share_of_risk": contribution / port_vol,
+            "standalone_vol": np.sqrt(np.diag(sigma)),
+        },
+        index=assets,
+    )
+
+
+@dataclass(frozen=True)
+class PortfolioDiagnostics:
+    """Concentration, diversification and compliance summary for an allocation."""
+
+    n_positions: int
+    gross_exposure: float
+    net_exposure: float
+    long_exposure: float
+    short_exposure: float
+    max_weight: float
+    herfindahl: float
+    effective_n: float
+    effective_n_risk: float
+    diversification_ratio: float
+    turnover: float | None = None
+    violations: tuple[ConstraintViolation, ...] = field(default_factory=tuple)
+
+    @property
+    def is_compliant(self) -> bool:
+        return not self.violations
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "n_positions": self.n_positions,
+            "gross_exposure": self.gross_exposure,
+            "net_exposure": self.net_exposure,
+            "long_exposure": self.long_exposure,
+            "short_exposure": self.short_exposure,
+            "max_weight": self.max_weight,
+            "herfindahl": self.herfindahl,
+            "effective_n": self.effective_n,
+            "effective_n_risk": self.effective_n_risk,
+            "diversification_ratio": self.diversification_ratio,
+            "turnover": self.turnover,
+            "violations": [v.describe() for v in self.violations],
+        }
+
+
+def portfolio_diagnostics(
+    weights: pd.Series,
+    cov_matrix: pd.DataFrame | None = None,
+    constraints: PortfolioConstraints | None = None,
+    active_tolerance: float = 1e-4,
+) -> PortfolioDiagnostics:
+    """Summarize an allocation's concentration, exposure and compliance."""
+    w = weights.astype(float)
+    longs = float(w[w > 0].sum())
+    shorts = float(w[w < 0].sum())
+    turnover = None
+    violations: tuple[ConstraintViolation, ...] = ()
+    if constraints is not None:
+        violations = tuple(check_constraints(w, constraints))
+        if constraints.previous_weights:
+            prev = pd.Series(constraints.previous_weights).reindex(w.index).fillna(0.0)
+            turnover = float((w - prev).abs().sum())
+
+    return PortfolioDiagnostics(
+        n_positions=int((w.abs() > active_tolerance).sum()),
+        gross_exposure=float(w.abs().sum()),
+        net_exposure=float(w.sum()),
+        long_exposure=longs,
+        short_exposure=shorts,
+        max_weight=float(w.max()) if len(w) else float("nan"),
+        herfindahl=herfindahl_index(w),
+        effective_n=effective_n(w),
+        effective_n_risk=(
+            effective_n_risk(w, cov_matrix) if cov_matrix is not None else float("nan")
+        ),
+        diversification_ratio=(
+            diversification_ratio(w, cov_matrix)
+            if cov_matrix is not None
+            else float("nan")
+        ),
+        turnover=turnover,
+        violations=violations,
+    )

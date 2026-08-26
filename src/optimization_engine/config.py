@@ -18,7 +18,29 @@ import yaml
 
 @dataclass
 class OptimizerSpec:
-    """Specification of which optimizer to run and its hyperparameters."""
+    """Specification of which optimizer to run and its hyperparameters.
+
+    Attributes:
+        name: Registered optimizer name (see ``available_optimizers()``).
+        target_return: Hard annualized expected-return target.
+        target_volatility: Hard annualized volatility cap.
+        risk_free_rate: Annual risk-free rate used for Sharpe and for the
+            tangency and CAPM/Black-Litterman calculations.
+        risk_aversion: Utility coefficient λ in ``μ'w − λ·w'Σw``.
+        cvar_alpha: Tail probability for mean-CVaR (``0.05`` ⇒ 95% CVaR).
+        risk_budget: ``asset -> target share of total risk`` for risk parity.
+        bl_views: Black-Litterman views. Either ``{asset: return}`` for
+            absolute views, or a list of ``{"weights": {...},
+            "expected_return": x, "confidence": y, "label": z}`` mappings for
+            relative (spread) views.
+        bl_view_confidences: Ω diagonal for the mapping form of ``bl_views``.
+        bl_tau: Prior-uncertainty scale in the Black-Litterman posterior.
+        bl_market_caps: Equilibrium market portfolio for reverse optimization.
+        bl_market_return: Observed market return, used to imply δ.
+        bl_calibrate_risk_aversion: Imply δ from the market Sharpe ratio
+            instead of using ``risk_aversion`` verbatim.
+        hrp_linkage: Hierarchical clustering linkage rule for HRP.
+    """
 
     name: str = "mean_variance"
     target_return: float | None = None
@@ -32,6 +54,8 @@ class OptimizerSpec:
     bl_tau: float = 0.05
     bl_market_caps: dict[str, float] | None = None
     hrp_linkage: Literal["single", "average", "complete", "ward"] = "single"
+    bl_market_return: float | None = None
+    bl_calibrate_risk_aversion: bool = False
     extra: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -61,6 +85,17 @@ class EngineConfig:
         optimizer: ``OptimizerSpec`` describing the run.
         benchmark_weights: Optional benchmark weight vector for
             comparison.
+        long_only: Forbid short positions. When False, per-asset minimum
+            weights may go negative.
+        fully_invested: Require ``sum(w) == 1``.
+        leverage: Cap on gross exposure ``Σ|w_i|``. Only meaningful once
+            ``long_only`` is off — a long-only, fully-invested book always
+            has gross exposure of exactly 1.
+        previous_weights: The portfolio being traded from. Needed for the
+            turnover budget and for turnover reporting.
+        turnover_limit: Cap on ``Σ|w_i − w_prev,i|``. Honoured by the
+            mean-variance family and mean-CVaR; the homogeneous solves
+            (max-Sharpe, max-diversification, risk parity) warn instead.
     """
 
     expected_returns: dict[str, float] = field(default_factory=dict)
@@ -78,6 +113,11 @@ class EngineConfig:
     market_weights: dict[str, float] | None = None
     optimizer: OptimizerSpec = field(default_factory=OptimizerSpec)
     benchmark_weights: dict[str, float] | None = None
+    long_only: bool = True
+    fully_invested: bool = True
+    leverage: float | None = None
+    previous_weights: dict[str, float] | None = None
+    turnover_limit: float | None = None
 
     @property
     def assets(self) -> list[str]:
@@ -106,6 +146,13 @@ class EngineConfig:
             "market_weights": (dict(self.market_weights) if self.market_weights else None),
             "optimizer": self.optimizer.to_dict(),
             "benchmark_weights": self.benchmark_weights,
+            "long_only": self.long_only,
+            "fully_invested": self.fully_invested,
+            "leverage": self.leverage,
+            "previous_weights": (
+                dict(self.previous_weights) if self.previous_weights else None
+            ),
+            "turnover_limit": self.turnover_limit,
         }
 
     @classmethod
@@ -137,6 +184,19 @@ class EngineConfig:
             ),
             optimizer=OptimizerSpec(**opt_raw),
             benchmark_weights=data.get("benchmark_weights"),
+            long_only=bool(data.get("long_only", True)),
+            fully_invested=bool(data.get("fully_invested", True)),
+            leverage=(
+                float(data["leverage"]) if data.get("leverage") is not None else None
+            ),
+            previous_weights=(
+                dict(data["previous_weights"]) if data.get("previous_weights") else None
+            ),
+            turnover_limit=(
+                float(data["turnover_limit"])
+                if data.get("turnover_limit") is not None
+                else None
+            ),
         )
 
 
