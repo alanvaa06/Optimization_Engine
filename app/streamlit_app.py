@@ -64,6 +64,12 @@ from optimization_engine.analytics.relative import (  # noqa: E402
 )
 from optimization_engine.analytics.report import BENCHMARK, PORTFOLIO  # noqa: E402
 from optimization_engine.analytics.risk import drawdown_table  # noqa: E402
+from optimization_engine.backtest import (  # noqa: E402
+    BacktestSpec,
+    CostSpec,
+    compute_tca,
+    cost_by_asset,
+)
 from optimization_engine.benchmark import BenchmarkError, BenchmarkSpec  # noqa: E402
 from optimization_engine.config import EngineConfig, OptimizerSpec  # noqa: E402
 from optimization_engine.data.covariance import (  # noqa: E402
@@ -2136,7 +2142,7 @@ with tab_backtest:
             "numbers as a description of the fit, not as a forecast."
         )
 
-        c1, c2 = st.columns(2)
+        c1, c2, c3 = st.columns(3)
         with c1:
             frequency = st.selectbox(
                 "Rebalancing",
@@ -2149,13 +2155,54 @@ with tab_backtest:
                     "continuous rebalancing."
                 ),
             )
+            execution_lag = st.number_input(
+                "Execution lag (periods)", min_value=0, max_value=10, value=0, step=1,
+                help=(
+                    "Periods between choosing a target and trading it. At zero "
+                    "the book fills on a close it has not seen — the "
+                    "conventional, optimistic assumption."
+                ),
+            )
         with c2:
-            cost_bps = st.slider(
-                "Transaction cost (bps, one-way)", 0, 100, 10,
-                help="Charged on traded notional at each rebalance.",
+            commission_bps = st.slider(
+                "Commission (bps, one-way)", 0, 100, 10,
+                help="The broker's share. Charged on traded notional.",
+            )
+            slippage_bps = st.slider(
+                "Slippage (bps, one-way)", 0, 100, 0,
+                help="The half-spread you cross. A market property, not a broker one.",
+            )
+        with c3:
+            impact_eta = st.slider(
+                "Market impact (eta)", 0.0, 2.0, 0.0, step=0.1,
+                help=(
+                    "Square-root impact: cost grows with the square root of "
+                    "trade size, so the same allocation gets more expensive as "
+                    "the book grows. Zero switches impact off."
+                ),
+            )
+            participation = st.slider(
+                "Tradable per period (% of book)", 0.5, 20.0, 5.0, step=0.5,
+                help=(
+                    "How much of the book can be traded in one name, in one "
+                    "period, without moving the price. Smaller is a thinner "
+                    "market and a more expensive rebalance."
+                ),
             )
 
-        bt = run.backtest(frequency=frequency, transaction_cost_bps=float(cost_bps))
+        cost_bps = float(commission_bps) + float(slippage_bps)
+        backtest_spec = BacktestSpec(
+            frequency=frequency,
+            costs=CostSpec(
+                commission_bps=float(commission_bps),
+                slippage_bps=float(slippage_bps),
+                impact_coefficient=float(impact_eta),
+                impact_participation=float(participation) / 100.0,
+            ),
+            execution_lag=int(execution_lag),
+            periods_per_year=int(periods_per_year),
+        )
+        bt = run.simulate(backtest_spec)
         metric_row(
             [
                 (
@@ -2176,6 +2223,26 @@ with tab_backtest:
                 ),
             ]
         )
+
+        with st.expander("What did the trading cost, and where did it go?"):
+            panel = compute_tca(bt)
+            st.caption(panel.describe())
+            t1, t2 = st.columns(2)
+            with t1:
+                st.dataframe(panel.to_frame(), width="stretch")
+            with t2:
+                by_asset = cost_by_asset(bt)
+                if by_asset.empty:
+                    st.info("Nothing traded, so there is no cost to attribute.")
+                else:
+                    st.dataframe(by_asset.head(15), width="stretch")
+            for reason in panel.reasons.values():
+                st.caption(f"— {reason}")
+            for degradation in panel.degradations:
+                st.warning(
+                    f"{degradation}. The reported cost is a lower bound on the "
+                    "modelled one."
+                )
 
         st.plotly_chart(
             plot_wealth_index(

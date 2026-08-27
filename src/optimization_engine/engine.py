@@ -28,6 +28,12 @@ from optimization_engine.analytics.risk import (
     group_risk_contribution,
     risk_contribution,
 )
+from optimization_engine.backtest.results import RunResult
+from optimization_engine.backtest.runner import run_backtest
+from optimization_engine.backtest.spec import BacktestSpec
+from optimization_engine.backtest.sweep import SweepResults, SweepSpec, run_sweep
+from optimization_engine.backtest.tearsheet import Tearsheet, build_tearsheet
+from optimization_engine.backtest.walkforward import WalkForwardRun, walk_forward_run
 from optimization_engine.benchmark import (
     ResolvedBenchmark,
     resolve_benchmark,
@@ -338,18 +344,7 @@ class EngineRun:
         rebalance_every = rebalance_every or max(ppy // 4, 1)
 
         if solve is None:
-            import copy
-
-            base_config = copy.deepcopy(self.config)
-            if reestimate_expected_returns:
-                # Emptying the vector makes run_engine derive it from the
-                # window via expected_returns_method.
-                base_config.expected_returns = {}
-
-            def solve(window: pd.DataFrame) -> pd.Series:
-                return run_engine(
-                    window, base_config, check_feasibility=False
-                ).result.weights
+            solve = self._window_solver(reestimate_expected_returns)
 
         result = walk_forward_backtest(
             self.returns,
@@ -364,6 +359,148 @@ class EngineRun:
             reestimate_expected_returns
         )
         return result
+
+    # -- the full simulation stack -----------------------------------------
+
+    def simulate(
+        self,
+        spec: BacktestSpec | None = None,
+        *,
+        weights: pd.Series | None = None,
+    ) -> RunResult:
+        """Replay the solved weights and return the full result bundle.
+
+        Where :meth:`backtest` gives the compact result, this gives everything
+        the simulation core produced: per-trade costs, NAV, the target
+        schedule, and the spec and result hashes that let one run be compared
+        with another. Take a :class:`~optimization_engine.backtest.spec.BacktestSpec`
+        when you need an execution lag or a cost model with market impact.
+
+        Still in-sample unless the spec says otherwise — the optimizer saw
+        this history.
+        """
+        spec = spec or BacktestSpec(periods_per_year=self.config.periods_per_year)
+        target = self.result.weights if weights is None else weights
+        return run_backtest(self.returns, target, spec)
+
+    def walk_forward_run(
+        self,
+        lookback: int | None = None,
+        rebalance_every: int | None = None,
+        spec: BacktestSpec | None = None,
+        expanding: bool = False,
+        solve: Callable[[pd.DataFrame], pd.Series] | None = None,
+        reestimate_expected_returns: bool = True,
+    ) -> WalkForwardRun:
+        """:meth:`walk_forward`, returning the full bundle instead of the digest.
+
+        Same evaluation, same defaults; what differs is that the result
+        carries the trade and cost frames and the provenance hashes, which is
+        what :meth:`tearsheet` and the sweep need.
+        """
+        ppy = self.config.periods_per_year
+        spec = spec or BacktestSpec(periods_per_year=ppy)
+        return walk_forward_run(
+            self.returns,
+            solve or self._window_solver(reestimate_expected_returns),
+            lookback=lookback or max(2 * ppy, 24),
+            rebalance_every=rebalance_every or max(ppy // 4, 1),
+            spec=spec,
+            expanding=expanding,
+        )
+
+    def tearsheet(
+        self,
+        run: RunResult | None = None,
+        *,
+        riskfree_rate: float | None = None,
+        n_trials: int | None = None,
+        trial_sharpes: pd.Series | None = None,
+        overfitting: Any = None,
+    ) -> Tearsheet:
+        """The assembled reading of a run, caveats attached.
+
+        Defaults to describing an in-sample replay of this run's own weights,
+        which is the cheapest thing to produce and the least informative — the
+        tearsheet says so in its caveats rather than leaving it to the reader.
+        Pass a walk-forward run for a number worth quoting.
+        """
+        rf = self.config.optimizer.risk_free_rate if riskfree_rate is None else riskfree_rate
+        return build_tearsheet(
+            run if run is not None else self.simulate(),
+            self.returns,
+            riskfree_rate=rf,
+            n_trials=n_trials,
+            trial_sharpes=trial_sharpes,
+            overfitting=overfitting,
+        )
+
+    def sweep(
+        self,
+        sweep: SweepSpec,
+        *,
+        lookback: int | None = None,
+        rebalance_every: int | None = None,
+        spec: BacktestSpec | None = None,
+        expanding: bool = False,
+        progress: Callable[[int, int], None] | None = None,
+    ) -> SweepResults:
+        """Walk-forward every cell of a grid, and count the trials.
+
+        Each cell is evaluated out of sample, because a grid scored in sample
+        measures how well each configuration memorized the history rather than
+        how well it would have done. The results carry the trial count that
+        the deflated Sharpe and the overfitting probability both need.
+        """
+        ppy = self.config.periods_per_year
+        run_spec = spec or BacktestSpec(periods_per_year=ppy)
+        window = lookback or max(2 * ppy, 24)
+        step = rebalance_every or max(ppy // 4, 1)
+
+        def evaluate(cell_config: EngineConfig) -> pd.Series:
+            import copy
+
+            cell = copy.deepcopy(cell_config)
+            cell.expected_returns = {}
+
+            def solve(window_returns: pd.DataFrame) -> pd.Series:
+                return run_engine(
+                    window_returns, cell, check_feasibility=False
+                ).result.weights
+
+            return walk_forward_run(
+                self.returns,
+                solve,
+                lookback=window,
+                rebalance_every=step,
+                spec=run_spec,
+                expanding=expanding,
+            ).returns
+
+        return run_sweep(
+            self.config,
+            sweep,
+            evaluate,
+            periods_per_year=ppy,
+            progress=progress,
+        )
+
+    def _window_solver(
+        self, reestimate_expected_returns: bool
+    ) -> Callable[[pd.DataFrame], pd.Series]:
+        """This run's own config, re-solved on whatever window it is handed."""
+        import copy
+
+        base_config = copy.deepcopy(self.config)
+        if reestimate_expected_returns:
+            # Emptying the vector makes run_engine derive it from the window
+            # via expected_returns_method.
+            base_config.expected_returns = {}
+
+        def solve(window: pd.DataFrame) -> pd.Series:
+            return run_engine(window, base_config, check_feasibility=False).result.weights
+
+        return solve
 
     def in_vs_out_of_sample(
         self, walk_forward_result: WalkForwardResult, riskfree_rate: float = 0.0

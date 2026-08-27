@@ -277,3 +277,89 @@ def test_an_unreachable_target_under_a_budget_names_the_cause(
     err = capsys.readouterr().err
     assert "Target return" in err
     assert "tracking-error or active-share budget is in force" in err
+
+
+def test_backtest_prices_the_trading_and_states_its_caveats(
+    feasible_config, capsys
+):
+    assert (
+        main(
+            [
+                "backtest",
+                "--config", str(feasible_config),
+                "--sample",
+                "--lookback", "252",
+                "--rebalance-every", "252",
+                "--commission-bps", "8",
+                "--slippage-bps", "4",
+            ]
+        )
+        == 0
+    )
+    out = capsys.readouterr().out
+    assert "out-of-sample" in out
+    assert "bps of notional" in out
+    # The run modelled costs and a lag, so those caveats are gone; nobody
+    # supplied a trial count, so that one stays.
+    assert "modelled as free" not in out
+    assert "undeflated" in out
+
+
+def test_backtest_sweep_counts_the_trials_it_ran(feasible_config, tmp_path, capsys):
+    output = tmp_path / "backtest.xlsx"
+    assert (
+        main(
+            [
+                "backtest",
+                "--config", str(feasible_config),
+                "--sample",
+                "--lookback", "252",
+                "--rebalance-every", "252",
+                "--commission-bps", "10",
+                "--sweep", "optimizer.name=min_variance,equal_weight",
+                "--output", str(output),
+            ]
+        )
+        == 0
+    )
+    out = capsys.readouterr().out
+    assert "2 cells" in out
+    assert "trial(s)" in out, "the deflation must name the trial count"
+    assert output.exists()
+    assert "sweep" in pd.ExcelFile(output).sheet_names
+
+
+def test_backtest_holdout_flags_a_second_look(feasible_config, tmp_path, capsys):
+    audit = tmp_path / "audit.jsonl"
+    argv = [
+        "backtest",
+        "--config", str(feasible_config),
+        "--sample",
+        "--lookback", "252",
+        "--rebalance-every", "252",
+        "--holdout", "2024-01-01",
+        "--audit-log", str(audit),
+    ]
+    assert main(argv) == 0
+    assert "First look" in capsys.readouterr().out
+    assert main(argv) == 0
+    assert "evaluated on the holdout before" in capsys.readouterr().out
+    assert len(audit.read_text().splitlines()) == 2
+
+
+def test_backtest_rejects_a_malformed_sweep(feasible_config, capsys):
+    assert (
+        main(
+            [
+                "backtest",
+                "--config", str(feasible_config),
+                "--sample",
+                "--lookback", "252",
+                "--rebalance-every", "252",
+                "--sweep", "optimizer.name",
+            ]
+        )
+        == 0
+    )
+    err = capsys.readouterr().err
+    assert "Sweep skipped" in err and "PATH=V1,V2" in err

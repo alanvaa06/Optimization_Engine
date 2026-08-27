@@ -15,67 +15,44 @@ This module provides both an honest in-sample replay (:func:`backtest_weights`,
 with explicit drift, rebalancing and costs) and a genuinely out-of-sample
 :func:`walk_forward_backtest` that re-estimates and re-solves on a rolling
 window and only ever holds positions forward in time.
+
+Both are adapters. The simulation itself lives in
+:mod:`optimization_engine.backtest`, whose stateless core also carries the
+cost models, the execution calendar, the per-trade and per-date cost frames,
+and the provenance hashes. What survives here is the compact result shape
+most callers want — a return series, turnover, and costs — plus a
+``.run`` handle back to the full bundle for the ones that want more.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Callable, Literal
+from typing import Callable
 
-import numpy as np
 import pandas as pd
 
-RebalanceFrequency = Literal[
-    "none", "daily", "weekly", "monthly", "quarterly", "annual"
+from optimization_engine.backtest.calendar import rebalance_dates
+from optimization_engine.backtest.costs import CostModel
+from optimization_engine.backtest.results import RunResult
+from optimization_engine.backtest.runner import run_backtest
+from optimization_engine.backtest.spec import (
+    REBALANCE_DESCRIPTIONS,
+    BacktestSpec,
+    CostSpec,
+    RebalanceFrequency,
+)
+from optimization_engine.backtest.walkforward import walk_forward_run
+
+__all__ = [
+    "REBALANCE_DESCRIPTIONS",
+    "BacktestResult",
+    "RebalanceFrequency",
+    "WalkForwardResult",
+    "backtest_weights",
+    "compare_in_and_out_of_sample",
+    "rebalance_dates",
+    "walk_forward_backtest",
 ]
-
-#: Pandas offset aliases for each supported rebalance cadence.
-_FREQ_ALIAS: dict[str, str | None] = {
-    "none": None,
-    "daily": None,  # every period; handled without resampling
-    "weekly": "W",
-    "monthly": "ME",
-    "quarterly": "QE",
-    "annual": "YE",
-}
-
-REBALANCE_DESCRIPTIONS: dict[str, str] = {
-    "none": (
-        "Buy and hold. Weights drift with performance; winners compound into "
-        "a larger share of the book."
-    ),
-    "daily": "Rebalance every period. Zero drift, maximum turnover and cost.",
-    "weekly": "Rebalance weekly.",
-    "monthly": "Rebalance monthly — the common institutional default.",
-    "quarterly": "Rebalance quarterly.",
-    "annual": "Rebalance annually. Low cost, large intra-year drift.",
-}
-
-
-def rebalance_dates(
-    index: pd.DatetimeIndex, frequency: RebalanceFrequency
-) -> pd.DatetimeIndex:
-    """Dates on which the book is traded back to target weights.
-
-    The first date is always included: that is the initial purchase.
-    """
-    if len(index) == 0:
-        return pd.DatetimeIndex([])
-    if frequency == "none":
-        return pd.DatetimeIndex([index[0]])
-    if frequency == "daily":
-        return pd.DatetimeIndex(index)
-    alias = _FREQ_ALIAS.get(frequency)
-    if alias is None:
-        raise ValueError(
-            f"Unknown rebalance frequency {frequency!r}. "
-            f"Available: {sorted(_FREQ_ALIAS)}"
-        )
-    marks = pd.Series(index, index=index).resample(alias).last().dropna()
-    dates = pd.DatetimeIndex(marks.values)
-    if index[0] not in dates:
-        dates = pd.DatetimeIndex([index[0]]).append(dates)
-    return dates.unique().sort_values()
 
 
 @dataclass
@@ -88,11 +65,13 @@ class BacktestResult:
         weights: Actual held weights at the start of each period, after drift.
         turnover: One-way turnover traded on each rebalance date.
         costs: Transaction cost charged on each rebalance date.
-        rebalance_dates: When the book was traded.
+        rebalance_dates: When the book was scheduled to trade.
         is_out_of_sample: Whether the weights were chosen without seeing the
             returns they are evaluated on. The single most important caveat
             attached to any backtest number.
         metadata: Free-form run description (lookback, frequency, costs …).
+        run: The full result bundle — per-trade costs, NAV, targets, and the
+            spec and result hashes. ``None`` only on results built by hand.
     """
 
     returns: pd.Series
@@ -103,6 +82,7 @@ class BacktestResult:
     rebalance_dates: pd.DatetimeIndex
     is_out_of_sample: bool = False
     metadata: dict[str, object] = field(default_factory=dict)
+    run: RunResult | None = None
 
     @property
     def total_turnover(self) -> float:
@@ -142,6 +122,47 @@ class BacktestResult:
         net = annualize_returns(self.returns, ppy)
         return float(gross - net)
 
+    def tca(self):
+        """The transaction-cost panel, when the full bundle is available.
+
+        Raises:
+            ValueError: If this result was not produced by the simulation core.
+        """
+        from optimization_engine.backtest.tca import compute_tca
+
+        if self.run is None:
+            raise ValueError(
+                "This result carries no run bundle, so there are no per-trade "
+                "costs to analyze."
+            )
+        return compute_tca(self.run)
+
+
+def _adapt(run: RunResult, marks: pd.DatetimeIndex, extra: dict) -> BacktestResult:
+    """Project the full bundle onto the compact legacy result shape."""
+    metadata: dict[str, object] = {
+        "frequency": run.meta.spec.get("frequency"),
+        "transaction_cost_bps": run.meta.spec.get("costs", {}).get("commission_bps", 0.0),
+        "periods_per_year": run.meta.spec.get("periods_per_year", 252),
+        "execution_lag": run.meta.spec.get("execution_lag", 0),
+        "spec_hash": run.meta.spec_hash,
+        "result_hash": run.meta.result_hash,
+    }
+    if run.meta.degradations:
+        metadata["cost_degradations"] = list(run.meta.degradations)
+    metadata.update(extra)
+    return BacktestResult(
+        returns=run.returns,
+        gross_returns=run.gross_returns,
+        weights=run.weights,
+        turnover=run.turnover,
+        costs=run.cost_series,
+        rebalance_dates=marks,
+        is_out_of_sample=run.meta.is_out_of_sample,
+        metadata=metadata,
+        run=run,
+    )
+
 
 def backtest_weights(
     returns: pd.DataFrame,
@@ -150,6 +171,10 @@ def backtest_weights(
     transaction_cost_bps: float = 0.0,
     periods_per_year: int = 252,
     is_out_of_sample: bool = False,
+    *,
+    spec: BacktestSpec | None = None,
+    cost_model: CostModel | None = None,
+    execution_lag: int = 0,
 ) -> BacktestResult:
     """Replay a weight schedule, letting positions drift between rebalances.
 
@@ -163,6 +188,12 @@ def backtest_weights(
             25 bps on 100% turnover costs 25 bps of NAV.
         periods_per_year: Observations per year, for annualizing turnover.
         is_out_of_sample: Tag the result; see :class:`BacktestResult`.
+        spec: A full :class:`~optimization_engine.backtest.spec.BacktestSpec`,
+            for the cost models and execution lag the four positional
+            arguments above cannot express. It supersedes them entirely.
+        cost_model: Override the model built from the spec's costs.
+        execution_lag: Periods between a decision and its fill. Ignored when
+            ``spec`` is given, which carries its own.
 
     Raises:
         ValueError: If ``returns`` is empty or the weights cover none of it.
@@ -170,80 +201,17 @@ def backtest_weights(
     if returns is None or returns.empty:
         raise ValueError("Cannot backtest on empty returns.")
 
-    assets = list(returns.columns)
-    if isinstance(weights, pd.Series):
-        schedule = pd.DataFrame(
-            [weights.reindex(assets).fillna(0.0).values],
-            index=[returns.index[0]],
-            columns=assets,
+    if spec is None:
+        spec = BacktestSpec(
+            frequency=frequency,
+            costs=CostSpec.from_bps(transaction_cost_bps),
+            execution_lag=execution_lag,
+            periods_per_year=periods_per_year,
+            is_out_of_sample=is_out_of_sample,
         )
-    else:
-        schedule = weights.reindex(columns=assets).fillna(0.0)
-        schedule = schedule.sort_index()
-        if schedule.empty:
-            raise ValueError("Weight schedule is empty.")
-
-    marks = rebalance_dates(returns.index, frequency)
-    mark_set = set(marks)
-
-    held = np.zeros(len(assets))
-    current_target = schedule.iloc[0].values.astype(float)
-    held_rows: list[np.ndarray] = []
-    gross: list[float] = []
-    net: list[float] = []
-    turnover_by_date: dict[pd.Timestamp, float] = {}
-    cost_by_date: dict[pd.Timestamp, float] = {}
-    cost_rate = transaction_cost_bps / 10_000.0
-    first = True
-
-    for date in returns.index:
-        # A new target from the schedule always forces a trade: the walk-forward
-        # runner only emits one when the optimizer has actually re-solved.
-        if date in schedule.index:
-            current_target = schedule.loc[date].values.astype(float)
-            trade_now = True
-        else:
-            trade_now = date in mark_set
-
-        if first or trade_now:
-            traded = float(np.abs(current_target - held).sum())
-            if traded > 1e-12:
-                turnover_by_date[date] = traded
-                cost_by_date[date] = traded * cost_rate
-            held = current_target.copy()
-            first = False
-
-        held_rows.append(held.copy())
-        period = returns.loc[date].values.astype(float)
-        gross_ret = float(held @ period)
-        gross.append(gross_ret)
-        net.append(gross_ret - cost_by_date.get(date, 0.0))
-
-        # Drift: positions grow with their own return, then renormalize to the
-        # new portfolio value so the weights still sum to the invested total.
-        grown = held * (1.0 + period)
-        total = grown.sum()
-        held = grown / total if abs(total) > 1e-12 else grown
-
-    index = returns.index
-    return BacktestResult(
-        returns=pd.Series(net, index=index, name="portfolio"),
-        gross_returns=pd.Series(gross, index=index, name="gross"),
-        weights=pd.DataFrame(held_rows, index=index, columns=assets),
-        turnover=pd.Series(turnover_by_date, dtype=float).reindex(
-            pd.DatetimeIndex(sorted(turnover_by_date))
-        ),
-        costs=pd.Series(cost_by_date, dtype=float).reindex(
-            pd.DatetimeIndex(sorted(cost_by_date))
-        ),
-        rebalance_dates=marks,
-        is_out_of_sample=is_out_of_sample,
-        metadata={
-            "frequency": frequency,
-            "transaction_cost_bps": transaction_cost_bps,
-            "periods_per_year": periods_per_year,
-        },
-    )
+    run = run_backtest(returns, weights, spec, cost_model=cost_model)
+    marks = rebalance_dates(pd.DatetimeIndex(returns.index), spec.frequency)
+    return _adapt(run, marks, {})
 
 
 @dataclass
@@ -283,6 +251,8 @@ def walk_forward_backtest(
     periods_per_year: int = 252,
     min_lookback: int | None = None,
     expanding: bool = False,
+    *,
+    spec: BacktestSpec | None = None,
 ) -> WalkForwardResult:
     """Re-estimate and re-solve on a rolling window, holding results forward.
 
@@ -304,92 +274,37 @@ def walk_forward_backtest(
             ``lookback``.
         expanding: Use a growing window anchored at the start instead of a
             fixed-length rolling one.
+        spec: A full backtest spec, for cost models and execution lag the
+            scalar arguments cannot express.
 
     Raises:
         ValueError: If the history is too short to produce a single
             out-of-sample period, or if every solve fails.
     """
-    if lookback < 2:
-        raise ValueError(f"lookback must be at least 2 periods; got {lookback}.")
-    if rebalance_every < 1:
-        raise ValueError(
-            f"rebalance_every must be at least 1 period; got {rebalance_every}."
+    if spec is None:
+        spec = BacktestSpec(
+            costs=CostSpec.from_bps(transaction_cost_bps),
+            periods_per_year=periods_per_year,
         )
-    min_lookback = min_lookback or lookback
-    n = len(returns)
-    if n <= min_lookback:
-        raise ValueError(
-            f"Need more than {min_lookback} observations to evaluate anything "
-            f"out of sample; got {n}. Shorten the lookback or load more history."
-        )
-
-    decision_points = list(range(min_lookback, n, rebalance_every))
-    schedule: dict[pd.Timestamp, pd.Series] = {}
-    window_rows: list[dict[str, object]] = []
-    failures: list[str] = []
-    last_weights: pd.Series | None = None
-
-    for pos in decision_points:
-        start = 0 if expanding else max(0, pos - lookback)
-        window = returns.iloc[start:pos]
-        decision_date = returns.index[pos]
-        try:
-            w = solve(window)
-            w = w.reindex(returns.columns).fillna(0.0)
-            schedule[decision_date] = w
-            last_weights = w
-            status = "ok"
-        except Exception as exc:
-            # Carrying the previous book forward is what a desk would actually
-            # do when a re-solve fails; skipping the period silently would
-            # remove a real cost from the track record.
-            failures.append(f"{decision_date.date()}: {exc}")
-            status = f"failed: {exc}"
-            if last_weights is not None:
-                schedule[decision_date] = last_weights
-        window_rows.append(
-            {
-                "decision_date": decision_date,
-                "window_start": returns.index[start],
-                "window_end": returns.index[pos - 1],
-                "window_length": pos - start,
-                "status": status,
-            }
-        )
-
-    if not schedule:
-        raise ValueError(
-            "Every walk-forward solve failed; there is nothing to evaluate. "
-            f"First error: {failures[0] if failures else 'unknown'}"
-        )
-
-    weights_history = pd.DataFrame(schedule).T.sort_index()
-    first_date = weights_history.index[0]
-    evaluation = returns.loc[first_date:]
-
-    backtest = backtest_weights(
-        evaluation,
-        weights_history,
-        frequency="none",  # trades happen on schedule dates only
-        transaction_cost_bps=transaction_cost_bps,
-        periods_per_year=periods_per_year,
-        is_out_of_sample=True,
+    walk = walk_forward_run(
+        returns,
+        solve,
+        lookback=lookback,
+        rebalance_every=rebalance_every,
+        spec=spec,
+        min_lookback=min_lookback,
+        expanding=expanding,
     )
-    backtest.metadata.update(
-        {
-            "lookback": lookback,
-            "rebalance_every": rebalance_every,
-            "expanding": expanding,
-            "n_rebalances": len(weights_history),
-            "n_failed_solves": len(failures),
-        }
+    backtest = _adapt(
+        walk.run,
+        pd.DatetimeIndex([walk.run.weights.index[0]]),
+        dict(walk.metadata),
     )
-
     return WalkForwardResult(
         backtest=backtest,
-        weights_history=weights_history,
-        windows=pd.DataFrame(window_rows),
-        failures=tuple(failures),
+        weights_history=walk.weights_history,
+        windows=walk.windows,
+        failures=walk.failures,
     )
 
 
@@ -416,5 +331,7 @@ def compare_in_and_out_of_sample(
     stats = summary_stats(
         frame, periods_per_year=periods_per_year, riskfree_rate=riskfree_rate
     ).T
-    stats["Degradation"] = stats["In-sample (fitted)"] - stats["Out-of-sample (walk-forward)"]
+    stats["Degradation"] = (
+        stats["In-sample (fitted)"] - stats["Out-of-sample (walk-forward)"]
+    )
     return stats

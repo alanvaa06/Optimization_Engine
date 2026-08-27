@@ -123,6 +123,81 @@ def _build_parser() -> argparse.ArgumentParser:
              "constraint instead of letting the solver fail.",
     )
 
+    backtest = sub.add_parser(
+        "backtest",
+        help="Walk-forward the configured process, price the trading, and "
+             "report what the search cost. Optionally sweep a grid.",
+    )
+    backtest.add_argument("--config", required=True, help="Path to YAML/JSON config.")
+    backtest.add_argument("--prices", help="Excel/CSV/Parquet file of prices.")
+    backtest.add_argument("--sheet", default="Precios", help="Excel sheet name.")
+    backtest.add_argument("--sample", action="store_true", help="Use built-in sample data.")
+    backtest.add_argument(
+        "--yahoo", help="Comma- or space-separated tickers to download from Yahoo."
+    )
+    backtest.add_argument(
+        "--yahoo-period", default="10y", help="Yahoo lookback when no dates are given."
+    )
+    backtest.add_argument("--yahoo-start", help="Yahoo start date (YYYY-MM-DD).")
+    backtest.add_argument("--yahoo-end", help="Yahoo end date (YYYY-MM-DD).")
+    backtest.add_argument(
+        "--lookback", type=int, metavar="N",
+        help="Estimation window in periods. Defaults to two years.",
+    )
+    backtest.add_argument(
+        "--rebalance-every", type=int, metavar="N",
+        help="Periods between re-solves. Defaults to one quarter.",
+    )
+    backtest.add_argument(
+        "--expanding", action="store_true",
+        help="Grow the estimation window from the start instead of rolling it.",
+    )
+    backtest.add_argument(
+        "--commission-bps", type=float, default=0.0, metavar="BPS",
+        help="One-way broker commission on traded notional.",
+    )
+    backtest.add_argument(
+        "--slippage-bps", type=float, default=0.0, metavar="BPS",
+        help="One-way spread cost on traded notional.",
+    )
+    backtest.add_argument(
+        "--impact-eta", type=float, default=0.0, metavar="ETA",
+        help="Square-root market-impact coefficient. Non-zero makes cost grow "
+             "with the square root of trade size, which is the only way "
+             "capacity shows up in a backtest.",
+    )
+    backtest.add_argument(
+        "--impact-participation", type=float, default=0.05, metavar="Q",
+        help="Fraction of the book tradable in one name, in one period, "
+             "without impact. Smaller means a thinner market.",
+    )
+    backtest.add_argument(
+        "--execution-lag", type=int, default=1, metavar="N",
+        help="Periods between a decision and its fill. Defaults to 1 — a desk "
+             "does not trade on a close it has not seen. Pass 0 for the "
+             "conventional (optimistic) same-period fill.",
+    )
+    backtest.add_argument(
+        "--holdout", metavar="YYYY-MM-DD",
+        help="Withhold everything after this date from the walk-forward, then "
+             "evaluate on it once and append the visit to the audit log.",
+    )
+    backtest.add_argument(
+        "--audit-log", default="runs/holdout_audit.jsonl",
+        help="Where the holdout audit trail is appended.",
+    )
+    backtest.add_argument(
+        "--sweep", metavar="PATH=V1,V2",
+        action="append",
+        help="Sweep a config path over values, e.g. "
+             "'optimizer.name=min_variance,risk_parity'. Repeat for a grid. "
+             "Every cell is walk-forwarded and the trial count is carried "
+             "into the deflated Sharpe.",
+    )
+    backtest.add_argument(
+        "--output", help="Optional Excel path for the tearsheet frames."
+    )
+
     check = sub.add_parser(
         "check",
         help="Validate data and constraints without solving. Reports data "
@@ -544,6 +619,170 @@ def _load_prices_for(args: argparse.Namespace, config):
     return load_prices(args.prices, sheet_name=args.sheet)
 
 
+def _parse_sweep_arguments(raw: list[str] | None):
+    """``--sweep path=a,b`` into the grid the sweep runner expects.
+
+    Values are parsed as JSON when they can be, so numbers and booleans reach
+    the config as numbers and booleans rather than as strings a validator
+    would later reject.
+    """
+    import json as _json
+
+    if not raw:
+        return None
+    params: dict[str, list] = {}
+    for entry in raw:
+        if "=" not in entry:
+            raise ValueError(
+                f"--sweep expects PATH=V1,V2 but got {entry!r}. "
+                "Example: --sweep optimizer.name=min_variance,risk_parity"
+            )
+        path, _, values = entry.partition("=")
+        parsed = []
+        for token in values.split(","):
+            token = token.strip()
+            if not token:
+                continue
+            try:
+                parsed.append(_json.loads(token))
+            except ValueError:
+                parsed.append(token)
+        if not parsed:
+            raise ValueError(f"--sweep {path!r} lists no values.")
+        params[path.strip()] = parsed
+    from optimization_engine.backtest import SweepSpec
+
+    return SweepSpec(params=params)
+
+
+def _cmd_backtest(args: argparse.Namespace) -> int:
+    """Walk the process forward, price the trading, and count the trials.
+
+    The three things this prints that a plain optimize run cannot: what the
+    strategy earned out of sample, what the trading cost to get it, and how
+    much of the remaining Sharpe survives being deflated for the size of the
+    search that produced it.
+    """
+    from optimization_engine.backtest import (
+        BacktestSpec,
+        CostSpec,
+        final_holdout_run,
+        gate_returns,
+        run_backtest,
+    )
+
+    config = load_config(args.config)
+    _apply_estimator_flags(config, args)
+    prices = _load_prices_for(args, config)
+    returns = prices_to_returns(prices)
+    if not config.expected_returns:
+        config.expected_returns = {asset: 0.0 for asset in returns.columns}
+
+    spec = BacktestSpec(
+        costs=CostSpec(
+            commission_bps=args.commission_bps,
+            slippage_bps=args.slippage_bps,
+            impact_coefficient=args.impact_eta,
+            impact_participation=args.impact_participation,
+        ),
+        execution_lag=args.execution_lag,
+        periods_per_year=config.periods_per_year,
+        name=Path(args.config).stem,
+    )
+    print(spec.describe())
+
+    evaluation = returns
+    if args.holdout:
+        evaluation = gate_returns(returns, args.holdout)
+        print(
+            f"  Holdout: walk-forward sees {len(evaluation)} of {len(returns)} "
+            f"observations; everything after {args.holdout} is withheld."
+        )
+
+    run = run_engine(evaluation, config, check_feasibility=False)
+    try:
+        walk = run.walk_forward_run(
+            lookback=args.lookback,
+            rebalance_every=args.rebalance_every,
+            spec=spec,
+            expanding=args.expanding,
+        )
+    except ValueError as exc:
+        print(f"Walk-forward failed: {exc}", file=sys.stderr)
+        return 2
+
+    print(f"  {walk.run.describe()}")
+    if walk.n_failures:
+        print(f"  {walk.n_failures} solve(s) failed; the previous book was carried forward.")
+
+    sweep_results = None
+    overfitting = None
+    n_trials = 1
+    trial_sharpes = None
+    try:
+        sweep_spec = _parse_sweep_arguments(args.sweep)
+    except ValueError as exc:
+        print(f"Sweep skipped: {exc}", file=sys.stderr)
+        sweep_spec = None
+    if sweep_spec is not None:
+        sweep_results = run.sweep(
+            sweep_spec,
+            lookback=args.lookback,
+            rebalance_every=args.rebalance_every,
+            spec=spec,
+            expanding=args.expanding,
+        )
+        print(f"  {sweep_results.describe()}")
+        n_trials = max(sweep_results.n_ok, 1)
+        trial_sharpes = sweep_results.trial_sharpes()
+        try:
+            overfitting = sweep_results.overfitting_report()
+        except ValueError as exc:
+            print(f"  Overfitting analysis skipped: {exc}", file=sys.stderr)
+        else:
+            print(f"  {overfitting.describe()}")
+
+    sheet = run.tearsheet(
+        walk.run,
+        n_trials=n_trials if sweep_results is not None else None,
+        trial_sharpes=trial_sharpes,
+        overfitting=overfitting,
+    )
+    print(f"  {sheet.tca.describe()}")
+    if sheet.deflated_sharpe is not None:
+        print(f"  {sheet.deflated_sharpe.describe()}")
+    for caveat in sheet.caveats:
+        print(f"  ! {caveat}")
+
+    if args.holdout:
+        # The last book the gated walk-forward chose is what a desk would
+        # actually have been holding when the boundary arrived. Replaying it
+        # forward is the one honest question the held-out segment can answer.
+        locked = walk.weights_history.iloc[-1]
+        holdout_spec = spec.with_(is_out_of_sample=True, name=f"{spec.name}-holdout")
+        outcome = final_holdout_run(
+            returns,
+            args.holdout,
+            lambda segment: run_backtest(segment, locked, holdout_spec).returns,
+            strategy={"config": args.config, "spec_hash": spec.spec_hash},
+            audit_path=args.audit_log,
+            periods_per_year=config.periods_per_year,
+        )
+        print(f"  {outcome.describe()}")
+        print(
+            "  Held-out Sharpe: "
+            f"{float(outcome.summary.loc['holdout', 'Sharpe Ratio']):.2f}"
+        )
+
+    if args.output:
+        frames = sheet.to_frames()
+        if sweep_results is not None:
+            frames["sweep"] = sweep_results.frame
+        out = write_excel_report(args.output, frames)
+        print(f"Wrote {out} ({len(frames)} sheets)")
+    return 0
+
+
 def _cmd_check(args: argparse.Namespace) -> int:
     """Pre-flight the inputs and constraints, and say what would go wrong."""
     from optimization_engine.data.covariance import (
@@ -670,6 +909,8 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_fred(args)
     if args.command == "check":
         return _cmd_check(args)
+    if args.command == "backtest":
+        return _cmd_backtest(args)
     if args.command == "describe":
         return _cmd_describe(args)
     parser.print_help()
