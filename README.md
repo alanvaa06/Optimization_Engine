@@ -68,7 +68,7 @@ value, and nothing about that bias shows up in the number itself.
 Take 50 strategies drawn from the *same zero-mean distribution* — no skill
 anywhere. The best posts an annualized Sharpe of 1.24, and the probabilistic
 Sharpe ratio calls it significant at 99.3%. Deflate it for the fact that it was
-the best of 50 and it drops to **45.6%**: a coin flip, which is what it is.
+the best of 50 and it drops to **45.9%**: a coin flip, which is what it is.
 
 `optengine optimize --trials 40` makes that declaration part of the run, and
 `probability_of_backtest_overfitting()` asks the complementary question — across
@@ -269,7 +269,7 @@ and nothing about that bias is visible in the number itself.
   the expected maximum across the trials you actually ran, adjusted for skew
   and kurtosis. Take 50 strategies drawn from the *same zero-mean
   distribution*: the best posts an annualized Sharpe of 1.24 and a
-  probabilistic Sharpe of 99.3%. Its deflated Sharpe is **45.6%**.
+  probabilistic Sharpe of 99.3%. Its deflated Sharpe is **45.9%**.
 * `minimum_track_record_length()` says how much history you would need before
   the observed Sharpe is significant. Usually a bracing answer.
 * `probability_of_backtest_overfitting()` implements CSCV: across every

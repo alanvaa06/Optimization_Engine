@@ -97,6 +97,25 @@ def test_best_of_many_skill_free_trials_does_not_survive_deflation(
     assert report.benchmark_sharpe > 0
 
 
+def test_the_documented_deflation_figures_still_hold(
+    skill_free_trials: pd.DataFrame,
+):
+    """Pins the numbers README.md and docs/RESEARCH.md quote.
+
+    ``default_rng`` is reproducible across numpy versions and every step from
+    there is deterministic, so these are stable. The point of the test is to
+    fail loudly if a change to the Sharpe convention or the standard error
+    moves them, rather than leaving the documentation quietly wrong.
+    """
+    annual = skill_free_trials.apply(sharpe_ratio, periods_per_year=252)
+    winner = skill_free_trials[annual.idxmax()]
+    report = deflated_sharpe_ratio(winner, n_trials=50, trial_sharpes=annual)
+
+    assert report.sharpe == pytest.approx(1.24, abs=0.005)
+    assert report.probabilistic == pytest.approx(0.993, abs=0.0005)
+    assert report.deflated == pytest.approx(0.459, abs=0.0005)
+
+
 def test_one_trial_deflates_to_the_plain_probabilistic_sharpe(
     skill_free_trials: pd.DataFrame,
 ):

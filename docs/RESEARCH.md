@@ -130,7 +130,7 @@ in-sample winner land below the out-of-sample median?
 `optimization_engine.analytics.selection`. The test suite validates the
 correction on 50 strategies drawn from the *same zero-mean distribution*: the
 best of them posts an annualized Sharpe of 1.24 and a probabilistic Sharpe of
-99.3%, and the deflated Sharpe correctly reports 45.6%.
+99.3%, and the deflated Sharpe correctly reports 45.9%.
 
 This matters for this engine specifically. It ships ten-plus methods, six
 covariance estimators and a grid of constraints; running forty combinations and
