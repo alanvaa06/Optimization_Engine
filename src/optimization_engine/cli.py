@@ -382,9 +382,16 @@ def _report_layer_exposures(run) -> None:
         for _, row in block.iterrows():
             limits = ""
             if pd.notna(row["effective_max"]):
-                limits = f" / cap {row['effective_max']:.1%}"
+                floor = (
+                    f"{row['effective_min']:.1%}"
+                    if pd.notna(row["effective_min"]) and row["effective_min"] > 0
+                    else "0%"
+                )
+                limits = f" / limit {floor}–{row['effective_max']:.1%}"
                 if row["basis"] == "parent":
-                    limits += f" ({row['max']:.0%} of {row['parent']})"
+                    limits += (
+                        f" ({row['min']:.0%}–{row['max']:.0%} of {row['parent']})"
+                    )
             mark = "  ←binding" if row["binding"] else ""
             print(f"    {row['bucket']:<24} {row['weight']:>7.2%}{limits}{mark}")
 

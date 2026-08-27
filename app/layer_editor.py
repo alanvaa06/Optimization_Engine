@@ -545,9 +545,16 @@ def render_layer_exposures(run) -> None:
     display = exposures.copy()
     display["Limit"] = [
         (
-            f"{row.min:.0%}–{row.max:.0%}"
+            f"{_pct(row.min)}–{_pct(row.max)}"
             + (f" of {row.parent}" if row.basis == "parent" else "")
         )
+        for row in exposures.itertuples()
+    ]
+    # A relative limit is written against its parent but *lives* on the book,
+    # and a bucket can be held up by its floor as easily as held down by its
+    # cap — so both ends are restated as portfolio shares.
+    display["Range (of book)"] = [
+        f"{_pct(row.effective_min)}–{_pct(row.effective_max)}"
         for row in exposures.itertuples()
     ]
     display = display.rename(
@@ -555,24 +562,29 @@ def render_layer_exposures(run) -> None:
             "layer": "Layer",
             "bucket": "Bucket",
             "weight": "Weight",
-            "effective_max": "Cap (of book)",
             "headroom": "Headroom",
             "binding": "Binding",
         }
     )
     st.dataframe(
         display[
-            ["Layer", "Bucket", "Weight", "Limit", "Cap (of book)", "Headroom", "Binding"]
-        ].style.format(
-            {
-                "Weight": "{:.2%}",
-                "Cap (of book)": "{:.2%}",
-                "Headroom": "{:.2%}",
-            }
-        ),
+            [
+                "Layer", "Bucket", "Weight", "Limit", "Range (of book)",
+                "Headroom", "Binding",
+            ]
+        ].style.format({"Weight": "{:.2%}", "Headroom": "{:.2%}"}),
         width="stretch",
         hide_index=True,
     )
+    st.caption(
+        "“Headroom” is the distance to the cap. A binding bucket means the "
+        "policy, not the objective, chose that number."
+    )
+
+
+def _pct(value) -> str:
+    """A limit as a percentage, or an em dash when the bucket is uncapped."""
+    return "—" if pd.isna(value) else f"{float(value):.0%}"
 
 
 __all__ = [

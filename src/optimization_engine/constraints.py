@@ -59,6 +59,12 @@ LEGACY_LAYER_NAME = "Asset class"
 #: Weight drift below this is floating-point noise, not a breach.
 DEFAULT_TOLERANCE = 1e-6
 
+#: A bucket this close to a limit is being held there by it. Wider than
+#: DEFAULT_TOLERANCE on purpose: a conic solver lands a few basis points
+#: inside an active constraint, and reporting that bucket as unconstrained
+#: hides the very limit that produced the allocation.
+BINDING_TOLERANCE = 5e-4
+
 
 class LayerConfigurationError(ValueError):
     """A layer is malformed in a way no solve can recover from."""
@@ -303,6 +309,27 @@ def has_layer_constraints(constraints_or_config: Any) -> bool:
 # ---------------------------------------------------------------------------
 
 
+def _membership_matrix(
+    assets: Sequence[str],
+    assignments: Mapping[str, str],
+    buckets: Sequence[str],
+) -> np.ndarray:
+    """0/1 rows selecting each bucket's members out of ``assets``.
+
+    Rows follow ``buckets`` and may repeat: a relative layer asks for one
+    parent row per *child*, and two children of the same parent legitimately
+    produce the same row.
+    """
+    row_of: dict[str, list[int]] = {}
+    for row, bucket in enumerate(buckets):
+        row_of.setdefault(bucket, []).append(row)
+    matrix = np.zeros((len(buckets), len(assets)))
+    for col, asset in enumerate(assets):
+        for row in row_of.get(assignments.get(str(asset), ""), ()):
+            matrix[row, col] = 1.0
+    return matrix
+
+
 def layer_cvxpy_constraints(
     weights,
     assets: Sequence[str],
@@ -310,6 +337,12 @@ def layer_cvxpy_constraints(
     scale=None,
 ):
     """Translate every layer into CVXPY inequalities on ``weights``.
+
+    Emitted as one matrix inequality per layer per side rather than one scalar
+    inequality per bucket. Canonicalization cost in CVXPY scales with the
+    *number* of constraint objects, and a three-layer policy over a dozen
+    buckets would otherwise add fifty of them to every solve — which is paid
+    again on each point of a frontier sweep and each window of a walk-forward.
 
     Args:
         weights: The decision variable. Either the weights themselves or the
@@ -326,62 +359,75 @@ def layer_cvxpy_constraints(
 
     Returns:
         A list of CVXPY constraints, empty when nothing is constrained.
-    """
-    import cvxpy as cp
 
+    Raises:
+        LayerConfigurationError: When a relative layer names a parent that
+            does not exist, or one of its buckets straddles two parents.
+    """
     cons: list[Any] = []
-    one = 1.0 if scale is None else scale
     layer_list = list(layers)
 
     for layer in layer_list:
-        idx_map = layer.member_indices(assets)
-        if not idx_map:
+        members = layer.member_indices(assets)
+        buckets = [b for b in layer.limits if members.get(b)]
+        if not buckets:
             continue
-        parent_idx: dict[str, list[int]] = {}
-        child_to_parent: dict[str, str] = {}
-        if layer.is_relative:
-            parent = resolve_parent(layer, layer_list)
-            if parent is None:
-                raise LayerConfigurationError(
-                    f"Layer {layer.name!r} is expressed as a share of "
-                    f"{layer.parent!r}, but no layer by that name exists."
-                )
-            child_to_parent, ambiguous = parent_bucket_map(layer, parent, assets)
-            if ambiguous:
-                bad = ", ".join(
-                    f"{c} (spans {', '.join(ps)})" for c, ps in ambiguous.items()
-                )
-                raise LayerConfigurationError(
-                    f"Layer {layer.name!r} is expressed as a share of "
-                    f"{parent.name!r}, but these buckets sit in more than one "
-                    f"parent: {bad}. Split them, or switch the layer to "
-                    "percent-of-portfolio."
-                )
-            # Parent membership is *not* restricted to constrained buckets:
-            # "40% of equity" is 40% of everything in equity, whether or not
-            # the equity bucket itself carries a cap.
-            for i, asset in enumerate(assets):
-                up = parent.assignments.get(str(asset))
-                if up is not None:
-                    parent_idx.setdefault(up, []).append(i)
 
-        for bucket, idx in idx_map.items():
-            lo, hi = layer.limits[bucket]
-            if layer.is_relative:
-                up = child_to_parent.get(bucket)
-                if up is None or not parent_idx.get(up):
-                    # Nothing in the parent: the child is forced to zero by the
-                    # membership itself, and a positive floor is caught by the
-                    # feasibility report rather than posed as 0 ≥ lo here.
-                    continue
-                reference = cp.sum(weights[parent_idx[up]])
-            else:
-                reference = one
-            if lo > 0:
-                cons.append(cp.sum(weights[idx]) >= float(lo) * reference)
-            cons.append(cp.sum(weights[idx]) <= float(hi) * reference)
+        if not layer.is_relative:
+            lo = np.array([float(layer.limits[b][0]) for b in buckets])
+            hi = np.array([float(layer.limits[b][1]) for b in buckets])
+            held = _membership_matrix(assets, layer.assignments, buckets) @ weights
+            reference = 1.0 if scale is None else scale
+            cons.append(held <= hi * reference)
+            if (lo > 0).any():
+                cons.append(held >= lo * reference)
+            continue
+
+        parent = resolve_parent(layer, layer_list)
+        if parent is None:
+            raise LayerConfigurationError(
+                f"Layer {layer.name!r} is expressed as a share of "
+                f"{layer.parent!r}, but no layer by that name exists."
+            )
+        child_to_parent, ambiguous = parent_bucket_map(layer, parent, assets)
+        if ambiguous:
+            bad = ", ".join(
+                f"{c} (spans {', '.join(ps)})" for c, ps in ambiguous.items()
+            )
+            raise LayerConfigurationError(
+                f"Layer {layer.name!r} is expressed as a share of "
+                f"{parent.name!r}, but these buckets sit in more than one "
+                f"parent: {bad}. Split them, or switch the layer to "
+                "percent-of-portfolio."
+            )
+        # Parent membership is *not* restricted to the parent's constrained
+        # buckets: "40% of equity" is 40% of everything in equity, whether or
+        # not the equity bucket itself carries a cap. A child whose parent
+        # holds nothing in this universe is dropped — the membership already
+        # forces it to zero, and a positive floor on it is caught by the
+        # feasibility report rather than posed here as ``0 ≥ lo``.
+        parent_members = parent.members(assets)
+        buckets = [
+            b for b in buckets if parent_members.get(child_to_parent.get(b, ""))
+        ]
+        if not buckets:
+            continue
+        parents = [child_to_parent[b] for b in buckets]
+        lo = np.array([float(layer.limits[b][0]) for b in buckets])
+        hi = np.array([float(layer.limits[b][1]) for b in buckets])
+        child = _membership_matrix(assets, layer.assignments, buckets)
+        above = _membership_matrix(assets, parent.assignments, parents)
+
+        # (child − hi·parent)·w ≤ 0 and (lo·parent − child)·w ≤ 0. Both sides
+        # are homogeneous of degree one, so no ``scale`` appears and the same
+        # rows are correct in weight space and in ray space alike.
+        cons.append((child - hi[:, None] * above) @ weights <= 0)
+        if (lo > 0).any():
+            rows = np.flatnonzero(lo > 0)
+            cons.append(
+                (lo[rows, None] * above[rows, :] - child[rows, :]) @ weights <= 0
+            )
     return cons
-
 
 # ---------------------------------------------------------------------------
 # Reporting
@@ -452,12 +498,13 @@ def layer_exposures(
                     # policy shaping the portfolio, so only a positive floor
                     # counts as binding from below.
                     "binding": bool(
-                        np.isfinite(eff_hi) and abs(eff_hi - weight) <= 1e-4
+                        np.isfinite(eff_hi)
+                        and abs(eff_hi - weight) <= BINDING_TOLERANCE
                     )
                     or bool(
                         np.isfinite(eff_lo)
                         and eff_lo > 1e-9
-                        and abs(weight - eff_lo) <= 1e-4
+                        and abs(weight - eff_lo) <= BINDING_TOLERANCE
                     ),
                 }
             )

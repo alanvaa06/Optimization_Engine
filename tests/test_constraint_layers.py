@@ -460,3 +460,73 @@ def test_weights_outside_the_universe_do_not_confuse_the_exposures():
     table = layer_exposures(weights, [layer]).set_index("bucket")
     assert table.loc["X", "weight"] == pytest.approx(0.6)
     assert np.isnan(table.loc["Y", "max"])
+
+
+# ---------------------------------------------------------------------------
+# Floors, which are the other half of every layer
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("method", ["mean_variance", "max_sharpe", "risk_parity"])
+def test_a_bucket_floor_is_honoured_as_a_share_of_the_portfolio(returns, method):
+    layer = ConstraintLayer(
+        name="Sub-asset class",
+        assignments=SUB_CLASS,
+        limits={"EM Equity": (0.08, 0.20), "DM Fixed Income": (0.05, 0.25)},
+    )
+    run = run_engine(returns, _config(returns, [layer], method=method))
+    w = run.result.weights
+    assert _bucket_weight(w, SUB_CLASS, "EM Equity") >= 0.08 - TOL
+    assert _bucket_weight(w, SUB_CLASS, "DM Fixed Income") >= 0.05 - TOL
+    assert run.result.is_compliant, run.result.violations
+
+
+@pytest.mark.parametrize("method", ["mean_variance", "max_sharpe"])
+def test_a_floor_stated_as_a_share_of_the_parent_scales_with_it(returns, method):
+    """"At least 70% of the equity sleeve must be developed."""
+    layer = ConstraintLayer(
+        name="Sub-asset class",
+        assignments=SUB_CLASS,
+        limits={"DM Equity": (0.70, 1.0), "EM Equity": (0.0, 0.30)},
+        basis=BASIS_PARENT,
+        parent="Asset class",
+    )
+    run = run_engine(returns, _config(returns, [layer], method=method))
+    w = run.result.weights
+    equity = _bucket_weight(w, ASSET_CLASS, "Equity")
+    assert equity > 0.01
+    assert _bucket_weight(w, SUB_CLASS, "DM Equity") >= 0.70 * equity - 1e-6
+    assert run.result.is_compliant, run.result.violations
+
+
+def test_two_buckets_sharing_a_parent_each_get_their_own_limit(returns):
+    """The parent row repeats, once per child, and the caps must not merge."""
+    layer = ConstraintLayer(
+        name="Equity split",
+        assignments={
+            "US_Equity": "US", "Intl_Equity": "Non-US", "EM_Equity": "Non-US"
+        },
+        limits={"US": (0.0, 0.60), "Non-US": (0.0, 0.40)},
+        basis=BASIS_PARENT,
+        parent="Asset class",
+    )
+    run = run_engine(returns, _config(returns, [layer]))
+    w = run.result.weights
+    equity = _bucket_weight(w, ASSET_CLASS, "Equity")
+    assert w["US_Equity"] <= 0.60 * equity + 1e-6
+    assert w["Intl_Equity"] + w["EM_Equity"] <= 0.40 * equity + 1e-6
+    assert run.result.is_compliant, run.result.violations
+
+
+def test_a_child_whose_parent_holds_nothing_is_dropped_rather_than_forced(returns):
+    """A parent bucket outside the universe leaves the child at zero, not broken."""
+    layer = ConstraintLayer(
+        name="Sub",
+        assignments={"US_Equity": "DM Equity"},
+        limits={"DM Equity": (0.0, 0.50), "Ghost": (0.0, 0.30)},
+        basis=BASIS_PARENT,
+        parent="Asset class",
+    )
+    run = run_engine(returns, _config(returns, [layer]))
+    equity = _bucket_weight(run.result.weights, ASSET_CLASS, "Equity")
+    assert run.result.weights["US_Equity"] <= 0.50 * equity + 1e-6
