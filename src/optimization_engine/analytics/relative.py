@@ -16,7 +16,10 @@ import statsmodels.api as sm
 from optimization_engine.analytics.performance import (
     annualize_returns,
     annualize_volatility,
+    probabilistic_sharpe_ratio,
+    sharpe_ratio,
 )
+from optimization_engine.analytics.risk import downside_deviation
 
 
 def spread(
@@ -200,6 +203,189 @@ def information_ratio(
     return ann_excess / te
 
 
+def batting_average(
+    r: pd.Series | pd.DataFrame, rb: pd.Series | pd.DataFrame
+) -> pd.Series:
+    """Share of periods in which the portfolio beat the benchmark.
+
+    The most honest single number about consistency, and the one that most
+    often contradicts the information ratio: a portfolio can win 4 periods in
+    10 and still post a strong IR because the 4 were large. Reported next to
+    :func:`up_down_number_ratio` so the reader can see which of the two
+    stories the excess return is telling.
+    """
+    frame, bench = _aligned(r, rb)
+    diff = frame.sub(bench, axis=0)
+    return pd.Series(
+        {col: float((diff[col].dropna() > 0).mean()) for col in diff.columns},
+        name="Batting Average",
+    )
+
+
+def up_down_number_ratio(
+    r: pd.Series | pd.DataFrame, rb: pd.Series | pd.DataFrame
+) -> pd.DataFrame:
+    """How often the portfolio outperformed in rising and in falling markets.
+
+    Capture ratios are magnitudes; these are counts. A manager can post a
+    flattering down-capture from a single well-timed month while having lost
+    to the benchmark in most of the others, and only the count reveals it.
+    """
+    frame, bench = _aligned(r, rb)
+    diff = frame.sub(bench, axis=0)
+    up, down = bench > 0, bench < 0
+    rows: dict[str, dict[str, float]] = {}
+    for col in frame.columns:
+        rows[col] = {
+            "Up Number Ratio": (
+                float((diff.loc[up, col].dropna() > 0).mean())
+                if int(up.sum()) else float("nan")
+            ),
+            "Down Number Ratio": (
+                float((diff.loc[down, col].dropna() > 0).mean())
+                if int(down.sum()) else float("nan")
+            ),
+        }
+    return pd.DataFrame(rows).T
+
+
+def treynor_ratio(
+    r: pd.Series | pd.DataFrame,
+    rb: pd.Series | pd.DataFrame,
+    riskfree_rate: float = 0.0,
+    periods_per_year: int = 252,
+) -> pd.Series:
+    """Annualized excess-over-cash return per unit of *systematic* risk.
+
+    Sharpe divides by total volatility, which charges a portfolio for
+    diversifiable risk it may be holding deliberately. Treynor divides by beta
+    instead, so it ranks portfolios by the return earned on the market
+    exposure alone — the right comparison for a sleeve inside a larger book,
+    the wrong one for a standalone allocation.
+    """
+    frame, bench = _aligned(r, rb)
+    betas = beta(frame, bench)
+    ann_excess = annualize_returns(frame, periods_per_year) - riskfree_rate
+    out = ann_excess / betas.replace(0.0, np.nan)
+    return pd.Series(out, name="Treynor Ratio")
+
+
+def m_squared(
+    r: pd.Series | pd.DataFrame,
+    rb: pd.Series | pd.DataFrame,
+    riskfree_rate: float = 0.0,
+    periods_per_year: int = 252,
+) -> pd.Series:
+    """Modigliani-Modigliani: the portfolio's return at the benchmark's risk.
+
+    Levers the portfolio with cash until its volatility equals the
+    benchmark's, then reports the resulting return. It says the same thing as
+    the Sharpe ratio — the ranking is identical — but in percentage points
+    rather than in ratio units, which is what makes it answerable: "this
+    portfolio earned 1.8% a year more than the index at the same risk".
+    """
+    frame, bench = _aligned(r, rb)
+    sr = sharpe_ratio(frame, riskfree_rate, periods_per_year)
+    bench_vol = float(annualize_volatility(bench, periods_per_year))
+    return pd.Series(sr * bench_vol + riskfree_rate, name="M-squared")
+
+
+def appraisal_ratio(
+    r: pd.Series | pd.DataFrame,
+    rb: pd.Series | pd.DataFrame,
+    riskfree_rate: float = 0.0,
+    periods_per_year: int = 252,
+) -> pd.Series:
+    """Jensen's alpha per unit of residual (stock-specific) volatility.
+
+    Treynor-Black's measure of pure selection skill. Where the information
+    ratio divides excess return by total tracking error — which includes any
+    deliberate beta tilt — this isolates the part of the deviation that the
+    benchmark cannot explain at all.
+    """
+    stats = regression_stats(r, rb, riskfree_rate, periods_per_year)
+    return pd.Series(
+        stats["Alpha (annualized)"] / stats["Residual Vol"].replace(0.0, np.nan),
+        name="Appraisal Ratio",
+    )
+
+
+def excess_returns(
+    r: pd.Series | pd.DataFrame, rb: pd.Series | pd.DataFrame
+) -> pd.DataFrame:
+    """Per-period portfolio-minus-benchmark returns, on their common dates."""
+    frame, bench = _aligned(r, rb)
+    return frame.sub(bench, axis=0)
+
+
+def relative_drawdown(
+    r: pd.Series | pd.DataFrame, rb: pd.Series | pd.DataFrame
+) -> pd.DataFrame:
+    """Drawdown of the portfolio's wealth *relative to* the benchmark's.
+
+    The series a plan sponsor actually watches: how far the portfolio has
+    fallen behind its index since the last time it was ahead. It is not the
+    drawdown of the excess return — that would compound a difference of
+    returns as if it were a return — but the drawdown of the ratio of the two
+    wealth curves, which is what "behind by 8% since 2022" means.
+    """
+    frame, bench = _aligned(r, rb)
+    bench_wealth = (1.0 + bench).cumprod()
+    ratio = (1.0 + frame).cumprod().div(bench_wealth, axis=0)
+    return ratio / ratio.cummax() - 1.0
+
+
+def relative_summary_extras(
+    r: pd.Series | pd.DataFrame,
+    rb: pd.Series | pd.DataFrame,
+    riskfree_rate: float = 0.0,
+    periods_per_year: int = 252,
+) -> pd.DataFrame:
+    """The second tier of relative statistics, for each column of ``r``.
+
+    Kept separate from :func:`summary_relative` so the headline table stays
+    short enough to read at a glance, and so a caller that wants everything
+    can ask for it explicitly.
+    """
+    frame, bench = _aligned(r, rb)
+    diff = frame.sub(bench, axis=0)
+    rel_dd = relative_drawdown(frame, bench)
+    out = pd.DataFrame(
+        {
+            "Batting Average": batting_average(frame, bench),
+            "Treynor Ratio": treynor_ratio(
+                frame, bench, riskfree_rate, periods_per_year
+            ),
+            "M-squared": m_squared(frame, bench, riskfree_rate, periods_per_year),
+            "Appraisal Ratio": appraisal_ratio(
+                frame, bench, riskfree_rate, periods_per_year
+            ),
+            "Correlation": pd.Series(
+                {c: float(frame[c].corr(bench)) for c in frame.columns}
+            ),
+            "Downside T.E.": pd.Series(
+                {
+                    c: float(
+                        downside_deviation(diff[c].dropna(), mar=0.0)
+                        * np.sqrt(periods_per_year)
+                    )
+                    for c in diff.columns
+                }
+            ),
+            "Worst Relative Drawdown": rel_dd.min(),
+            "Prob. Excess > 0": pd.Series(
+                {
+                    c: probabilistic_sharpe_ratio(
+                        diff[c].dropna(), 0.0, 0.0, periods_per_year
+                    )
+                    for c in diff.columns
+                }
+            ),
+        }
+    )
+    return out.join(up_down_number_ratio(frame, bench))
+
+
 def active_share(weights: pd.Series, benchmark_weights: pd.Series) -> float:
     """Half the sum of absolute weight differences versus the benchmark.
 
@@ -227,8 +413,11 @@ def summary_relative(
         rb: Benchmark returns.
         periods_per_year: Observations per year.
         riskfree_rate: Annual risk-free rate, used for the CAPM alpha.
-        extended: Add alpha, its t-statistic, R², residual volatility, and
-            up/down betas.
+        extended: Add alpha, its t-statistic, R², residual volatility,
+            up/down betas, and the second tier from
+            :func:`relative_summary_extras` — batting average, Treynor, M²,
+            the appraisal ratio, downside tracking error and the worst
+            relative drawdown.
     """
     frame, bench = _aligned(r, rb)
     ann_excess = annualize_returns(frame, periods_per_year) - annualize_returns(
@@ -250,9 +439,17 @@ def summary_relative(
         }
     )
     if extended:
-        out = out.join(
-            regression_stats(frame, bench, riskfree_rate, periods_per_year)[
-                ["Alpha (annualized)", "Alpha t-stat", "R-squared", "Residual Vol"]
-            ]
-        ).join(conditional_beta(frame, bench))
+        out = (
+            out.join(
+                regression_stats(frame, bench, riskfree_rate, periods_per_year)[
+                    ["Alpha (annualized)", "Alpha t-stat", "R-squared", "Residual Vol"]
+                ]
+            )
+            .join(conditional_beta(frame, bench))
+            .join(
+                relative_summary_extras(
+                    frame, bench, riskfree_rate, periods_per_year
+                )
+            )
+        )
     return out

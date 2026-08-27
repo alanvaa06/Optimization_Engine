@@ -45,10 +45,20 @@ def check_constraints(
     weights: pd.Series,
     constraints: PortfolioConstraints,
     tolerance: float = DEFAULT_TOLERANCE,
+    cov_matrix: pd.DataFrame | None = None,
 ) -> list[ConstraintViolation]:
     """List every constraint the solved ``weights`` breach beyond ``tolerance``.
 
     Returns an empty list when the allocation is fully compliant.
+
+    Args:
+        weights: The solved allocation.
+        constraints: What was asked for.
+        tolerance: Drift below this is floating-point noise.
+        cov_matrix: Needed to check a tracking-error budget. Without it that
+            one limit goes unchecked — which is why the methods that cannot
+            impose it are the same ones that cannot verify it, and why the
+            factory warns rather than letting it pass silently.
     """
     out: list[ConstraintViolation] = []
 
@@ -105,6 +115,45 @@ def check_constraints(
                 ConstraintViolation(
                     "turnover", "Turnover", float(constraints.turnover_limit), turnover
                 )
+            )
+
+    out.extend(_benchmark_violations(weights, constraints, tolerance, cov_matrix))
+    return out
+
+
+def _benchmark_violations(
+    weights: pd.Series,
+    constraints: PortfolioConstraints,
+    tolerance: float,
+    cov_matrix: pd.DataFrame | None,
+) -> list[ConstraintViolation]:
+    """Active-share and tracking-error breaches, when a benchmark is set."""
+    if not constraints.benchmark_weights:
+        return []
+    out: list[ConstraintViolation] = []
+    bench = (
+        pd.Series(constraints.benchmark_weights).reindex(weights.index).fillna(0.0)
+    )
+    active = weights - bench
+
+    if constraints.max_active_share is not None:
+        share = float(active.abs().sum() / 2.0)
+        limit = float(constraints.max_active_share)
+        if share > limit + tolerance:
+            out.append(
+                ConstraintViolation("active_share", "Active share", limit, share)
+            )
+
+    if constraints.max_tracking_error is not None and cov_matrix is not None:
+        aligned = cov_matrix.reindex(weights.index, axis=0).reindex(
+            weights.index, axis=1
+        )
+        variance = float(active.values @ aligned.values @ active.values)
+        te = float(np.sqrt(max(variance, 0.0)))
+        limit = float(constraints.max_tracking_error)
+        if te > limit + tolerance:
+            out.append(
+                ConstraintViolation("tracking_error", "Tracking error", limit, te)
             )
 
     return out
@@ -266,7 +315,7 @@ def portfolio_diagnostics(
     turnover = None
     violations: tuple[ConstraintViolation, ...] = ()
     if constraints is not None:
-        violations = tuple(check_constraints(w, constraints))
+        violations = tuple(check_constraints(w, constraints, cov_matrix=cov_matrix))
         if constraints.previous_weights:
             prev = pd.Series(constraints.previous_weights).reindex(w.index).fillna(0.0)
             turnover = float((w - prev).abs().sum())

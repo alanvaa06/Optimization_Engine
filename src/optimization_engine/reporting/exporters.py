@@ -36,13 +36,19 @@ def write_excel_report(
                 continue
             if isinstance(df, pd.Series):
                 df = df.to_frame()
-            sheet = _unique_sheet_name(name, used)
+            sheet = unique_sheet_name(name, used)
             used.add(sheet)
             df.to_excel(writer, sheet_name=sheet, index=True)
     return p
 
 
-def _unique_sheet_name(name: str, used: set[str]) -> str:
+def unique_sheet_name(name: str, used: set[str]) -> str:
+    """Excel-safe sheet name for ``name``, distinct from everything in ``used``.
+
+    Public because the UI writes its own workbook and needs the same
+    de-duplication: two names that differ only past character 31 would
+    otherwise land on the same sheet and one would be lost.
+    """
     base = str(name)[:_SHEET_NAME_LIMIT]
     if base not in used:
         return base
@@ -54,12 +60,31 @@ def _unique_sheet_name(name: str, used: set[str]) -> str:
     raise ValueError(f"Cannot find a unique Excel sheet name for {name!r}.")
 
 
+#: Kept for callers that imported the private name.
+_unique_sheet_name = unique_sheet_name
+
+
+def performance_sheets(report, prefix: str = "") -> dict[str, pd.DataFrame]:
+    """Workbook contents for one :class:`PerformanceReport`.
+
+    Args:
+        report: The report to lay out.
+        prefix: Prepended to every sheet name, so an out-of-sample report can
+            sit alongside the fitted one without either overwriting the other.
+    """
+    frames = report.to_frames()
+    if not prefix:
+        return dict(frames)
+    return {f"{prefix}{name}": frame for name, frame in frames.items()}
+
+
 def run_sheets(
     run,
     riskfree_rate: float = 0.0,
     data_quality=None,
     walk_forward=None,
     frontier_uncertainty=None,
+    performance=None,
 ) -> dict[str, pd.DataFrame]:
     """Assemble the standard workbook contents for an :class:`EngineRun`.
 
@@ -73,6 +98,10 @@ def run_sheets(
             out-of-sample track record and its degradation table.
         frontier_uncertainty: Optional :class:`FrontierUncertainty` to include
             the resampled confidence band and per-asset weight dispersion.
+        performance: Optional :class:`PerformanceReport`. When the run has a
+            benchmark and none is passed, one is built from the run so that a
+            workbook exported without extra arguments still carries the
+            relative numbers.
     """
     sheets: dict[str, pd.DataFrame] = {
         "weights": run.result.weights.to_frame("weight"),
@@ -95,6 +124,30 @@ def run_sheets(
             riskfree_rate=riskfree_rate, extended=True
         ),
     }
+
+    if run.benchmark is not None:
+        sheets["benchmark"] = run.benchmark.summary()
+        benchmark_weights = run.benchmark.weights_frame()
+        if benchmark_weights is not None:
+            # The active weights are the whole point of showing the benchmark
+            # in a workbook, so they are computed here rather than left to the
+            # reader's spreadsheet arithmetic.
+            benchmark_weights = benchmark_weights.copy()
+            portfolio = run.result.weights.reindex(benchmark_weights.index).fillna(0.0)
+            benchmark_weights["portfolio_weight"] = portfolio
+            benchmark_weights["active_weight"] = (
+                portfolio - benchmark_weights["benchmark_weight"]
+            )
+            sheets["benchmark_weights"] = benchmark_weights
+        if performance is None:
+            try:
+                performance = run.performance(riskfree_rate=riskfree_rate)
+            except (ValueError, KeyError):
+                # A benchmark that shares no dates with the panel is reported
+                # by the UI; it must not take the whole workbook down with it.
+                performance = None
+    if performance is not None:
+        sheets.update(performance_sheets(performance))
 
     if run.diagnostics is not None:
         sheets["portfolio_diagnostics"] = pd.DataFrame(
@@ -163,4 +216,21 @@ def run_sheets(
         sheets["in_vs_out_of_sample"] = run.in_vs_out_of_sample(
             walk_forward, riskfree_rate
         )
+        if run.benchmark is not None:
+            # The out-of-sample track record measured against the same
+            # benchmark. This is the pair a reader should compare — a fitted
+            # information ratio next to a walk-forward one — and putting them
+            # in the same workbook is what makes the comparison happen.
+            try:
+                sheets.update(
+                    performance_sheets(
+                        run.performance(
+                            riskfree_rate=riskfree_rate,
+                            returns_override=walk_forward.returns,
+                        ),
+                        prefix="oos_",
+                    )
+                )
+            except (ValueError, KeyError):
+                pass
     return sheets

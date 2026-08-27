@@ -106,6 +106,13 @@ def derive_widget_state(method_name: str) -> dict[str, dict[str, object]]:
             req.supports_risk_aversion,
             f"{method_name} does not use a risk-aversion utility.",
         ),
+        "benchmark_limits": _state(
+            req.supports_benchmark_limits,
+            f"{method_name} cannot impose a tracking-error or active-share "
+            "budget inside its solve — the limit would be reported in the "
+            "compliance panel but never bind. Use mean-variance, minimum "
+            "variance or active mean-variance.",
+        ),
         "soft_bounds_caption": _state(
             req.bounds_mode != "hard",
             "Hard bounds — no soft-bounds caption shown.",

@@ -49,6 +49,12 @@ class MethodRequirements:
     supports_frontier: bool
     extras: tuple[ExtraInput, ...] = field(default_factory=tuple)
     supports_turnover: bool = False
+    #: Whether a tracking-error or active-share budget is imposed *inside*
+    #: the solve. False means the limit is reported but not enforced — the
+    #: projection-based methods can neither impose nor verify it.
+    supports_benchmark_limits: bool = False
+    #: Whether the method is undefined without a benchmark.
+    requires_benchmark: bool = False
     label: str = ""
     summary: str = ""
     when_to_use: str = ""
@@ -170,6 +176,7 @@ _CDAR_ALPHA = ExtraInput(
 REQUIREMENTS: dict[str, MethodRequirements] = {
     "mean_variance": MethodRequirements(
         name="mean_variance",
+        supports_benchmark_limits=True,
         label="Mean-variance (Markowitz)",
         requires_mu=True, requires_cov=True, requires_returns=False,
         supports_target_return=True, supports_target_volatility=True,
@@ -194,6 +201,7 @@ REQUIREMENTS: dict[str, MethodRequirements] = {
     ),
     "min_variance": MethodRequirements(
         name="min_variance",
+        supports_benchmark_limits=True,
         label="Global minimum variance",
         requires_mu=False, requires_cov=True, requires_returns=False,
         supports_target_return=False, supports_target_volatility=False,
@@ -213,6 +221,7 @@ REQUIREMENTS: dict[str, MethodRequirements] = {
     ),
     "max_sharpe": MethodRequirements(
         name="max_sharpe",
+        supports_benchmark_limits=True,
         label="Maximum Sharpe (tangency)",
         requires_mu=True, requires_cov=True, requires_returns=False,
         supports_target_return=False, supports_target_volatility=False,
@@ -366,6 +375,7 @@ REQUIREMENTS: dict[str, MethodRequirements] = {
     ),
     "cvar": MethodRequirements(
         name="cvar",
+        supports_benchmark_limits=True,
         label="Mean-CVaR (expected shortfall)",
         requires_mu=False, requires_cov=False, requires_returns=True,
         supports_target_return=True, supports_target_volatility=False,
@@ -390,6 +400,7 @@ REQUIREMENTS: dict[str, MethodRequirements] = {
     ),
     "cdar": MethodRequirements(
         name="cdar",
+        supports_benchmark_limits=True,
         label="Mean-CDaR (conditional drawdown)",
         requires_mu=False, requires_cov=False, requires_returns=True,
         supports_target_return=True, supports_target_volatility=False,
@@ -419,6 +430,7 @@ REQUIREMENTS: dict[str, MethodRequirements] = {
     ),
     "max_diversification": MethodRequirements(
         name="max_diversification",
+        supports_benchmark_limits=True,
         label="Maximum diversification",
         requires_mu=False, requires_cov=True, requires_returns=False,
         supports_target_return=False, supports_target_volatility=False,
@@ -459,6 +471,36 @@ REQUIREMENTS: dict[str, MethodRequirements] = {
             "concentration is in the asset list itself.",
             "Bounds and group budgets are applied by projection afterwards, so "
             "a binding one makes the result something other than 1/N.",
+        ),
+    ),
+    "active_mean_variance": MethodRequirements(
+        name="active_mean_variance",
+        supports_benchmark_limits=True,
+        requires_benchmark=True,
+        label="Active mean-variance (vs benchmark)",
+        requires_mu=True, requires_cov=True, requires_returns=False,
+        supports_target_return=False, supports_target_volatility=False,
+        supports_risk_aversion=True, supports_risk_free_rate=True,
+        supports_group_bounds=True, bounds_mode="hard",
+        supports_frontier=False, supports_turnover=True, extras=(),
+        summary=(
+            "Trade expected return *in excess of the benchmark* against "
+            "tracking error, instead of total return against total risk."
+        ),
+        when_to_use=(
+            "The mandate is written relative to an index: a target excess "
+            "return, an active-risk budget, or both. Set a tracking-error "
+            "limit and this spends exactly that budget."
+        ),
+        assumptions=(
+            "The benchmark is the right one — every number this produces is "
+            "measured against it, so a badly chosen index makes a good "
+            "portfolio look wrong and vice versa.",
+            "Expected returns are accurate in *relative* terms; only the "
+            "spread between assets and the benchmark drives the answer.",
+            "The covariance matrix describes active risk as well as total "
+            "risk, which is a stronger claim: tracking error depends on the "
+            "off-diagonal terms far more than volatility does.",
         ),
     ),
     "inverse_vol": MethodRequirements(

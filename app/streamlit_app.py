@@ -40,6 +40,7 @@ from components import (  # noqa: E402
     num,
     pct,
     render_assumptions,
+    render_benchmark,
     render_compliance,
     render_covariance_diagnostics,
     render_data_quality,
@@ -55,7 +56,9 @@ from optimization_engine.analytics.relative import (  # noqa: E402
     active_share,
     summary_relative,
 )
+from optimization_engine.analytics.report import BENCHMARK, PORTFOLIO  # noqa: E402
 from optimization_engine.analytics.risk import drawdown_table  # noqa: E402
+from optimization_engine.benchmark import BenchmarkError, BenchmarkSpec  # noqa: E402
 from optimization_engine.config import EngineConfig, OptimizerSpec  # noqa: E402
 from optimization_engine.data.covariance import (  # noqa: E402
     COVARIANCE_DESCRIPTIONS,
@@ -85,16 +88,24 @@ from optimization_engine.optimizers.factory import (  # noqa: E402
 )
 from optimization_engine.optimizers.feasibility import analyze_feasibility  # noqa: E402
 from optimization_engine.optimizers.requirements import requirements_for  # noqa: E402
-from optimization_engine.reporting.exporters import run_sheets  # noqa: E402
+from optimization_engine.reporting.exporters import (  # noqa: E402
+    performance_sheets,
+    run_sheets,
+    unique_sheet_name,
+)
 from optimization_engine.reporting.plots import (  # noqa: E402
     plot_correlation_heatmap,
     plot_drawdown,
     plot_efficient_frontier,
     plot_frontier_uncertainty,
+    plot_period_returns,
     plot_portfolio_composition,
+    plot_relative_wealth,
     plot_return_distribution,
     plot_risk_contributions,
+    plot_risk_return_scatter,
     plot_rolling_metrics,
+    plot_rolling_relative,
     plot_walk_forward_comparison,
     plot_wealth_index,
     plot_weight_dispersion,
@@ -238,6 +249,22 @@ if _pending and _pending in st.session_state.scenarios:
     st.session_state["nco_objective"] = str(_cfg.optimizer.nco_objective)
     st.session_state["nco_detone"] = bool(_cfg.optimizer.nco_detone_for_clustering)
     st.session_state["long_only"] = bool(_cfg.long_only)
+    st.session_state["benchmark_kind"] = _cfg.benchmark.kind
+    if _cfg.benchmark.asset:
+        st.session_state["benchmark_asset"] = _cfg.benchmark.asset
+    if _cfg.benchmark.series_name:
+        st.session_state["benchmark_series"] = _cfg.benchmark.series_name
+    st.session_state["benchmark_rebalance"] = _cfg.benchmark.rebalance
+    if _cfg.benchmark.weights:
+        st.session_state.benchmark_weights_table = pd.DataFrame(
+            {"Weight": pd.Series(_cfg.benchmark.weights)}
+        )
+    st.session_state["use_te_limit"] = _cfg.max_tracking_error is not None
+    if _cfg.max_tracking_error is not None:
+        st.session_state["max_tracking_error"] = float(_cfg.max_tracking_error)
+    st.session_state["use_as_limit"] = _cfg.max_active_share is not None
+    if _cfg.max_active_share is not None:
+        st.session_state["max_active_share"] = float(_cfg.max_active_share)
     if _cfg.optimizer.target_return is not None:
         st.session_state["mv_mode"] = "Target return"
         st.session_state["target_return"] = float(_cfg.optimizer.target_return)
@@ -412,10 +439,19 @@ with st.sidebar:
         "Universe (assets to include)",
         options=list(raw_prices.columns),
         default=list(raw_prices.columns),
+        help=(
+            "Anything you load but leave out here stays available as an "
+            "external benchmark in step 6 — load an index alongside the "
+            "universe and deselect it to compare against it."
+        ),
     )
     if not selected_assets:
         st.warning("Select at least one asset.")
         st.stop()
+    # Kept whole: the series left out of the universe are exactly the ones
+    # that can serve as an external benchmark, and slicing them away here
+    # would make that impossible without a second download.
+    raw_prices_loaded = raw_prices
     raw_prices = raw_prices[selected_assets]
 
     st.caption(f"{raw_prices.shape[0]:,} rows × {raw_prices.shape[1]} assets loaded.")
@@ -500,12 +536,22 @@ if returns.empty:
     st.error("The price panel produced no usable returns.")
     st.stop()
 
+# Series loaded but left out of the universe: candidate external benchmarks.
+_excluded = [c for c in raw_prices_loaded.columns if c not in selected_assets]
+external_returns: pd.DataFrame | None = None
+if _excluded:
+    _external_prices = raw_prices_loaded[_excluded].sort_index().dropna(how="all")
+    external_returns = prices_to_returns(_external_prices).dropna(how="all")
+    if external_returns.empty:
+        external_returns = None
+
 # ---------------------------------------------------------------------------
 # Sidebar — step 3: method
 # ---------------------------------------------------------------------------
 
 _METHOD_ORDER = [
-    "mean_variance", "min_variance", "max_sharpe", "risk_parity",
+    "mean_variance", "active_mean_variance", "min_variance", "max_sharpe",
+    "risk_parity",
     "hrp", "black_litterman", "cvar", "max_diversification",
     "inverse_vol", "equal_weight",
 ]
@@ -665,7 +711,157 @@ with st.sidebar:
         target_return = None if _tr == 0.0 else _tr
 
     st.divider()
-    st.header("6 · Exposure")
+    st.header("6 · Benchmark")
+    st.caption(
+        "What the portfolio is measured against — and, once a limit is set, "
+        "what it is optimized against."
+    )
+    _bench_kinds = ["none", "equal_weight", "single_asset", "custom_weights"]
+    if external_returns is not None:
+        _bench_kinds.append("external")
+    if req.requires_benchmark:
+        # The method is undefined without one, so "no benchmark" is not
+        # offered rather than offered and then rejected at solve time.
+        _bench_kinds = [k for k in _bench_kinds if k != "none"]
+    _bench_labels = {
+        "none": "No benchmark",
+        "equal_weight": "Equal weight (1/N)",
+        "single_asset": "Single asset",
+        "custom_weights": "Custom weights",
+        "external": "External series",
+    }
+    benchmark_kind = st.selectbox(
+        "Benchmark",
+        options=_bench_kinds,
+        format_func=lambda k: _bench_labels[k],
+        key="benchmark_kind",
+        help=(
+            "Absolute numbers say what happened; relative numbers say whether "
+            "the process earned its fee. Everything downstream — the "
+            "performance tab, the workbook, and the active-risk limits below "
+            "— reads this one choice."
+        ),
+    )
+    if req.requires_benchmark:
+        st.caption(
+            f"{req.display_name} measures return and risk against the "
+            "benchmark, so one has to be chosen — 'no benchmark' is not an "
+            "option for this method."
+        )
+
+    benchmark_asset: str | None = None
+    benchmark_custom: dict[str, float] | None = None
+    benchmark_series: str | None = None
+    if benchmark_kind == "single_asset":
+        benchmark_asset = st.selectbox(
+            "Benchmark asset", options=list(returns.columns), key="benchmark_asset"
+        )
+    elif benchmark_kind == "custom_weights":
+        if (
+            "benchmark_weights_table" not in st.session_state
+            or set(st.session_state.benchmark_weights_table.index)
+            != set(returns.columns)
+        ):
+            st.session_state.benchmark_weights_table = pd.DataFrame(
+                {"Weight": [1.0 / returns.shape[1]] * returns.shape[1]},
+                index=list(returns.columns),
+            )
+        st.session_state.benchmark_weights_table = st.data_editor(
+            st.session_state.benchmark_weights_table,
+            num_rows="fixed",
+            column_config={
+                "Weight": st.column_config.NumberColumn(
+                    min_value=-1.0, max_value=1.5, step=0.01, format="%.3f"
+                ),
+            },
+            key="bench_editor",
+        )
+        benchmark_custom = {
+            str(a): float(v)
+            for a, v in st.session_state.benchmark_weights_table["Weight"].items()
+        }
+        _bench_total = sum(benchmark_custom.values())
+        if abs(_bench_total) < 1e-9:
+            st.error("Benchmark weights sum to zero — pick a different mix.")
+        elif abs(_bench_total - 1.0) > 1e-6:
+            st.caption(
+                f"Weights sum to {_bench_total:.3f}; they are normalized to 1 "
+                "so the comparison is against the same amount of money."
+            )
+    elif benchmark_kind == "external":
+        benchmark_series = st.selectbox(
+            "External series",
+            options=list(external_returns.columns),
+            key="benchmark_series",
+            help=(
+                "Loaded alongside the universe but excluded from it. It has "
+                "no holdings here, so active share and the active-risk "
+                "decomposition are unavailable — every return-based metric "
+                "still is."
+            ),
+        )
+        if unique_currencies != {base_currency}:
+            st.caption(
+                "⚠️ FX conversion is applied to the universe only. This series "
+                f"is compared as quoted, not in {base_currency}."
+            )
+
+    benchmark_rebalance = "periodic"
+    if benchmark_kind in ("equal_weight", "single_asset", "custom_weights"):
+        benchmark_rebalance = st.radio(
+            "Benchmark rebalancing",
+            options=["periodic", "buy_and_hold"],
+            format_func=lambda r: (
+                "Rebalanced every period" if r == "periodic" else "Bought and held"
+            ),
+            horizontal=True,
+            key="benchmark_rebalance",
+            help=(
+                "Published indices are rebalanced; an untouched policy "
+                "portfolio drifts. Over a long sample the two are materially "
+                "different track records."
+            ),
+        )
+
+    max_tracking_error: float | None = None
+    max_active_share: float | None = None
+    if benchmark_kind != "none":
+        _limits_enabled = ws["benchmark_limits"]["enabled"]
+        if not _limits_enabled:
+            st.caption(f"ℹ️ {ws['benchmark_limits']['tooltip']}")
+        if st.checkbox(
+            "Limit tracking error",
+            value=False,
+            key="use_te_limit",
+            disabled=not _limits_enabled,
+            help=(
+                "Cap √((w−b)'Σ(w−b)) inside the solve. This is the constraint "
+                "that turns a benchmark from a reporting choice into an "
+                "optimization input."
+            ),
+        ):
+            max_tracking_error = st.slider(
+                "Max tracking error (annual)", 0.005, 0.20, 0.03, 0.005,
+                format="%.3f", key="max_tracking_error",
+            )
+        if st.checkbox(
+            "Limit active share",
+            value=False,
+            key="use_as_limit",
+            disabled=not _limits_enabled,
+            help=(
+                "Cap ½·Σ|wᵢ−bᵢ|. Binds on positions, so it holds in a calm "
+                "market where a tracking-error budget quietly permits a "
+                "portfolio that shares almost nothing with its index."
+            ),
+        ):
+            max_active_share = st.slider(
+                "Max active share", 0.05, 1.0, 0.40, 0.05,
+                format="%.2f", key="max_active_share",
+            )
+
+    st.divider()
+    st.header("7 · Exposure")
     long_only = st.checkbox(
         "Long only", value=True, key="long_only",
         help="Off allows short positions, subject to each asset's minimum weight.",
@@ -698,7 +894,7 @@ with st.sidebar:
             )
 
     st.divider()
-    st.header("7 · Frontier")
+    st.header("8 · Frontier")
     build_frontier = st.checkbox(
         "Build efficient frontier",
         value=True,
@@ -724,6 +920,7 @@ st.markdown("---")
     tab_constraints,
     tab_optimize,
     tab_backtest,
+    tab_performance,
     tab_compare,
     tab_whatif,
     tab_report,
@@ -734,6 +931,7 @@ st.markdown("---")
         "⚙️ Assumptions & constraints",
         "🚀 Optimize",
         "📉 Backtest",
+        "🎯 Performance",
         "🆚 Compare",
         "🎚️ What-if",
         "📤 Report",
@@ -1375,6 +1573,14 @@ def _build_config() -> EngineConfig:
             st.session_state.previous_weights_table["Previous weight"].to_dict()
         )
 
+    benchmark_spec = BenchmarkSpec(
+        kind=benchmark_kind,
+        asset=benchmark_asset,
+        weights=benchmark_custom,
+        series_name=benchmark_series,
+        rebalance=benchmark_rebalance,
+    )
+
     return EngineConfig(
         expected_returns=expected_returns,
         bounds=bounds,
@@ -1399,6 +1605,9 @@ def _build_config() -> EngineConfig:
         ),
         market_weights=market_weights,
         optimizer=spec,
+        benchmark=benchmark_spec,
+        max_tracking_error=max_tracking_error,
+        max_active_share=max_active_share,
         long_only=bool(long_only),
         leverage=leverage_cap,
         previous_weights=previous_weights,
@@ -1413,7 +1622,7 @@ def _feasibility_cached(signature: str, returns_hash: str, _returns: pd.DataFram
     mu = pd.Series(cfg.expected_returns).reindex(_returns.columns).fillna(0.0)
     return analyze_feasibility(
         list(_returns.columns),
-        constraints_from_config(cfg),
+        constraints_from_config(cfg, list(_returns.columns)),
         expected_returns=effective_expected_returns(cfg, cov, mu),
         cov_matrix=cov,
     )
@@ -1441,10 +1650,17 @@ with tab_constraints:
 
 
 @st.cache_data(show_spinner=False, max_entries=32)
-def _solve_scenario_cached(signature: str, returns_df: pd.DataFrame):
-    """Solve a config given its JSON signature; cached on (signature, returns)."""
+def _solve_scenario_cached(
+    signature: str, returns_df: pd.DataFrame, _external: pd.DataFrame | None = None
+):
+    """Solve a config given its JSON signature; cached on (signature, returns).
+
+    ``_external`` is leading-underscored so Streamlit does not try to hash it;
+    the benchmark it feeds is already part of ``signature``, so the cache key
+    stays correct.
+    """
     cfg = EngineConfig.from_dict(json.loads(signature))
-    return run_engine(returns_df, cfg, build_frontier=False)
+    return run_engine(returns_df, cfg, build_frontier=False, external_returns=_external)
 
 
 def _summarize_run(name: str, run) -> dict:
@@ -1504,6 +1720,7 @@ with tab_optimize:
                     config,
                     build_frontier=build_frontier,
                     n_frontier_points=n_frontier_points,
+                    external_returns=external_returns,
                 )
             st.session_state["last_error"] = None
         except Exception as exc:
@@ -1547,6 +1764,70 @@ with tab_optimize:
         )
         render_portfolio_diagnostics(run.diagnostics)
         render_projection_distance(run.result)
+
+        if run.benchmark is not None and run.benchmark.weights is not None:
+            st.markdown("**Against the benchmark, before the fact**")
+            st.caption(
+                f"Ex-ante numbers, from the covariance the optimizer solved "
+                f"with — not from a replay. Benchmark: {run.benchmark.label}."
+            )
+            _bench_w = run.benchmark.weights.reindex(weights.index).fillna(0.0)
+            _active = weights - _bench_w
+            _ex_ante_te = float(
+                np.sqrt(
+                    max(float(_active.values @ run.cov_matrix.values @ _active.values), 0.0)
+                )
+            )
+            _bench_return = float(
+                run.expected_returns.reindex(weights.index).fillna(0.0) @ _bench_w
+            )
+            _active_return = run.result.expected_return - _bench_return
+            metric_row(
+                [
+                    (
+                        "Expected active return",
+                        pct(_active_return),
+                        "Portfolio minus benchmark, on the expected-return "
+                        "vector the solve used.",
+                    ),
+                    (
+                        "Ex-ante tracking error",
+                        pct(_ex_ante_te),
+                        "√((w−b)'Σ(w−b)). The realized figure on the "
+                        "🎯 Performance tab will differ — this is what the "
+                        "covariance predicts, that is what happened.",
+                    ),
+                    (
+                        "Implied information ratio",
+                        num(_active_return / _ex_ante_te)
+                        if _ex_ante_te > 1e-9
+                        else "—",
+                        "Expected active return per unit of expected active "
+                        "risk.",
+                    ),
+                    (
+                        "Active share",
+                        pct(float(_active.abs().sum() / 2.0), 1),
+                        "Half the sum of absolute weight differences.",
+                    ),
+                ]
+            )
+            with st.expander("Active weights vs. the benchmark", expanded=False):
+                _active_frame = pd.DataFrame(
+                    {
+                        "Portfolio": weights,
+                        "Benchmark": _bench_w,
+                        "Active": _active,
+                    }
+                ).sort_values("Active", ascending=False)
+                st.dataframe(
+                    _active_frame.style.format("{:.2%}"), width="stretch"
+                )
+                st.caption(
+                    "Where the risk *differs* from the benchmark's, which is "
+                    "not where the risk is: a large index position carries "
+                    "absolute risk and no active risk at all."
+                )
 
         st.divider()
         left, right = st.columns([1, 1])
@@ -1875,58 +2156,13 @@ with tab_backtest:
 
         st.divider()
         st.markdown("### Versus a benchmark")
-        bench_kind = st.selectbox(
-            "Benchmark",
-            options=["None", "Equal weight (1/N)", "Single asset", "Custom weights"],
-            index=1,
-            help=(
-                "Absolute numbers say what happened; relative numbers say "
-                "whether the optimizer earned its fee. Alpha, tracking error "
-                "and active share all need something to be active against."
-            ),
-        )
-        benchmark_returns = None
-        benchmark_weights = None
-        if bench_kind == "Equal weight (1/N)":
-            benchmark_weights = pd.Series(
-                1.0 / returns.shape[1], index=returns.columns
-            )
-        elif bench_kind == "Single asset":
-            bench_asset = st.selectbox(
-                "Benchmark asset", options=list(returns.columns)
-            )
-            benchmark_weights = pd.Series(0.0, index=returns.columns)
-            benchmark_weights[bench_asset] = 1.0
-        elif bench_kind == "Custom weights":
-            if (
-                "benchmark_weights_table" not in st.session_state
-                or set(st.session_state.benchmark_weights_table.index)
-                != set(returns.columns)
-            ):
-                st.session_state.benchmark_weights_table = pd.DataFrame(
-                    {"Weight": [1.0 / returns.shape[1]] * returns.shape[1]},
-                    index=returns.columns,
-                )
-            st.session_state.benchmark_weights_table = st.data_editor(
-                st.session_state.benchmark_weights_table,
-                num_rows="fixed",
-                column_config={
-                    "Weight": st.column_config.NumberColumn(
-                        min_value=-1.0, max_value=1.5, step=0.01, format="%.3f"
-                    ),
-                },
-                key="bench_editor",
-            )
-            benchmark_weights = st.session_state.benchmark_weights_table["Weight"]
-
-        if benchmark_weights is not None:
-            total = float(benchmark_weights.sum())
-            if abs(total) < 1e-9:
-                st.warning("Benchmark weights sum to zero — pick a different mix.")
-            else:
-                benchmark_returns = (returns * (benchmark_weights / total)).sum(axis=1)
+        render_benchmark(run)
+        benchmark_returns = run.benchmark_returns
 
         if benchmark_returns is not None:
+            # One selection, made once in the sidebar, drives this panel, the
+            # performance page and the export. A second picker here is how the
+            # tabs end up quoting information ratios against different indices.
             relative = summary_relative(
                 bt.returns.to_frame("portfolio"),
                 benchmark_returns.reindex(bt.returns.index),
@@ -1934,7 +2170,9 @@ with tab_backtest:
                 riskfree_rate=float(risk_free_rate),
                 extended=True,
             ).T
-            share = active_share(run.result.weights, benchmark_weights / total)
+            share = None
+            if run.benchmark.weights is not None:
+                share = active_share(run.result.weights, run.benchmark.weights)
             metric_row(
                 [
                     (
@@ -1954,7 +2192,7 @@ with tab_backtest:
                     ),
                     (
                         "Active share",
-                        pct(share),
+                        pct(share) if share is not None else "—",
                         "Half the sum of absolute weight differences. 0 is the "
                         "benchmark; 1 shares no holding with it.",
                     ),
@@ -1973,9 +2211,7 @@ with tab_backtest:
                 ),
                 width="stretch",
             )
-            st.dataframe(
-                relative.style.format("{:.4f}"), width="stretch"
-            )
+            st.dataframe(format_table(relative), width="stretch")
             t_stat = float(relative.loc["Alpha t-stat", "portfolio"])
             alpha = float(relative.loc["Alpha (annualized)", "portfolio"])
             if abs(t_stat) < 2:
@@ -1991,6 +2227,11 @@ with tab_backtest:
                     "statistically significant in sample. Confirm it survives "
                     "the walk-forward below before believing it."
                 )
+            st.caption(
+                "The 🎯 Performance tab carries the full relative picture — "
+                "capture, batting average, rolling tracking error and the "
+                "exportable tables."
+            )
 
         if frequency != "daily":
             with st.expander("Weight drift between rebalances", expanded=False):
@@ -2151,6 +2392,382 @@ with tab_backtest:
 
 
 # ---------------------------------------------------------------------------
+# 🎯 Performance
+# ---------------------------------------------------------------------------
+
+
+def _performance_downloads(report, key_prefix: str) -> None:
+    """Excel workbook and tidy CSV of everything on this page.
+
+    Two formats because they answer different questions: the workbook is what
+    gets circulated, the long-form CSV is what gets pivoted against last
+    quarter's run without anyone having to align column orders by hand.
+    """
+    left, right = st.columns(2)
+    buf = io.BytesIO()
+    frames = performance_sheets(report)
+    with pd.ExcelWriter(buf, engine="xlsxwriter") as writer:
+        for name, frame in frames.items():
+            frame.to_excel(writer, sheet_name=name[:31], index=True)
+    buf.seek(0)
+    left.download_button(
+        "📥 Performance workbook (Excel)",
+        data=buf,
+        file_name="performance_report.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        type="primary",
+        key=f"{key_prefix}_xlsx",
+        width="stretch",
+    )
+    right.download_button(
+        "📄 Metrics (CSV)",
+        data=report.metrics().to_csv(index=False).encode("utf-8"),
+        file_name="performance_metrics.csv",
+        mime="text/csv",
+        key=f"{key_prefix}_csv",
+        width="stretch",
+        help=(
+            "One row per metric: block, series, metric, value. The shape that "
+            "survives a pivot table and a diff against another run."
+        ),
+    )
+
+
+with tab_performance:
+    run = st.session_state.get("last_run")
+    if run is None:
+        st.info("Run an optimization first — this page measures its track record.")
+    else:
+        st.subheader("Performance")
+        render_benchmark(run)
+
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            perf_frequency = st.selectbox(
+                "Rebalancing",
+                options=["monthly", "quarterly", "annual", "weekly", "daily", "none"],
+                index=0,
+                format_func=lambda f: f.title() if f != "none" else "Buy and hold",
+                key="perf_frequency",
+                help=(
+                    "The track record is a replay of the solved weights under "
+                    "this rule, net of the cost below."
+                ),
+            )
+        with c2:
+            perf_cost_bps = st.slider(
+                "Transaction cost (bps, one-way)", 0, 100, 10, key="perf_cost",
+            )
+        with c3:
+            perf_period_freq = st.selectbox(
+                "Period table",
+                options=["yearly", "quarterly", "monthly"],
+                index=0,
+                key="perf_period_freq",
+            )
+
+        perf_window = st.slider(
+            "Rolling window (periods)",
+            min_value=max(int(periods_per_year) // 4, 5),
+            max_value=min(int(periods_per_year) * 3, max(len(returns) - 1, 10)),
+            value=min(int(periods_per_year), max(len(returns) - 1, 10)),
+            key="perf_window",
+            help=(
+                "One year by default. A full-sample ratio cannot tell a "
+                "strategy that worked throughout from one that earned "
+                "everything in a single quarter; this can."
+            ),
+        )
+
+        try:
+            report = run.performance(
+                riskfree_rate=float(risk_free_rate),
+                frequency=perf_frequency,
+                transaction_cost_bps=float(perf_cost_bps),
+                rolling_window=int(perf_window),
+                period_freq=perf_period_freq,
+            )
+        except (ValueError, BenchmarkError) as exc:
+            report = None
+            st.error(f"Performance report unavailable: {exc}")
+
+        if report is not None:
+            st.markdown(f"> {report.describe()}")
+            if not report.metadata.get("out_of_sample", False):
+                st.warning(
+                    "**In-sample.** The optimizer estimated its inputs from "
+                    "these same returns, so it already knew which assets won. "
+                    "The walk-forward section of the Backtest tab is the "
+                    "honest version of this page."
+                )
+
+            head = report.headline()
+
+            st.markdown("#### Absolute")
+            metric_row(
+                [
+                    ("Annualized return", pct(head["annualized_return"]), None),
+                    ("Volatility", pct(head["annualized_volatility"]), None),
+                    (
+                        "Sharpe",
+                        num(head["sharpe_ratio"]),
+                        "Excess return per unit of total risk.",
+                    ),
+                    (
+                        "Sortino",
+                        num(head["sortino_ratio"]),
+                        "Excess return per unit of *downside* deviation.",
+                    ),
+                    ("Max drawdown", pct(head["max_drawdown"]), None),
+                    (
+                        "Calmar",
+                        num(head["calmar_ratio"]),
+                        "Annualized return over the worst drawdown.",
+                    ),
+                ]
+            )
+            metric_row(
+                [
+                    (
+                        "Hit rate",
+                        pct(head["hit_rate"], 1),
+                        "Share of periods with a positive return.",
+                    ),
+                    (
+                        "Prob. Sharpe > 0",
+                        pct(head["probabilistic_sharpe"], 1),
+                        "Probability the true Sharpe exceeds zero, given the "
+                        "skew and fat tails of this sample. Below ~95% the "
+                        "Sharpe has not been demonstrated.",
+                    ),
+                    (
+                        "Gain-to-pain",
+                        num(report.absolute.loc[PORTFOLIO, "Gain-to-Pain"]),
+                        "Total return over the sum of the losing periods.",
+                    ),
+                    (
+                        "Time under water",
+                        pct(report.absolute.loc[PORTFOLIO, "Time Under Water"], 1),
+                        "Share of periods spent below the previous high-water "
+                        "mark — the statistic an investor experiences.",
+                    ),
+                    (
+                        "Turnover / year",
+                        num(report.metadata.get("annualized_turnover"), 2),
+                        "One-way.",
+                    ),
+                    (
+                        "Ulcer index",
+                        num(report.absolute.loc[PORTFOLIO, "Ulcer Index"], 3),
+                        "Root-mean-square of the whole drawdown path: depth "
+                        "and duration together.",
+                    ),
+                ]
+            )
+
+            if report.has_benchmark:
+                st.markdown(f"#### Relative to {report.benchmark_label}")
+                metric_row(
+                    [
+                        ("Annualized excess", pct(head["excess_return"]), None),
+                        ("Tracking error", pct(head["tracking_error"]), None),
+                        (
+                            "Information ratio",
+                            num(head["information_ratio"]),
+                            "Excess return per unit of tracking error.",
+                        ),
+                        ("Beta", num(head["beta"]), None),
+                        (
+                            "Alpha (CAPM)",
+                            pct(head["alpha"]),
+                            f"t-statistic {head['alpha_t_stat']:.2f}. Below |2| "
+                            "the alpha is not distinguishable from zero.",
+                        ),
+                        (
+                            "Active share",
+                            pct(head["active_share"], 1)
+                            if "active_share" in head
+                            else "—",
+                            "Half the sum of absolute weight differences. "
+                            "0 is the benchmark; 1 shares no holding with it. "
+                            "Unavailable for an external index.",
+                        ),
+                    ]
+                )
+                metric_row(
+                    [
+                        (
+                            "Up capture",
+                            num(head["up_capture"]),
+                            "Share of the benchmark's gains captured.",
+                        ),
+                        (
+                            "Down capture",
+                            num(head["down_capture"]),
+                            "Share of the benchmark's losses taken. Lower is "
+                            "better.",
+                        ),
+                        (
+                            "Batting average",
+                            pct(head["batting_average"], 1),
+                            "Share of periods that beat the benchmark. It "
+                            "often disagrees with the information ratio — a "
+                            "few large wins can carry a low batting average.",
+                        ),
+                        (
+                            "Worst relative drawdown",
+                            pct(head["worst_relative_drawdown"]),
+                            "Furthest the portfolio has fallen behind the "
+                            "benchmark since last being ahead.",
+                        ),
+                        (
+                            "M²",
+                            pct(report.relative.loc[PORTFOLIO, "M-squared"]),
+                            "The portfolio's return levered to the benchmark's "
+                            "risk — the Sharpe ranking, in percentage points.",
+                        ),
+                        (
+                            "Prob. excess > 0",
+                            pct(report.relative.loc[PORTFOLIO, "Prob. Excess > 0"], 1),
+                            "Probability the true excess return is positive, "
+                            "given this sample's shape.",
+                        ),
+                    ]
+                )
+
+            st.divider()
+            g1, g2 = st.columns(2)
+            with g1:
+                st.plotly_chart(
+                    plot_wealth_index(
+                        report.returns[
+                            [c for c in report.returns.columns if c != "Excess"]
+                        ],
+                        "Cumulative wealth (start = 1)",
+                    ),
+                    width="stretch",
+                )
+            with g2:
+                if report.has_benchmark:
+                    st.plotly_chart(
+                        plot_relative_wealth(
+                            report.returns[PORTFOLIO],
+                            report.returns[BENCHMARK],
+                            f"Relative to {report.benchmark_label}",
+                        ),
+                        width="stretch",
+                    )
+                else:
+                    st.plotly_chart(
+                        plot_return_distribution(
+                            report.returns[PORTFOLIO],
+                            title="Return distribution",
+                        ),
+                        width="stretch",
+                    )
+
+            g3, g4 = st.columns(2)
+            with g3:
+                st.plotly_chart(
+                    plot_drawdown(
+                        report.returns[
+                            [c for c in report.returns.columns if c != "Excess"]
+                        ],
+                        "Drawdown",
+                    ),
+                    width="stretch",
+                )
+            with g4:
+                st.plotly_chart(
+                    plot_period_returns(
+                        report.periods,
+                        f"{perf_period_freq.capitalize()} returns",
+                    ),
+                    width="stretch",
+                )
+
+            scatter_points = summary_stats(
+                returns, periods_per_year=int(periods_per_year)
+            )
+            scatter_points = pd.concat(
+                [
+                    scatter_points,
+                    summary_stats(
+                        report.returns[
+                            [c for c in report.returns.columns if c != "Excess"]
+                        ],
+                        periods_per_year=int(periods_per_year),
+                    ),
+                ]
+            )
+            highlight = {PORTFOLIO: "portfolio"}
+            if report.has_benchmark:
+                highlight[BENCHMARK] = "benchmark"
+            st.plotly_chart(
+                plot_risk_return_scatter(
+                    scatter_points,
+                    highlight,
+                    "Where the portfolio sits against its own universe",
+                ),
+                width="stretch",
+            )
+
+            r1, r2 = st.columns(2)
+            with r1:
+                st.plotly_chart(
+                    plot_rolling_metrics(
+                        report.rolling_absolute.dropna(how="all"),
+                        f"Rolling {int(perf_window)}-period performance",
+                    ),
+                    width="stretch",
+                )
+            with r2:
+                if report.rolling_relative_frame is not None:
+                    st.plotly_chart(
+                        plot_rolling_relative(
+                            report.rolling_relative_frame.dropna(how="all"),
+                            f"Rolling {int(perf_window)}-period vs. benchmark",
+                        ),
+                        width="stretch",
+                    )
+                else:
+                    st.caption(
+                        "Choose a benchmark in the sidebar to see the rolling "
+                        "excess return, tracking error, information ratio and "
+                        "beta here."
+                    )
+
+            st.divider()
+            st.markdown("#### Tables")
+            t_abs, t_rel, t_per, t_dd = st.tabs(
+                ["Absolute", "Relative", "Periods", "Drawdowns"]
+            )
+            with t_abs:
+                st.dataframe(format_table(report.absolute.T), width="stretch")
+            with t_rel:
+                if report.relative is not None:
+                    st.dataframe(format_table(report.relative.T), width="stretch")
+                    if report.active_share is not None:
+                        st.caption(
+                            f"Active share {report.active_share:.1%} — computed "
+                            "from positions, so unlike tracking error it cannot "
+                            "be flattered by a quiet market."
+                        )
+                else:
+                    st.info("No benchmark set.")
+            with t_per:
+                st.dataframe(format_table(report.periods), width="stretch")
+            with t_dd:
+                st.dataframe(format_table(report.drawdowns), width="stretch")
+
+            st.divider()
+            st.markdown("#### Export")
+            st.caption(
+                "Everything on this page, in the two formats it gets used in."
+            )
+            _performance_downloads(report, "perf")
+
+# ---------------------------------------------------------------------------
 # 🆚 Compare
 # ---------------------------------------------------------------------------
 
@@ -2185,7 +2802,9 @@ with tab_compare:
                 scn = st.session_state.scenarios[n]
                 try:
                     sub = _scenario_returns_subset(scn, returns)
-                    runs[n] = _solve_scenario_cached(scenario_signature(scn), sub)
+                    runs[n] = _solve_scenario_cached(
+                        scenario_signature(scn), sub, external_returns
+                    )
                     covered = len(
                         [c for c in returns.columns if c in scn.config.expected_returns]
                     )
@@ -2421,7 +3040,7 @@ with tab_whatif:
                 cfg_live = _live_config()
                 sub = returns[[c for c in returns.columns if c in anchor_assets]]
                 st.session_state.whatif_run = _solve_scenario_cached(
-                    config_signature(cfg_live), sub
+                    config_signature(cfg_live), sub, external_returns
                 )
                 st.session_state.whatif_error = None
             except Exception as exc:
@@ -2466,6 +3085,7 @@ with tab_whatif:
                 anchor_run = _solve_scenario_cached(
                     scenario_signature(anchor_scn),
                     _scenario_returns_subset(anchor_scn, returns),
+                    external_returns,
                 )
                 weights_df = pd.DataFrame(
                     {
@@ -2723,6 +3343,11 @@ with tab_report:
         )
 
         assumptions = run.assumptions()
+        report = None
+        try:
+            report = run.performance(riskfree_rate=float(risk_free_rate))
+        except (ValueError, BenchmarkError) as exc:
+            st.warning(f"Performance sheets omitted: {exc}")
         # Same builder the CLI uses, so a workbook exported from the app and
         # one written by `optengine optimize` carry identical sheets.
         sheets = run_sheets(
@@ -2731,21 +3356,49 @@ with tab_report:
             data_quality=quality,
             walk_forward=st.session_state.get("walk_forward"),
             frontier_uncertainty=st.session_state.get("frontier_uncertainty"),
+            performance=report,
         )
 
         buf = io.BytesIO()
+        # Excel caps sheet names at 31 characters and two long names can
+        # truncate onto each other, so the shared de-duplicating writer is
+        # used rather than a bare slice that would silently drop a sheet.
+        _used: set[str] = set()
         with pd.ExcelWriter(buf, engine="xlsxwriter") as writer:
             for name, df in sheets.items():
-                df.to_excel(writer, sheet_name=name[:31], index=True)
+                if df is None:
+                    continue
+                sheet = unique_sheet_name(name, _used)
+                _used.add(sheet)
+                df.to_excel(writer, sheet_name=sheet, index=True)
         buf.seek(0)
-        st.download_button(
+        dl_left, dl_right = st.columns(2)
+        dl_left.download_button(
             label="📥 Download Excel report",
             data=buf,
             file_name="optimization_report.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             type="primary",
+            width="stretch",
+        )
+        dl_right.download_button(
+            label="📄 Weights (CSV)",
+            data=(
+                run.result.weights.to_frame("weight")
+                .to_csv()
+                .encode("utf-8")
+            ),
+            file_name="weights.csv",
+            mime="text/csv",
+            width="stretch",
         )
         st.caption(f"{len(sheets)} sheets: {', '.join(sheets)}")
+
+        if report is not None:
+            st.divider()
+            st.markdown("**Performance**")
+            st.caption(report.describe())
+            _performance_downloads(report, "report_tab")
 
         st.markdown("**Assumptions**")
         render_assumptions(assumptions)

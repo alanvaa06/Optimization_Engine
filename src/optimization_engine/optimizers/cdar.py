@@ -135,7 +135,10 @@ class CDaROptimizer(BaseOptimizer):
             extras.append(self._target_mu_vector() @ w >= float(self.target_return))
 
         objective = zeta + cp.sum(z) / (self.alpha * T)
-        cons = build_constraints(w, self.assets, self.constraints, extras)
+        cons = build_constraints(
+            w, self.assets, self.constraints, extras,
+            cov_matrix=self._sigma_matrix(),
+        )
         problem = cp.Problem(cp.Minimize(objective), cons)
         info = solve_problem(problem)
         if w.value is None:

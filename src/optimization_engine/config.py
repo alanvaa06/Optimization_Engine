@@ -15,6 +15,8 @@ from typing import Any, Literal
 
 import yaml
 
+from optimization_engine.benchmark import BenchmarkSpec
+
 
 @dataclass
 class OptimizerSpec:
@@ -114,8 +116,22 @@ class EngineConfig:
         market_return: Optional CAPM market return (defaults to estimated).
         market_weights: Optional CAPM market portfolio (defaults to equal).
         optimizer: ``OptimizerSpec`` describing the run.
-        benchmark_weights: Optional benchmark weight vector for
-            comparison.
+        benchmark: How the benchmark is defined — 1/N, a single asset, an
+            explicit policy vector, or an external index. It drives both the
+            relative performance report and the benchmark-relative
+            constraints below, so the report and the solve cannot disagree
+            about what the benchmark is.
+        benchmark_weights: Explicit benchmark weight vector. Overrides
+            whatever ``benchmark`` would resolve to; kept because a caller
+            may have the vector without wanting to describe how it was built.
+        max_tracking_error: Cap on annualized active risk versus the
+            benchmark, ``√((w−b)'Σ(w−b))``. Imposed inside the solve by the
+            mean-variance family, mean-CVaR/CDaR and active mean-variance;
+            reported but not enforced by the projection-based methods.
+        max_active_share: Cap on ``½·Σ|w_i − b_i|``. Binds on positions
+            rather than on realized risk, so it holds in a calm market where
+            a tracking-error budget silently permits an unrecognizable
+            portfolio.
         long_only: Forbid short positions. When False, per-asset minimum
             weights may go negative.
         fully_invested: Require ``sum(w) == 1``.
@@ -149,7 +165,10 @@ class EngineConfig:
     market_return: float | None = None
     market_weights: dict[str, float] | None = None
     optimizer: OptimizerSpec = field(default_factory=OptimizerSpec)
+    benchmark: BenchmarkSpec = field(default_factory=BenchmarkSpec)
     benchmark_weights: dict[str, float] | None = None
+    max_tracking_error: float | None = None
+    max_active_share: float | None = None
     long_only: bool = True
     fully_invested: bool = True
     leverage: float | None = None
@@ -159,6 +178,26 @@ class EngineConfig:
     @property
     def assets(self) -> list[str]:
         return list(self.expected_returns.keys())
+
+    def benchmark_weight_map(
+        self, assets: list[str] | None = None
+    ) -> dict[str, float] | None:
+        """The benchmark's weights, or ``None`` when it has none.
+
+        An explicit ``benchmark_weights`` vector wins over the spec: a caller
+        that supplied the numbers directly meant those numbers. Otherwise the
+        spec is expanded over ``assets`` — which matters for the rule-based
+        kinds, since 1/N over ten assets is a different portfolio from 1/N
+        over twelve. An external-index benchmark has no weights in the
+        investable universe and correctly returns ``None``.
+        """
+        if self.benchmark_weights:
+            return {str(k): float(v) for k, v in self.benchmark_weights.items()}
+        universe = list(assets) if assets else self.assets
+        if not universe or not self.benchmark.has_weights:
+            return None
+        weights = self.benchmark.weight_vector(universe)
+        return None if weights is None else {str(k): float(v) for k, v in weights.items()}
 
     def get_bounds(self, asset: str, default: tuple[float, float] = (0.0, 1.0)) -> tuple[float, float]:
         if asset in self.bounds:
@@ -186,7 +225,10 @@ class EngineConfig:
             "market_return": self.market_return,
             "market_weights": (dict(self.market_weights) if self.market_weights else None),
             "optimizer": self.optimizer.to_dict(),
+            "benchmark": self.benchmark.to_dict(),
             "benchmark_weights": self.benchmark_weights,
+            "max_tracking_error": self.max_tracking_error,
+            "max_active_share": self.max_active_share,
             "long_only": self.long_only,
             "fully_invested": self.fully_invested,
             "leverage": self.leverage,
@@ -228,7 +270,18 @@ class EngineConfig:
                 if data.get("market_weights") else None
             ),
             optimizer=OptimizerSpec(**opt_raw),
+            benchmark=BenchmarkSpec.from_dict(data.get("benchmark")),
             benchmark_weights=data.get("benchmark_weights"),
+            max_tracking_error=(
+                float(data["max_tracking_error"])
+                if data.get("max_tracking_error") is not None
+                else None
+            ),
+            max_active_share=(
+                float(data["max_active_share"])
+                if data.get("max_active_share") is not None
+                else None
+            ),
             long_only=bool(data.get("long_only", True)),
             fully_invested=bool(data.get("fully_invested", True)),
             leverage=(

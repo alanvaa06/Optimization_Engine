@@ -69,3 +69,22 @@ group_bounds:
   Equity:       [0.30, 0.70]
   Alternatives: [0.00, 0.20]
   FixedIncome:  [0.20, 0.60]
+
+# What the portfolio is measured — and, with a limit set below, optimized —
+# against. Stated once so the report and the solve cannot disagree about it.
+#
+#   kind:      none | equal_weight | single_asset | custom_weights | external
+#   asset:     the universe member, for kind: single_asset
+#   weights:   {asset: weight}, for kind: custom_weights (normalized to 1)
+#   rebalance: periodic (index convention) | buy_and_hold (weights drift)
+benchmark:
+  kind: equal_weight
+  rebalance: periodic
+
+# Active-risk limits, both measured against the benchmark's positions.
+# Left unset here: this config also targets a 7% return, and a budget tight
+# enough to be interesting puts that target out of reach — which the
+# feasibility report will tell you, in those words, if you set both.
+#
+# max_tracking_error: 0.03   # √((w−b)'Σ(w−b)) ≤ 3% a year
+# max_active_share: 0.50     # ½·Σ|wᵢ−bᵢ| ≤ 50%

@@ -82,9 +82,9 @@ mean-variance solve misplaces its weights by 14.8% RMSE between simulated
 histories drawn from the same distribution. Nested Clustered Optimization
 misplaces them by 0.01%.
 
-*Every figure above is produced by `python scripts/render_docs_images.py` from
-the built-in sample dataset, using the same plotting code the app calls — so
-what the README shows is what the library draws.*
+*Every figure in this README is produced by `python scripts/render_docs_images.py`
+from the built-in sample dataset, using the same plotting code the app calls —
+so what the README shows is what the library draws.*
 
 ## What's inside
 
@@ -94,6 +94,7 @@ what the README shows is what the library draws.*
 | Method | Class | When to use |
 | --- | --- | --- |
 | Mean-variance (target return / vol / utility) | `MeanVarianceOptimizer` | Classic Markowitz with full constraints |
+| Active mean-variance (vs a benchmark) | `ActiveMeanVarianceOptimizer` | The mandate is relative: excess return against an active-risk budget |
 | Global minimum variance | `MinVarianceOptimizer` | You don't trust any expected-return estimate |
 | Maximum Sharpe ratio | `MaxSharpeOptimizer` | Tangency portfolio, sized separately against cash |
 | Risk parity / risk budgeting (ERC) | `RiskParityOptimizer` | Spread *risk* evenly, not capital |
@@ -117,6 +118,7 @@ what it assumes — the same text the UI shows next to the method picker.
 * Long-only or long-short with a gross-exposure cap.
 * Target return, target volatility, or risk-aversion utility.
 * Turnover budget against a previous allocation.
+* Tracking-error budget and active-share cap against a chosen benchmark.
 
 Every constraint is honoured by every method, but not always the same way.
 Convex solves impose them directly; the allocate-then-constrain methods (1/N,
@@ -125,7 +127,12 @@ report how far the mandate moved their answer — because a 1/N book that had
 to shift 15% of its weight is no longer really 1/N. Where a constraint truly
 cannot bind (a turnover budget on the homogeneous max-Sharpe,
 max-diversification and risk-parity solves), the method warns rather than
-ignoring it silently. After every solve the weights are checked against every
+ignoring it silently. The benchmark-relative limits do carry into those
+homogeneous solves: under `w = y/κ` an active-share cap becomes
+`‖y − κb‖₁ ≤ 2·AS·κ` and a tracking-error budget the second-order cone
+`‖Σ^½(y − κb)‖₂ ≤ TE·κ`, so the tangency and maximum-diversification
+portfolios honour an active-risk mandate instead of reporting a breach
+afterwards. After every solve the weights are checked against every
 constraint and any breach is reported.
 
 **Covariance estimators**
@@ -170,14 +177,30 @@ mean-variance to corner solutions).
 
 **Analytics**
 
-Drawdown episodes with recovery timing, Ulcer index, VaR/CVaR (historic and
-Cornish-Fisher), Sharpe, probabilistic Sharpe, Sortino, Calmar, Omega, tail
-ratio, hit rate, rolling metrics, Newey-West annualized volatility, the full
-Euler risk decomposition in volatility units, concentration measures
-(Herfindahl, effective N, effective N of *risk*, diversification ratio), and
-benchmark-relative statistics: tracking error, information ratio, CAPM alpha
-with its t-statistic and R², up/down capture, conditional (up/down) beta, and
-active share.
+*Absolute* — drawdown episodes with recovery timing, Ulcer index, time under
+water, VaR/CVaR (historic and Cornish-Fisher), Sharpe, probabilistic Sharpe,
+Sortino, Calmar, Martin, Omega, gain-to-pain, win/loss ratio, tail ratio, hit
+rate, best and worst single period, rolling metrics, Newey-West annualized
+volatility, the full Euler risk decomposition in volatility units, and
+concentration measures (Herfindahl, effective N, effective N of *risk*,
+diversification ratio).
+
+*Relative* — annualized excess return, tracking error and its downside half,
+information ratio, CAPM alpha with its t-statistic and R², beta and
+conditional (up/down) beta, up/down capture and the up/down *count* ratios,
+batting average, Treynor, M², the appraisal ratio, relative drawdown against
+the benchmark's wealth curve, the probability that the true excess return is
+positive, and active share.
+
+`performance_report()` assembles both halves into one object — headline
+figures, calendar-period returns, rolling absolute and rolling relative
+frames, drawdown episodes — computed on **one aligned sample**, which is the
+point of having it. Assembling the two halves separately is how a report ends
+up quoting a Sharpe ratio from ten years of history next to an information
+ratio from the benchmark's shorter five, with nothing in the output saying so.
+It exports as an Excel workbook or as a tidy long-form `block, series, metric,
+value` table that survives a CSV round-trip and a diff against last quarter's
+run.
 
 **How many bets is this, really?**
 
@@ -196,6 +219,68 @@ Thirteen distinct, nameable positions; one dominant driver. `run.diversification
 reports both, because neither is "the" answer — PCA measures how much
 independent variation you are exposed to, minimum torsion how many distinct
 positions you take.
+
+**Measured against what?**
+
+A benchmark enters the engine in two places, and the engine insists they are
+the same one. A `BenchmarkSpec` states the choice once — 1/N, a single asset,
+an explicit policy vector, or an external index carried alongside the
+universe — and both uses read it:
+
+* as a **return stream**, for every relative statistic above;
+* as a **weight vector**, for active share, the tracking-error decomposition,
+  and the two constraints that turn the benchmark from a reporting choice into
+  an optimization input.
+
+Not every kind supplies both. An external index is a return series with no
+holdings in the investable universe, so asking it for an active share raises
+rather than inventing one — and the UI greys the cell instead of printing a
+number that means nothing.
+
+The rebalancing convention is stated rather than assumed: `periodic` restores
+the stated weights every period, which is what published index returns do and
+what `(returns · w).sum()` computes; `buy_and_hold` invests once and lets the
+winners compound into a larger share. Over a long sample those are materially
+different track records.
+
+Setting a tracking-error budget changes what gets solved. On the sample panel,
+mean-variance at λ = 3 against a 1/N benchmark, rebalanced quarterly at 15bps:
+
+| Active-risk budget | Return | Sharpe | Excess | T.E. | Information ratio | Active share |
+| --- | --- | --- | --- | --- | --- | --- |
+| unconstrained | 9.34% | 0.68 | 4.14% | 5.03% | 0.82 | 76.9% |
+| ≤ 3% | 8.27% | 0.61 | 3.08% | 3.01% | **1.02** | 54.3% |
+| ≤ 1.5% | 7.14% | 0.47 | 1.94% | 1.53% | **1.27** | 27.7% |
+
+The budget binds exactly, and tightening it *raises* the information ratio
+while lowering absolute return: the mandate spends less active risk and spends
+what is left more efficiently. That is an in-sample result on one panel, not a
+law — but it is the trade-off the constraint exists to let you see, and it is
+invisible in an absolute report.
+
+What "3.08% of excess return" felt like to hold is a different question, and
+the relative wealth curve is the one that answers it. This is the ratio of the
+two wealth curves, not the compounded excess return — compounding a difference
+of returns as though it were a return overstates the gap, and the error grows
+with the sample. The shaded bands are relative drawdown: the stretches during
+which the portfolio was behind the index it is measured on, which is what a
+client remembers and what no absolute chart shows.
+
+![Portfolio wealth divided by benchmark wealth, with the periods spent behind the index shaded](docs/images/relative-performance.png)
+
+Annualized figures hide the shape of a record, so the same report tabulates it
+period by period. Here the portfolio beat the index in seven of the nine
+calendar periods, and the two it lost were the first two — a shape that a
+single information ratio summarises away, and that decides whether anyone is
+still invested by the third year.
+
+![Calendar-year returns for the portfolio and its benchmark, with the excess marked](docs/images/period-returns.png)
+
+`active_mean_variance` goes further and optimizes in active space directly:
+maximize `α'x − λ·x'Σx` over `x = w − b`, or maximize expected active return
+subject to `√(x'Σx) ≤ TE*` when a budget is set. With `b = 0` it reduces
+exactly to `mean_variance`, which is the check that the reformulation is not
+quietly a different problem.
 
 **Active management (Grinold-Kahn)**
 
@@ -332,6 +417,7 @@ src/optimization_engine/
 ├── data/             # loaders · covariance · denoising · data-quality
 ├── optimizers/       # one file per technique + diagnostics + feasibility
 ├── reporting/        # Excel exporter + Plotly figures
+├── benchmark.py      # what the portfolio is measured — and optimized — against
 ├── config.py         # YAML/JSON-driven config
 ├── engine.py         # high-level façade (run_engine)
 ├── frontier.py       # efficient frontier sweep
@@ -367,8 +453,8 @@ streamlit run app/streamlit_app.py
 ```
 
 The sidebar walks a numbered path — **Data → Currency → Method →
-Assumptions → Objective → Exposure → Frontier** — and each step surfaces what
-could make the next one wrong.
+Assumptions → Objective → Benchmark → Exposure → Frontier** — and each step
+surfaces what could make the next one wrong.
 
 1. **Data** — data-quality report before anything is estimated: interior
    gaps, stale feeds that read to an optimizer as low volatility, unadjusted
@@ -395,13 +481,27 @@ could make the next one wrong.
    confidence band and names the positions the sample cannot pin down.
 5. **Backtest** — choose a rebalancing cadence and transaction costs; see
    weight drift, cost drag, rolling performance, the return distribution with
-   its VaR/CVaR cuts, benchmark-relative statistics, and a walk-forward run
-   that says in words how much of the result was hindsight.
-6. **Compare / What-if** — saved scenarios side by side, and live re-solving
+   its VaR/CVaR cuts, and a walk-forward run that says in words how much of
+   the result was hindsight.
+6. **Performance** — absolute and relative on one page, both computed on the
+   same aligned sample: KPI cards for each, cumulative wealth against the
+   benchmark and the *relative* wealth curve with its underwater band,
+   calendar-period bars, rolling absolute and rolling relative panels, a
+   risk-return scatter placing the portfolio and its benchmark among the
+   assets they are built from, and the full tables. Exports as a workbook or
+   as a tidy metrics CSV.
+7. **Compare / What-if** — saved scenarios side by side, and live re-solving
    as you drag weight bounds.
-7. **Report** — one-click Excel export carrying assumptions, diagnostics,
-   data-quality findings and the walk-forward comparison alongside the
-   weights.
+8. **Report** — one-click Excel export carrying assumptions, diagnostics,
+   data-quality findings, the benchmark and active weights, the full
+   performance report and the walk-forward comparison alongside the weights.
+
+The **Benchmark** step is one choice that everything downstream reads: the
+relative block on the backtest page, the performance page, the workbook, and —
+when you set a tracking-error or active-share limit — the solve itself. Any
+series you load but leave out of the universe is offered there as an external
+benchmark, so pulling `^GSPC` alongside your tickers and deselecting it is all
+it takes to measure against the index.
 
 The sidebar's **📚 Scenarios** block saves, updates, loads, renames, deletes,
 and downloads/uploads named profiles (YAML).
@@ -424,7 +524,19 @@ optengine optimize --config config/example_multi_asset.yaml --sample \
 # you tried, and rank the methods by how reliably each recovers the truth.
 optengine optimize --config config/example_multi_asset.yaml --sample \
     --denoise --walk-forward --trials 40 --mcos 20
+
+# Measure against a benchmark, and hold the solve to an active-risk budget.
+# --benchmark takes a kind ('equal_weight'), an asset name, or 'none' to
+# override whatever the config's benchmark block says.
+optengine optimize --config config/example_multi_asset.yaml --sample \
+    --benchmark equal_weight --max-tracking-error 0.03 --max-active-share 0.5
 ```
+
+A benchmarked run prints the relative headline alongside the absolute one, and
+the workbook gains the benchmark, the active weights, and the full absolute
+and relative performance report — plus the same report on the walk-forward
+returns when `--walk-forward` is set, so the fitted information ratio sits
+next to the out-of-sample one.
 
 `check` exits non-zero when the data has errors or the constraints have no
 solution, so it drops straight into CI or a pre-commit hook.
@@ -457,6 +569,32 @@ print(run.risk_decomposition())       # contributions in volatility units
 # What survives out of sample?
 wf = run.walk_forward(transaction_cost_bps=10)
 print(run.in_vs_out_of_sample(wf))
+
+# Measured against what? State it once, and both the report and the solve
+# read the same answer.
+from dataclasses import replace
+
+from optimization_engine import BenchmarkSpec
+
+relative = replace(
+    config,
+    optimizer=OptimizerSpec(name="mean_variance", risk_aversion=3.0),
+    benchmark=BenchmarkSpec(kind="equal_weight"),
+    max_tracking_error=0.03,          # binds inside the mean-variance solve
+)
+relative_run = run_engine(returns, relative)
+
+report = relative_run.performance(frequency="monthly", transaction_cost_bps=10)
+print(report.describe())              # one paragraph, hedged where it should be
+print(report.relative.T)              # excess, T.E., IR, alpha and its t-stat,
+                                      # capture, batting average, M², …
+print(report.periods)                 # portfolio vs benchmark, year by year
+report.metrics().to_csv("metrics.csv", index=False)   # tidy, diffable
+
+# The same report, on returns this process never saw. Its own walk-forward,
+# not the one above — that belonged to a different config.
+relative_wf = relative_run.walk_forward(transaction_cost_bps=10)
+print(relative_run.performance(returns_override=relative_wf.returns).describe())
 
 # ...and how much of *that* is the forty configurations you tried first?
 from optimization_engine import deflated_sharpe_ratio

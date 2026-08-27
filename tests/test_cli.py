@@ -178,3 +178,102 @@ def test_write_excel_report_skips_none_and_promotes_series(tmp_path):
     )
     sheets = pd.read_excel(out, sheet_name=None)
     assert set(sheets) == {"a"}
+
+
+# ---------------------------------------------------------------------------
+# Benchmark flags
+# ---------------------------------------------------------------------------
+
+
+def test_optimize_reports_against_a_benchmark(feasible_config, tmp_path, capsys):
+    out_path = tmp_path / "bench.xlsx"
+    code = main(
+        [
+            "optimize", "--config", str(feasible_config), "--sample",
+            "--benchmark", "equal_weight", "--output", str(out_path),
+        ]
+    )
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "vs Equal weight (1/N)" in out
+    assert "IR" in out and "T.E." in out
+    sheets = pd.read_excel(out_path, sheet_name=None)
+    assert "benchmark" in sheets
+    assert "performance_relative" in sheets
+
+
+def test_optimize_accepts_an_asset_name_as_the_benchmark(
+    feasible_config, tmp_path, capsys
+):
+    code = main(
+        [
+            "optimize", "--config", str(feasible_config), "--sample",
+            "--benchmark", "US_Equity", "--output", str(tmp_path / "a.xlsx"),
+        ]
+    )
+    assert code == 0
+    assert "vs US_Equity" in capsys.readouterr().out
+
+
+def test_optimize_rejects_an_unknown_benchmark(feasible_config, tmp_path, capsys):
+    code = main(
+        [
+            "optimize", "--config", str(feasible_config), "--sample",
+            "--benchmark", "NOT_A_THING", "--output", str(tmp_path / "b.xlsx"),
+        ]
+    )
+    assert code == 2
+    err = capsys.readouterr().err
+    assert "neither a benchmark kind nor an asset" in err
+
+
+def test_a_tracking_error_budget_binds_from_the_command_line(
+    feasible_config, tmp_path
+):
+    import numpy as np
+
+    data = yaml.safe_load(feasible_config.read_text())
+    # The example config targets a return the tight budget cannot reach;
+    # this test is about the budget, so the target comes off.
+    data["optimizer"].pop("target_return", None)
+    path = tmp_path / "no_target.yaml"
+    path.write_text(yaml.safe_dump(data))
+
+    out_path = tmp_path / "te.xlsx"
+    assert (
+        main(
+            [
+                "optimize", "--config", str(path), "--sample",
+                "--benchmark", "equal_weight",
+                "--max-tracking-error", "0.02",
+                "--output", str(out_path),
+            ]
+        )
+        == 0
+    )
+    sheets = pd.read_excel(out_path, sheet_name=None)
+    weights = sheets["benchmark_weights"].set_index(
+        sheets["benchmark_weights"].columns[0]
+    )
+    active = weights["active_weight"].values
+    cov = sheets["cov_matrix"].set_index(sheets["cov_matrix"].columns[0])
+    realized = float(np.sqrt(max(active @ cov.values @ active, 0.0)))
+    assert realized <= 0.02 + 1e-4
+
+
+def test_an_unreachable_target_under_a_budget_names_the_cause(
+    feasible_config, tmp_path, capsys
+):
+    # The example config targets 7%; a 4% tracking-error budget puts that
+    # out of reach, and the message should say so rather than "infeasible".
+    code = main(
+        [
+            "optimize", "--config", str(feasible_config), "--sample",
+            "--benchmark", "equal_weight", "--max-tracking-error", "0.04",
+            "--output", str(tmp_path / "c.xlsx"),
+        ]
+    )
+    assert code == 2
+    err = capsys.readouterr().err
+    assert "Target return" in err
+    assert "tracking-error or active-share budget is in force" in err

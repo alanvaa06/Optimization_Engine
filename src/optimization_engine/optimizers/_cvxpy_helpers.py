@@ -236,8 +236,22 @@ def build_constraints(
     assets: list[str],
     constraints: PortfolioConstraints,
     extra_constraints: list[cp.Constraint] | None = None,
+    cov_matrix: np.ndarray | None = None,
 ) -> list[cp.Constraint]:
-    """Translate a :class:`PortfolioConstraints` object into CVXPY constraints."""
+    """Translate a :class:`PortfolioConstraints` object into CVXPY constraints.
+
+    Args:
+        weights: The decision variable.
+        assets: Column order the vectors are aligned to.
+        constraints: The constraint set to translate.
+        extra_constraints: Method-specific constraints to append.
+        cov_matrix: Annualized covariance, aligned to ``assets``. Required
+            only for a tracking-error budget, which is the one constraint
+            that cannot be written from weights alone. Passing ``None`` while
+            a budget is set raises rather than dropping it: a portfolio
+            returned without the active-risk limit its mandate specifies is
+            worse than an error.
+    """
     cons: list[cp.Constraint] = []
 
     if constraints.fully_invested:
@@ -260,9 +274,78 @@ def build_constraints(
         )
         cons.append(cp.norm(weights - prev, 1) <= float(constraints.turnover_limit))
 
+    cons.extend(benchmark_constraints(weights, assets, constraints, cov_matrix))
+
     if extra_constraints:
         cons.extend(extra_constraints)
     return cons
+
+
+def benchmark_constraints(
+    weights: cp.Variable,
+    assets: list[str],
+    constraints: PortfolioConstraints,
+    cov_matrix: np.ndarray | None = None,
+) -> list[cp.Constraint]:
+    """Active-risk and active-share limits, relative to the benchmark.
+
+    Both are convex in ``w``: tracking error is a quadratic form in the active
+    weights and active share is an L1 norm of them, so neither costs the solve
+    its convexity. Returns an empty list when no benchmark is set.
+
+    Raises:
+        ValueError: When a tracking-error budget is set without a covariance
+            matrix to measure it with, or when either limit is negative.
+    """
+    benchmark = constraints.benchmark_vector(assets)
+    if benchmark is None:
+        if (
+            constraints.max_tracking_error is not None
+            or constraints.max_active_share is not None
+        ):
+            raise ValueError(
+                "A tracking-error or active-share budget was set without "
+                "benchmark_weights. Name the benchmark the limit is relative to."
+            )
+        return []
+
+    cons: list[cp.Constraint] = []
+    active = weights - benchmark
+
+    if constraints.max_active_share is not None:
+        limit = float(constraints.max_active_share)
+        if limit < 0:
+            raise ValueError(f"max_active_share must be non-negative; got {limit}.")
+        # Active share is half the L1 distance, hence the factor of two.
+        cons.append(cp.norm(active, 1) <= 2.0 * limit)
+
+    if constraints.max_tracking_error is not None:
+        te = float(constraints.max_tracking_error)
+        if te < 0:
+            raise ValueError(f"max_tracking_error must be non-negative; got {te}.")
+        if cov_matrix is None:
+            raise ValueError(
+                "A tracking-error budget needs a covariance matrix. This "
+                "optimizer does not have one, so the limit could not be "
+                "imposed — use mean_variance, min_variance or "
+                "active_mean_variance to bind it."
+            )
+        cons.append(cp.quad_form(active, cp.psd_wrap(cov_matrix)) <= te**2)
+
+    return cons
+
+
+def psd_sqrt(sigma: np.ndarray) -> np.ndarray:
+    """Symmetric square root of a PSD matrix, tolerant of tiny negative eigenvalues.
+
+    Cholesky would be faster but requires strict positive definiteness, and
+    the engine's covariance estimates are routinely on the boundary — a
+    detoned or shrunk matrix can carry eigenvalues at ``-1e-18``. Clipping
+    them to zero and rebuilding from the eigendecomposition gives the nearest
+    PSD square root instead of an exception.
+    """
+    values, vectors = np.linalg.eigh(np.asarray(sigma, dtype=float))
+    return vectors @ np.diag(np.sqrt(np.clip(values, 0.0, None))) @ vectors.T
 
 
 def build_scaled_constraints(
@@ -270,6 +353,7 @@ def build_scaled_constraints(
     kappa: cp.Variable,
     assets: list[str],
     constraints: PortfolioConstraints,
+    cov_matrix: np.ndarray | None = None,
 ) -> list[cp.Constraint]:
     """Constraints for the homogeneous ``w = y / κ`` reformulations.
 
@@ -279,8 +363,28 @@ def build_scaled_constraints(
     it is scaled by ``κ = Σy`` — so per-asset bounds and group budgets stay
     hard constraints instead of being applied by post-hoc projection.
 
-    Turnover budgets do **not** carry over: ``‖w − w_prev‖₁ ≤ τ`` is affine,
-    not homogeneous, so it is left to the caller to reject or warn.
+    The benchmark-relative limits carry over too, though they are not linear.
+    With ``w − b = (y − κb)/κ`` and ``κ > 0``, an active-share cap becomes
+    ``‖y − κb‖₁ ≤ 2·AS·κ`` and a tracking-error budget becomes the
+    second-order cone ``‖Σ^½(y − κb)‖₂ ≤ TE·κ``. Both stay convex, so the
+    tangency and maximum-diversification portfolios honour an active-risk
+    mandate rather than reporting a violation after the fact.
+
+    Turnover budgets do **not** carry over: ``‖w − w_prev‖₁ ≤ τ`` is affine
+    in ``w`` with a constant term that has no ``κ`` to absorb it, so it is
+    left to the caller to reject or warn.
+
+    Args:
+        y: The unnormalized ray variable.
+        kappa: The scaling variable, ``κ = Σy``.
+        assets: Column order the vectors are aligned to.
+        constraints: The constraint set to translate.
+        cov_matrix: Annualized covariance aligned to ``assets``. Required
+            only for a tracking-error budget.
+
+    Raises:
+        ValueError: When a benchmark-relative limit is set without the
+            benchmark, or a tracking-error budget without a covariance matrix.
     """
     cons: list[cp.Constraint] = [cp.sum(y) == kappa, kappa >= 1e-8]
 
@@ -292,5 +396,34 @@ def build_scaled_constraints(
         lo, hi = constraints.group_bounds[group]
         cons.append(cp.sum(y[idx]) >= float(lo) * kappa)
         cons.append(cp.sum(y[idx]) <= float(hi) * kappa)
+
+    benchmark = constraints.benchmark_vector(assets)
+    if benchmark is None:
+        if (
+            constraints.max_tracking_error is not None
+            or constraints.max_active_share is not None
+        ):
+            raise ValueError(
+                "A tracking-error or active-share budget was set without "
+                "benchmark_weights. Name the benchmark the limit is relative to."
+            )
+        return cons
+
+    active = y - kappa * benchmark
+    if constraints.max_active_share is not None:
+        limit = float(constraints.max_active_share)
+        if limit < 0:
+            raise ValueError(f"max_active_share must be non-negative; got {limit}.")
+        cons.append(cp.norm(active, 1) <= 2.0 * limit * kappa)
+    if constraints.max_tracking_error is not None:
+        te = float(constraints.max_tracking_error)
+        if te < 0:
+            raise ValueError(f"max_tracking_error must be non-negative; got {te}.")
+        if cov_matrix is None:
+            raise ValueError(
+                "A tracking-error budget needs a covariance matrix, and this "
+                "optimizer was not given one."
+            )
+        cons.append(cp.norm(psd_sqrt(cov_matrix) @ active, 2) <= te * kappa)
 
     return cons

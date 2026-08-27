@@ -106,7 +106,10 @@ class CVaROptimizer(BaseOptimizer):
             mu = self._target_mu_vector()
             extras.append(mu @ w >= float(self.target_return))
 
-        cons = build_constraints(w, self.assets, self.constraints, extras)
+        cons = build_constraints(
+            w, self.assets, self.constraints, extras,
+            cov_matrix=self._sigma_matrix(),
+        )
         problem = cp.Problem(cp.Minimize(portfolio_cvar), cons)
         info = solve_problem(problem)
         if w.value is None:

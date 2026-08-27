@@ -254,11 +254,20 @@ def reachable_return_range(
     expected_returns: pd.Series,
     constraints: PortfolioConstraints,
     assets: list[str] | None = None,
+    cov_matrix: pd.DataFrame | None = None,
 ) -> tuple[float, float] | None:
-    """Solve two LPs for the min and max expected return the constraints allow.
+    """Solve two programs for the min and max expected return the constraints allow.
 
     This is the range a target return must fall inside. Returns ``None`` when
-    the constraint set is infeasible or no LP solver is available.
+    the constraint set is infeasible or no solver is available.
+
+    Args:
+        expected_returns: The vector the target is expressed in.
+        constraints: The constraint set about to be solved.
+        assets: Universe order. Defaults to the returns' index.
+        cov_matrix: Needed only when a tracking-error budget is set — that
+            budget genuinely narrows the reachable range, and omitting it
+            would report a range the solve cannot deliver.
     """
     import cvxpy as cp
 
@@ -273,7 +282,15 @@ def reachable_return_range(
     bounds: list[float] = []
     for sense in (cp.Minimize, cp.Maximize):
         w = cp.Variable(n)
-        problem = cp.Problem(sense(mu @ w), build_constraints(w, assets, constraints))
+        sigma = None
+        if cov_matrix is not None:
+            sigma = (
+                cov_matrix.reindex(assets, axis=0).reindex(assets, axis=1).values
+            )
+        problem = cp.Problem(
+            sense(mu @ w),
+            build_constraints(w, assets, constraints, cov_matrix=sigma),
+        )
         try:
             problem.solve()
         except Exception:
@@ -335,7 +352,9 @@ def analyze_feasibility(
     lo = hi = gmv = None
 
     if not any(i.fatal for i in issues) and expected_returns is not None:
-        rng = reachable_return_range(expected_returns, constraints, assets)
+        rng = reachable_return_range(
+            expected_returns, constraints, assets, cov_matrix=cov_matrix
+        )
         if rng is None:
             issues.append(
                 FeasibilityIssue(

@@ -178,6 +178,83 @@ def hit_rate(r: pd.Series | pd.DataFrame, threshold: float = 0.0) -> float | pd.
     return (r > threshold).mean()
 
 
+def gain_to_pain_ratio(r: pd.Series | pd.DataFrame) -> float | pd.Series:
+    """Total return divided by the total of the losing periods.
+
+    Schwager's ratio. Where Sharpe divides by a symmetric dispersion — which
+    charges the portfolio for its good months as much as its bad ones — this
+    divides by the losses alone, and it needs no distributional assumption to
+    do it. A value of 1 means every unit earned was matched by a unit lost
+    along the way.
+    """
+    if isinstance(r, pd.DataFrame):
+        return r.aggregate(gain_to_pain_ratio)
+    series = r.dropna()
+    pain = float(series[series < 0].sum())
+    if pain == 0:
+        return float("inf") if float(series.sum()) > 0 else float("nan")
+    return float(series.sum() / abs(pain))
+
+
+def win_loss_ratio(r: pd.Series | pd.DataFrame) -> float | pd.Series:
+    """Average winning period over the average losing period, in absolute size.
+
+    Read next to the hit rate, never instead of it: a strategy can win four
+    times out of five and still lose money if this ratio is small enough.
+    """
+    if isinstance(r, pd.DataFrame):
+        return r.aggregate(win_loss_ratio)
+    series = r.dropna()
+    wins = series[series > 0]
+    losses = series[series < 0]
+    if len(losses) == 0:
+        return float("inf") if len(wins) else float("nan")
+    if len(wins) == 0:
+        return 0.0
+    return float(wins.mean() / abs(losses.mean()))
+
+
+def martin_ratio(
+    r: pd.Series | pd.DataFrame,
+    riskfree_rate: float = 0.0,
+    periods_per_year: int = 252,
+) -> float | pd.Series:
+    """Annualized excess return over the Ulcer index.
+
+    Calmar divides by the single worst drawdown, so one bad fortnight decides
+    it. The Ulcer index is the root-mean-square of the whole drawdown path,
+    which prices the *duration* of the pain as well as its depth — the
+    difference between a portfolio that fell 30% and recovered in a month and
+    one that spent three years down 20%.
+    """
+    if isinstance(r, pd.DataFrame):
+        return r.aggregate(
+            martin_ratio,
+            riskfree_rate=riskfree_rate,
+            periods_per_year=periods_per_year,
+        )
+    ulcer = float(ulcer_index(r))
+    if ulcer <= 0:
+        return float("nan")
+    rf = _rf_per_period(riskfree_rate, periods_per_year)
+    return float(annualize_returns(r - rf, periods_per_year) / ulcer)
+
+
+def time_under_water(r: pd.Series | pd.DataFrame) -> float | pd.Series:
+    """Share of periods spent below the previous high-water mark.
+
+    The statistic an investor experiences directly. A high Sharpe with 80%
+    time under water describes a portfolio that is uncomfortable to hold
+    regardless of how well it scores.
+    """
+    if isinstance(r, pd.DataFrame):
+        return r.aggregate(time_under_water)
+    dd = drawdown_series(r.dropna())
+    if len(dd) == 0:
+        return float("nan")
+    return float((dd < -1e-12).mean())
+
+
 def rolling_metrics(
     r: pd.Series,
     window: int,
@@ -224,8 +301,11 @@ def summary_stats(
         periods_per_year: Observations per year.
         riskfree_rate: Annual risk-free rate for Sharpe and Sortino.
         var_level: Tail percentile for VaR/CVaR (5 ⇒ 5%).
-        extended: Add Calmar, Omega, tail ratio, hit rate, the Ulcer index,
-            drawdown duration and the probabilistic Sharpe ratio.
+        extended: Add the ratios that do not assume symmetric risk —
+            Calmar, Omega, Martin, gain-to-pain, win/loss — plus the tail
+            ratio, hit rate, Ulcer index, drawdown duration, time under
+            water, the best and worst single period, and the
+            probabilistic Sharpe ratio.
     """
     if isinstance(r, pd.Series):
         r = r.to_frame()
@@ -276,6 +356,16 @@ def summary_stats(
         out["Hit Rate"] = r.aggregate(hit_rate)
         out["Ulcer Index"] = r.aggregate(ulcer_index)
         out["Max DD Duration"] = r.aggregate(max_drawdown_duration)
+        out["Martin Ratio"] = r.aggregate(
+            martin_ratio,
+            riskfree_rate=riskfree_rate,
+            periods_per_year=periods_per_year,
+        )
+        out["Gain-to-Pain"] = r.aggregate(gain_to_pain_ratio)
+        out["Win/Loss Ratio"] = r.aggregate(win_loss_ratio)
+        out["Time Under Water"] = r.aggregate(time_under_water)
+        out["Best Period"] = r.max()
+        out["Worst Period"] = r.min()
         out["Prob. Sharpe > 0"] = r.aggregate(
             lambda s: probabilistic_sharpe_ratio(
                 s, 0.0, riskfree_rate, periods_per_year

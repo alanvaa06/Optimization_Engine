@@ -27,6 +27,13 @@ from optimization_engine.analytics.diversification import (
     effective_number_of_bets,
     minimum_torsion,
 )
+from optimization_engine.analytics.report import (
+    PerformanceReport,
+    compare_performance,
+    performance_report,
+    period_returns,
+    rolling_relative,
+)
 from optimization_engine.analytics.selection import (
     DeflatedSharpe,
     OverfittingReport,
@@ -34,6 +41,11 @@ from optimization_engine.analytics.selection import (
     expected_maximum_sharpe,
     minimum_track_record_length,
     probability_of_backtest_overfitting,
+)
+from optimization_engine.benchmark import (
+    BenchmarkSpec,
+    ResolvedBenchmark,
+    resolve_benchmark,
 )
 from optimization_engine.config import (
     EngineConfig,
@@ -140,6 +152,14 @@ from optimization_engine.scenarios import (
 __version__ = "0.3.0"
 
 __all__ = [
+    "BenchmarkSpec",
+    "PerformanceReport",
+    "ResolvedBenchmark",
+    "compare_performance",
+    "performance_report",
+    "period_returns",
+    "resolve_benchmark",
+    "rolling_relative",
     "EngineConfig",
     "OptimizerSpec",
     "load_config",
