@@ -156,7 +156,12 @@ def walk_forward_run(
         "n_rebalances": int(len(weights_history)),
         "n_failed_solves": int(len(failures)),
     }
-    run = run_backtest(evaluation, weights_history, spec, notes=notes)
+    # The cost models see the whole history, not just the evaluated slice:
+    # a decision made at the first evaluated date has years of returns behind
+    # it, and pricing its impact off the slice alone would throw them away.
+    run = run_backtest(
+        evaluation, weights_history, spec, notes=notes, context_returns=returns
+    )
 
     return WalkForwardRun(
         run=run,

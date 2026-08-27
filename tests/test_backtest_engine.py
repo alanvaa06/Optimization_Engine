@@ -619,3 +619,29 @@ def test_engine_exposes_the_whole_stack(returns):
     sheet = run.tearsheet(bundle)
     assert not sheet.performance.empty
     assert sheet.tca.total_cost > 0
+
+
+def test_a_walk_forward_prices_its_first_trades_off_the_whole_history(returns):
+    """Impact must not degrade for want of data that is sitting right there.
+
+    The evaluation window starts partway into the sample, so estimating
+    trailing volatility from it alone would leave the first trades unpriced
+    even though years of returns precede them.
+    """
+    spec = BacktestSpec(
+        costs=CostSpec(impact_coefficient=0.5, impact_volatility_lookback=63)
+    )
+
+    def solve(window: pd.DataFrame) -> pd.Series:
+        return pd.Series(1.0 / window.shape[1], index=window.columns)
+
+    walk = walk_forward_run(returns, solve, lookback=252, rebalance_every=126, spec=spec)
+    assert not walk.run.meta.degradations, walk.run.meta.degradations
+
+    # Replaying the same weights without that context degrades, which is what
+    # makes the line above a result rather than a coincidence.
+    blind = run_backtest(
+        returns.loc[walk.weights_history.index[0]:], walk.weights_history, spec
+    )
+    assert blind.meta.degradations
+    assert blind.total_cost < walk.run.total_cost

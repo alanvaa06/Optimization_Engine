@@ -108,3 +108,16 @@ jobs:
             --output /tmp/ci_report.xlsx
       - name: Report was written
         run: test -s /tmp/ci_report.xlsx
+      # The backtest command reaches code the optimize path never touches:
+      # the simulation core, the cost models, and the sweep runner that feeds
+      # the selection-bias diagnostics.
+      - name: End-to-end backtest with a sweep
+        run: |
+          optengine backtest \
+            --config config/example_multi_asset.yaml \
+            --sample --lookback 504 --rebalance-every 252 \
+            --commission-bps 8 --slippage-bps 4 --impact-eta 0.3 \
+            --sweep optimizer.name=min_variance,equal_weight \
+            --output /tmp/ci_backtest.xlsx
+      - name: Tearsheet was written
+        run: test -s /tmp/ci_backtest.xlsx

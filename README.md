@@ -411,7 +411,11 @@ Three things that in-sample constant-weight replays quietly assume away:
   the same allocation gets more expensive as the book grows — the only way
   capacity shows up in a backtest at all. When the trailing volatility behind
   that estimate is missing, the trade degrades to the linear charge and the run
-  says so on `meta.degradations` rather than silently charging zero.
+  says so on `meta.degradations` rather than silently charging zero. A
+  walk-forward hands the cost models the *whole* history as context, so its
+  first trades are priced off the years that precede them rather than degrading
+  for want of data sitting just outside the evaluation window — only rows
+  strictly before each decision date are ever read.
 
 `walk_forward_run()` re-estimates and re-solves on a rolling (or expanding)
 window and holds each solution forward over returns the optimizer never saw;

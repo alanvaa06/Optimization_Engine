@@ -79,11 +79,13 @@ def run_backtest(
     *,
     cost_model: CostModel | None = None,
     notes: dict[str, Any] | None = None,
+    context_returns: pd.DataFrame | None = None,
 ) -> RunResult:
     """Replay a weight schedule over a return history.
 
     Args:
-        returns: Periodic asset returns, one column per asset.
+        returns: Periodic asset returns, one column per asset. This is the
+            evaluation window: every period here is replayed.
         weights: Either one target vector held throughout, or a frame of
             target weights indexed by the date they become effective — which
             is what the walk-forward runner produces.
@@ -92,6 +94,13 @@ def run_backtest(
         cost_model: Override the model built from ``spec.costs``. Useful for
             testing and for cost models this library does not ship.
         notes: Free-form annotations to carry on the result metadata.
+        context_returns: A longer history the cost models may estimate from.
+            A walk-forward evaluation starts partway into the sample, so
+            estimating trailing volatility from the evaluation window alone
+            would degrade its first trades for want of data that exists —
+            just outside the slice. Only rows strictly before each decision
+            date are ever read, so this widens what can be estimated without
+            widening what can be seen.
 
     Returns:
         The full result bundle. See :class:`~optimization_engine.backtest.results.RunResult`.
@@ -109,11 +118,12 @@ def run_backtest(
     model = cost_model if cost_model is not None else build_cost_model(spec.costs)
 
     lookback = int(model.volatility_lookback())
-    volatility = (
-        trailing_volatilities(returns, lookback, spec.costs.min_impact_observations)
-        if lookback > 0
-        else None
-    )
+    volatility = None
+    if lookback > 0:
+        history = returns if context_returns is None else context_returns
+        volatility = trailing_volatilities(
+            history, lookback, spec.costs.min_impact_observations
+        ).reindex(index=index, columns=assets)
 
     marks = rebalance_dates(index, spec.frequency)
     # A schedule date is always a decision: the walk-forward runner only emits
