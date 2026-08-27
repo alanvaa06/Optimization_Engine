@@ -25,7 +25,7 @@ import pandas as pd
 
 from optimization_engine.optimizers._cvxpy_helpers import (
     bounds_arrays,
-    group_index_map,
+    layer_constraints,
     solve_problem,
 )
 from optimization_engine.optimizers.base import BaseOptimizer
@@ -109,10 +109,12 @@ class RiskParityOptimizer(BaseOptimizer):
             y >= cp.multiply(lb_pos, total),
             y <= cp.multiply(ub_arr, total),
         ]
-        for group, idx in group_index_map(self.assets, self.constraints).items():
-            g_lb, g_ub = self.constraints.group_bounds[group]
-            cons.append(cp.sum(y[idx]) >= float(g_lb) * total)
-            cons.append(cp.sum(y[idx]) <= float(g_ub) * total)
+        # ``y`` is the unnormalized ray again, so every layer's bucket budget
+        # scales by the same total — including a percent-of-parent limit,
+        # where both sides scale and the ratio is preserved exactly.
+        cons.extend(
+            layer_constraints(y, self.assets, self.constraints, scale=total)
+        )
 
         objective = cp.Minimize(0.5 * cp.quad_form(y, sigma_psd) - b @ cp.log(y))
         problem = cp.Problem(objective, cons)

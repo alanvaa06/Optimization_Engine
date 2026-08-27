@@ -53,6 +53,13 @@ from optimization_engine.config import (
     load_config,
     save_config,
 )
+from optimization_engine.constraints import (
+    ConstraintLayer,
+    currency_layer,
+    effective_layers,
+    layer_exposures,
+    layer_from_mapping,
+)
 from optimization_engine.data.covariance import (
     CovarianceDiagnostics,
     covariance_diagnostics,
@@ -160,8 +167,13 @@ __all__ = [
     "period_returns",
     "resolve_benchmark",
     "rolling_relative",
+    "ConstraintLayer",
     "EngineConfig",
     "OptimizerSpec",
+    "currency_layer",
+    "effective_layers",
+    "layer_exposures",
+    "layer_from_mapping",
     "load_config",
     "save_config",
     "covariance_matrix",

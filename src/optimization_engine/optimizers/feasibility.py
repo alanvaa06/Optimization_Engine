@@ -6,7 +6,8 @@ the cause is a typo in one bound or a genuinely impossible mandate.
 
 This module answers the question the solver won't: *which* constraint makes
 the problem impossible, and what has to change. The cheap structural checks
-(budget vs. bounds, group budgets vs. member bounds) run without a solver;
+(budget vs. bounds, every layer's bucket budgets vs. member bounds) run
+without a solver;
 the reachable-return range is computed with two small LPs.
 """
 
@@ -17,6 +18,11 @@ from dataclasses import dataclass, field
 import numpy as np
 import pandas as pd
 
+from optimization_engine.constraints import (
+    ConstraintLayer,
+    parent_bucket_map,
+    resolve_parent,
+)
 from optimization_engine.optimizers.base import PortfolioConstraints
 
 _TOL = 1e-9
@@ -136,104 +142,8 @@ def _structural_issues(
             )
         )
 
-    if constraints.groups and constraints.group_bounds:
-        members: dict[str, list[int]] = {}
-        for i, a in enumerate(assets):
-            g = constraints.groups.get(a)
-            if g is not None:
-                members.setdefault(g, []).append(i)
-
-        total_group_min = 0.0
-        total_group_max = 0.0
-        covered = set()
-        for group, (glo, ghi) in constraints.group_bounds.items():
-            idx = members.get(group, [])
-            if not idx:
-                issues.append(
-                    FeasibilityIssue(
-                        code="empty_group",
-                        message=(
-                            f"Group {group!r} has bounds but no assets assigned "
-                            "to it."
-                        ),
-                        suggestion=(
-                            f"Assign assets to {group!r} in the Group column, or "
-                            "remove its bounds."
-                        ),
-                        fatal=float(glo) > _TOL,
-                    )
-                )
-                continue
-            covered.update(idx)
-            member_max = float(ub[idx].sum())
-            member_min = float(lb[idx].sum())
-            if member_max < float(glo) - 1e-8:
-                issues.append(
-                    FeasibilityIssue(
-                        code="group_min_unreachable",
-                        message=(
-                            f"Group {group!r} needs at least {float(glo):.2%} but "
-                            f"its members' caps only add up to {member_max:.2%}."
-                        ),
-                        suggestion=(
-                            f"Raise the per-asset maximums inside {group!r}, or "
-                            f"lower the group minimum below {member_max:.2%}."
-                        ),
-                    )
-                )
-            if member_min > float(ghi) + 1e-8:
-                issues.append(
-                    FeasibilityIssue(
-                        code="group_max_unreachable",
-                        message=(
-                            f"Group {group!r} is capped at {float(ghi):.2%} but its "
-                            f"members' minimums already force {member_min:.2%}."
-                        ),
-                        suggestion=(
-                            f"Lower the per-asset minimums inside {group!r}, or "
-                            f"raise the group maximum above {member_min:.2%}."
-                        ),
-                    )
-                )
-            if float(glo) > float(ghi) + 1e-8:
-                issues.append(
-                    FeasibilityIssue(
-                        code="inverted_group_bounds",
-                        message=(
-                            f"Group {group!r} has a minimum ({float(glo):.2%}) above "
-                            f"its maximum ({float(ghi):.2%})."
-                        ),
-                        suggestion="Swap or correct the group's Min/Max weights.",
-                    )
-                )
-            total_group_min += float(glo)
-            total_group_max += float(ghi)
-
-        if constraints.fully_invested and covered and len(covered) == len(assets):
-            if total_group_min > 1.0 + 1e-8:
-                issues.append(
-                    FeasibilityIssue(
-                        code="group_mins_exceed_budget",
-                        message=(
-                            f"Group minimums sum to {total_group_min:.2%}, more than "
-                            "the 100% budget."
-                        ),
-                        suggestion=(
-                            "Lower the group minimums so they sum to at most 100%."
-                        ),
-                    )
-                )
-            if total_group_max < 1.0 - 1e-8:
-                issues.append(
-                    FeasibilityIssue(
-                        code="group_maxes_below_budget",
-                        message=(
-                            f"Group maximums sum to only {total_group_max:.2%}, so "
-                            "the portfolio cannot be fully invested."
-                        ),
-                        suggestion="Raise the group maximums so they sum to at least 100%.",
-                    )
-                )
+    for layer in constraints.layers:
+        issues.extend(_layer_issues(layer, constraints, assets, lb, ub))
 
     if constraints.leverage is not None and constraints.leverage < 1.0 - _TOL:
         issues.append(
@@ -247,6 +157,266 @@ def _structural_issues(
             )
         )
 
+    return issues
+
+
+def _layer_issues(
+    layer: ConstraintLayer,
+    constraints: PortfolioConstraints,
+    assets: list[str],
+    lb: np.ndarray,
+    ub: np.ndarray,
+) -> list[FeasibilityIssue]:
+    """Structural checks for one layer of the allocation policy.
+
+    Each layer is a partition of (part of) the universe with a budget per
+    bucket, so the same arithmetic applies whether the layer is asset class,
+    sub-asset class or currency. The messages name the layer, because "Group
+    'EM' is capped at 20%" is ambiguous once three layers can own a bucket
+    called EM.
+    """
+    issues: list[FeasibilityIssue] = []
+    members: dict[str, list[int]] = {}
+    for i, asset in enumerate(assets):
+        bucket = layer.assignments.get(str(asset))
+        if bucket is not None:
+            members.setdefault(bucket, []).append(i)
+
+    where = f"{layer.name} · " if layer.name else ""
+    parent_layer = None
+    parent_map: dict[str, str] = {}
+    if layer.is_relative:
+        parent_layer = resolve_parent(layer, constraints.layers)
+        if parent_layer is None:
+            return [
+                FeasibilityIssue(
+                    code="missing_parent_layer",
+                    message=(
+                        f"Layer {layer.name!r} states its limits as a share of "
+                        f"{layer.parent!r}, but there is no layer by that name."
+                    ),
+                    suggestion=(
+                        "Point the layer at an existing one, or switch its "
+                        "limits to percent-of-portfolio."
+                    ),
+                )
+            ]
+        parent_map, ambiguous = parent_bucket_map(layer, parent_layer, assets)
+        for bucket, parents in ambiguous.items():
+            issues.append(
+                FeasibilityIssue(
+                    code="ambiguous_parent_bucket",
+                    message=(
+                        f"{where}{bucket!r} is capped as a share of "
+                        f"{parent_layer.name!r}, but its assets sit in more "
+                        f"than one: {', '.join(parents)}."
+                    ),
+                    suggestion=(
+                        f"Split {bucket!r} so all its assets share a parent, or "
+                        "switch this layer to percent-of-portfolio."
+                    ),
+                )
+            )
+
+    total_min = 0.0
+    total_max = 0.0
+    covered: set[int] = set()
+    for bucket, (blo, bhi) in layer.limits.items():
+        blo, bhi = float(blo), float(bhi)
+        idx = members.get(bucket, [])
+        if not idx:
+            issues.append(
+                FeasibilityIssue(
+                    code="empty_group",
+                    message=(
+                        f"{where}{bucket!r} has limits but no assets assigned "
+                        "to it."
+                    ),
+                    suggestion=(
+                        f"Assign assets to {bucket!r}, or remove its limits."
+                    ),
+                    fatal=blo > _TOL,
+                )
+            )
+            continue
+        covered.update(idx)
+        if blo > bhi + 1e-8:
+            issues.append(
+                FeasibilityIssue(
+                    code="inverted_group_bounds",
+                    message=(
+                        f"{where}{bucket!r} has a minimum ({blo:.2%}) above its "
+                        f"maximum ({bhi:.2%})."
+                    ),
+                    suggestion="Swap or correct that bucket's Min/Max weights.",
+                )
+            )
+
+        if layer.is_relative:
+            if bhi > 1.0 + 1e-8:
+                issues.append(
+                    FeasibilityIssue(
+                        code="relative_cap_above_parent",
+                        message=(
+                            f"{where}{bucket!r} is capped at {bhi:.0%} of its "
+                            "parent, which is more than the whole parent."
+                        ),
+                        suggestion=(
+                            "A share-of-parent cap above 100% never binds; "
+                            "lower it or switch the layer to "
+                            "percent-of-portfolio."
+                        ),
+                        fatal=False,
+                    )
+                )
+            continue
+
+        member_max = float(ub[idx].sum())
+        member_min = float(lb[idx].sum())
+        if member_max < blo - 1e-8:
+            issues.append(
+                FeasibilityIssue(
+                    code="group_min_unreachable",
+                    message=(
+                        f"{where}{bucket!r} needs at least {blo:.2%} but its "
+                        f"members' caps only add up to {member_max:.2%}."
+                    ),
+                    suggestion=(
+                        f"Raise the per-asset maximums inside {bucket!r}, or "
+                        f"lower its minimum below {member_max:.2%}."
+                    ),
+                )
+            )
+        if member_min > bhi + 1e-8:
+            issues.append(
+                FeasibilityIssue(
+                    code="group_max_unreachable",
+                    message=(
+                        f"{where}{bucket!r} is capped at {bhi:.2%} but its "
+                        f"members' minimums already force {member_min:.2%}."
+                    ),
+                    suggestion=(
+                        f"Lower the per-asset minimums inside {bucket!r}, or "
+                        f"raise its maximum above {member_min:.2%}."
+                    ),
+                )
+            )
+        total_min += blo
+        total_max += bhi
+
+    if layer.is_relative:
+        issues.extend(_relative_layer_issues(layer, parent_map, constraints, assets))
+        return issues
+
+    if constraints.fully_invested and covered and len(covered) == len(assets):
+        if total_min > 1.0 + 1e-8:
+            issues.append(
+                FeasibilityIssue(
+                    code="group_mins_exceed_budget",
+                    message=(
+                        f"{where}bucket minimums sum to {total_min:.2%}, more "
+                        "than the 100% budget."
+                    ),
+                    suggestion=(
+                        "Lower the minimums on this layer so they sum to at "
+                        "most 100%."
+                    ),
+                )
+            )
+        if total_max < 1.0 - 1e-8:
+            issues.append(
+                FeasibilityIssue(
+                    code="group_maxes_below_budget",
+                    message=(
+                        f"{where}bucket maximums sum to only {total_max:.2%}, "
+                        "so the portfolio cannot be fully invested."
+                    ),
+                    suggestion=(
+                        "Raise the maximums on this layer so they sum to at "
+                        "least 100%, or leave some assets out of it."
+                    ),
+                )
+            )
+    return issues
+
+
+def _relative_layer_issues(
+    layer: ConstraintLayer,
+    parent_map: dict[str, str],
+    constraints: PortfolioConstraints,
+    assets: list[str],
+) -> list[FeasibilityIssue]:
+    """Whether a percent-of-parent layer can fill its parent at all.
+
+    Sub-buckets that cap out below 100% of the parent while covering all of it
+    do not make the problem infeasible — the parent simply cannot be filled —
+    but that is almost always a typo (30/30 inside a sleeve the allocator
+    means to fill), so it is reported as a warning with the arithmetic shown.
+    """
+    issues: list[FeasibilityIssue] = []
+    if constraints.long_only is False:
+        issues.append(
+            FeasibilityIssue(
+                code="relative_layer_shorts",
+                message=(
+                    f"Layer {layer.name!r} is a share of its parent while short "
+                    "positions are allowed."
+                ),
+                suggestion=(
+                    "A share-of-parent limit assumes the parent sleeve is "
+                    "positive; with shorts it can invert. Use "
+                    "percent-of-portfolio limits instead."
+                ),
+                fatal=False,
+            )
+        )
+    by_parent: dict[str, list[str]] = {}
+    for bucket, up in parent_map.items():
+        if bucket in layer.limits:
+            by_parent.setdefault(up, []).append(bucket)
+    parent_layer = resolve_parent(layer, constraints.layers)
+    for up, children in by_parent.items():
+        covers_parent = parent_layer is not None and all(
+            layer.assignments.get(str(a)) in layer.limits
+            for a in assets
+            if parent_layer.assignments.get(str(a)) == up
+        )
+        if not covers_parent:
+            continue
+        cap_total = sum(float(layer.limits[c][1]) for c in children)
+        floor_total = sum(float(layer.limits[c][0]) for c in children)
+        if cap_total < 1.0 - 1e-8:
+            issues.append(
+                FeasibilityIssue(
+                    code="relative_caps_below_parent",
+                    message=(
+                        f"Inside {up!r}, the {layer.name} caps sum to "
+                        f"{cap_total:.0%} of the sleeve, so at most that much "
+                        "of it can be filled."
+                    ),
+                    suggestion=(
+                        f"Raise the {layer.name} caps inside {up!r} so they sum "
+                        "to at least 100%, or lower the cap on "
+                        f"{up!r} itself to match."
+                    ),
+                    fatal=False,
+                )
+            )
+        if floor_total > 1.0 + 1e-8:
+            issues.append(
+                FeasibilityIssue(
+                    code="relative_floors_exceed_parent",
+                    message=(
+                        f"Inside {up!r}, the {layer.name} minimums sum to "
+                        f"{floor_total:.0%} of the sleeve — more than the "
+                        "sleeve itself."
+                    ),
+                    suggestion=(
+                        f"Lower the {layer.name} minimums inside {up!r} so they "
+                        "sum to at most 100%."
+                    ),
+                )
+            )
     return issues
 
 

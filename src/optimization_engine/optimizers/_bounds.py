@@ -10,7 +10,7 @@ unconstrained answer into the mandate. Two routines do that here:
   the mandate allows.
 * :func:`project_to_bounds_iterated` handles per-asset bounds and the budget
   only, by clipping and redistributing. It is the cheaper path taken when no
-  group budgets are set, and it cannot see them at all.
+  layered budgets are set, and it cannot see them at all.
 """
 
 from __future__ import annotations
@@ -100,9 +100,10 @@ def project_to_constraints(
 
     Solves ``min ‖x − w‖²`` subject to the full constraint set. Where
     :func:`project_to_bounds_iterated` can only clip and redistribute — and is
-    blind to group budgets, so a 1/N book quietly ends up over its
-    alternatives cap — this respects every linear constraint at once while
-    staying as close as possible to the method's own allocation.
+    blind to bucket budgets, so a 1/N book quietly ends up over its
+    alternatives cap — this respects every linear constraint at once, on every
+    layer of the policy, while staying as close as possible to the method's own
+    allocation.
 
     Args:
         w: The unconstrained allocation.
@@ -128,7 +129,7 @@ def project_to_constraints(
     w = np.asarray(w, dtype=float).flatten()
     lb, ub = bounds_arrays(assets, constraints)
 
-    has_groups = bool(constraints.groups and constraints.group_bounds)
+    has_groups = constraints.has_layer_limits
     has_active_share = constraints.max_active_share is not None
     if not (has_groups or has_active_share):
         projected = project_to_bounds_iterated(w, lb, ub)
@@ -150,7 +151,7 @@ def project_to_constraints(
     except SolverFailure as exc:
         raise InfeasibleBoundsError(
             "No allocation satisfies the weight bounds, the budget and the "
-            f"group budgets at once. ({exc})"
+            f"layered bucket budgets at once. ({exc})"
         ) from exc
 
     return projected, float(np.abs(projected - w).sum()) / 2.0

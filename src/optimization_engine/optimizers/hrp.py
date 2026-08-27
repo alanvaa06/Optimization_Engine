@@ -115,14 +115,14 @@ class HRPOptimizer(BaseOptimizer):
             raise ValueError(
                 "HRP needs at least 2 assets to build a cluster tree."
             )
-        if self.constraints.group_bounds and self.constraints.groups:
+        if self.constraints.has_layer_limits:
             warnings.warn(
                 "HRP allocates down its own correlation-derived hierarchy, "
-                "which generally disagrees with a hand-specified grouping. The "
-                "group budgets will be met by projecting the result onto the "
-                "constraint set, which moves it away from HRP's own answer — "
-                "use risk_parity or mean_variance to have them enforced inside "
-                "the solve.",
+                "which generally disagrees with a hand-specified one. The "
+                "layered bucket budgets will be met by projecting the result "
+                "onto the constraint set, which moves it away from HRP's own "
+                "answer — use risk_parity or mean_variance to have them "
+                "enforced inside the solve.",
                 stacklevel=3,
             )
         if (np.array([self.constraints.get_bounds(a)[0] for a in self.assets]) < 0).any():

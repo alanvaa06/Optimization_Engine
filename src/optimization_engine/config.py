@@ -16,6 +16,7 @@ from typing import Any, Literal
 import yaml
 
 from optimization_engine.benchmark import BenchmarkSpec
+from optimization_engine.constraints import ConstraintLayer, coerce_layers
 
 
 @dataclass
@@ -92,7 +93,15 @@ class EngineConfig:
         expected_returns: Expected (annual) return per asset.
         bounds: Min/max weight per asset, as ``[lo, hi]`` pairs.
         groups: Optional ``asset -> group`` mapping (e.g. asset class).
+            This is the first layer of the allocation policy.
         group_bounds: Optional ``group -> [lo, hi]`` pairs.
+        constraint_layers: Further layers of the policy, applied on top of
+            ``groups``/``group_bounds`` and simultaneously with it — a
+            sub-asset-class breakdown inside each asset class, a currency
+            split cutting across all of them, a regional overlay. Each layer
+            maps assets to buckets and caps each bucket, either as a share of
+            the whole book or as a share of its parent layer's bucket. See
+            :mod:`optimization_engine.constraints`.
         periods_per_year: Number of return observations per year.
         covariance_method: ``sample``, ``ledoit_wolf``, ``oas``,
             ``shrink`` (Ledoit-Wolf via riskfolio when available),
@@ -149,6 +158,7 @@ class EngineConfig:
     bounds: dict[str, list[float]] = field(default_factory=dict)
     groups: dict[str, str] = field(default_factory=dict)
     group_bounds: dict[str, list[float]] = field(default_factory=dict)
+    constraint_layers: list[ConstraintLayer] = field(default_factory=list)
     currencies: dict[str, str] = field(default_factory=dict)
     base_currency: str = "USD"
     periods_per_year: int = 252
@@ -174,6 +184,9 @@ class EngineConfig:
     leverage: float | None = None
     previous_weights: dict[str, float] | None = None
     turnover_limit: float | None = None
+
+    def __post_init__(self) -> None:
+        self.constraint_layers = list(coerce_layers(self.constraint_layers))
 
     @property
     def assets(self) -> list[str]:
@@ -211,6 +224,7 @@ class EngineConfig:
             "bounds": {k: list(v) for k, v in self.bounds.items()},
             "groups": dict(self.groups),
             "group_bounds": {k: list(v) for k, v in self.group_bounds.items()},
+            "constraint_layers": [lyr.to_dict() for lyr in self.constraint_layers],
             "currencies": dict(self.currencies),
             "base_currency": self.base_currency,
             "periods_per_year": self.periods_per_year,
@@ -248,6 +262,7 @@ class EngineConfig:
             bounds={k: list(v) for k, v in (data.get("bounds") or {}).items()},
             groups=dict(data.get("groups") or {}),
             group_bounds={k: list(v) for k, v in (data.get("group_bounds") or {}).items()},
+            constraint_layers=list(coerce_layers(data.get("constraint_layers"))),
             currencies=dict(data.get("currencies") or {}),
             base_currency=str(data.get("base_currency", "USD")).upper(),
             periods_per_year=int(data.get("periods_per_year", 252)),

@@ -284,6 +284,7 @@ def _cmd_optimize(args: argparse.Namespace) -> int:
             f"{run.diagnostics.effective_n:.1f} · diversification ratio "
             f"{run.diagnostics.diversification_ratio:.2f}"
         )
+    _report_layer_exposures(run)
     performance = _report_versus_benchmark(run, config)
 
     sheets = run_sheets(
@@ -364,6 +365,28 @@ def _apply_benchmark_flags(
         config.max_tracking_error = float(args.max_tracking_error)
     if getattr(args, "max_active_share", None) is not None:
         config.max_active_share = float(args.max_active_share)
+
+
+def _report_layer_exposures(run) -> None:
+    """Print each layer's bucket exposures next to their caps.
+
+    Only the bucket that is *binding* explains the allocation, so the marker
+    goes there: an allocator scanning the output should be able to see which
+    line of the policy produced the portfolio without opening the workbook.
+    """
+    exposures = run.layer_exposures()
+    if exposures.empty:
+        return
+    for layer_name, block in exposures.groupby("layer", sort=False):
+        print(f"  {layer_name}:")
+        for _, row in block.iterrows():
+            limits = ""
+            if pd.notna(row["effective_max"]):
+                limits = f" / cap {row['effective_max']:.1%}"
+                if row["basis"] == "parent":
+                    limits += f" ({row['max']:.0%} of {row['parent']})"
+            mark = "  ←binding" if row["binding"] else ""
+            print(f"    {row['bucket']:<24} {row['weight']:>7.2%}{limits}{mark}")
 
 
 def _report_versus_benchmark(run, config):

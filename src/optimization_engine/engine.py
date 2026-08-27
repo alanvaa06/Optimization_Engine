@@ -33,6 +33,7 @@ from optimization_engine.benchmark import (
     resolve_benchmark,
 )
 from optimization_engine.config import EngineConfig
+from optimization_engine.constraints import effective_layers, layer_exposures
 from optimization_engine.data.covariance import (
     CovarianceDiagnostics,
     covariance_diagnostics,
@@ -122,6 +123,47 @@ class EngineRun:
         """Risk shares aggregated to asset-class level."""
         return group_risk_contribution(
             self.result.weights, self.cov_matrix, self.config.groups
+        )
+
+    @property
+    def constraint_layers(self):
+        """Every layer of the allocation policy this run was solved under."""
+        return effective_layers(self.config)
+
+    def layer_exposures(self) -> pd.DataFrame:
+        """Realized exposure of every bucket, on every layer, against its limit.
+
+        The table an allocator reads to see *which* part of the policy is
+        binding: a book that stops at 60% equity because the asset-class cap
+        says so is a different portfolio from one that stops there because the
+        EM sub-limit ran out, and only the headroom column tells them apart.
+        """
+        return layer_exposures(self.result.weights, self.constraint_layers)
+
+    def layer_risk_contributions(self, layer: str | None = None) -> pd.Series:
+        """Share of portfolio risk carried by each bucket of one layer.
+
+        Weight limits are set on capital, but the thing they are trying to
+        control is risk, and the two diverge sharply — a 30% fixed-income
+        sleeve rarely carries 30% of the risk. Defaults to the first layer.
+
+        Raises:
+            ValueError: When the run has no layers, or none by that name.
+        """
+        layers = self.constraint_layers
+        if not layers:
+            raise ValueError(
+                "This run has no allocation layers, so there are no buckets "
+                "to attribute risk to."
+            )
+        chosen = next(
+            (lyr for lyr in layers if layer is None or lyr.name == layer), None
+        )
+        if chosen is None:
+            names = ", ".join(lyr.name for lyr in layers)
+            raise ValueError(f"No layer named {layer!r}. Available: {names}.")
+        return group_risk_contribution(
+            self.result.weights, self.cov_matrix, chosen.assignments
         )
 
     def diversification(self, model: str = "minimum_torsion"):
@@ -476,6 +518,16 @@ class EngineRun:
             ),
             "max_tracking_error": self.config.max_tracking_error,
             "max_active_share": self.config.max_active_share,
+            "constraint_layers": (
+                "; ".join(
+                    f"{lyr.name} ({len(lyr.limits)} buckets"
+                    + (f", % of {lyr.parent}" if lyr.is_relative else "")
+                    + ")"
+                    for lyr in self.constraint_layers
+                    if lyr.is_active
+                )
+                or "—"
+            ),
             "solver": self.result.extras.get("solver"),
             "solver_status": self.result.extras.get("solver_status"),
         }
