@@ -50,6 +50,12 @@ from components import (  # noqa: E402
     render_portfolio_diagnostics,
     render_projection_distance,
 )
+from layer_editor import (  # noqa: E402
+    current_layers,
+    render_layer_builder,
+    render_layer_exposures,
+    seed_layers_from_config,
+)
 
 from optimization_engine.analytics.performance import rolling_metrics, summary_stats  # noqa: E402
 from optimization_engine.analytics.relative import (  # noqa: E402
@@ -206,6 +212,9 @@ def _seed_table_from_config(cfg) -> None:
     st.session_state.asset_currency = {
         a: str(cfg.currencies.get(a, cfg.base_currency)) for a in assets
     }
+    # The saved mandate, not an empty builder: a scenario is only reproducible
+    # if its layered limits come back with it.
+    seed_layers_from_config(cfg)
     if getattr(cfg.optimizer, "risk_budget", None):
         st.session_state.risk_budget = pd.DataFrame(
             {"Risk Budget": pd.Series(cfg.optimizer.risk_budget)}
@@ -1203,8 +1212,15 @@ with tab_constraints:
         a: str(edited.loc[a, "Currency"]) for a in returns.columns
     }
 
+    asset_groups = {a: str(edited.loc[a, "Group"]) for a in returns.columns}
+
     if ws["group_bounds"]["enabled"]:
-        st.markdown("**Group (asset-class) constraints**")
+        st.divider()
+        st.markdown("**Layer 1 · Asset-class budgets**")
+        st.caption(
+            "One row per value in the Group column above. Leave a row at "
+            "0.00–1.00 to leave that asset class uncapped."
+        )
         unique_groups = sorted(edited["Group"].dropna().unique().tolist())
         if unique_groups:
             gb_default = pd.DataFrame(
@@ -1225,9 +1241,25 @@ with tab_constraints:
                     ),
                 },
             )
+
+        base_limits = {}
+        if "group_bounds" in st.session_state:
+            base_limits = {
+                str(g): (float(row["Min Weight"]), float(row["Max Weight"]))
+                for g, row in st.session_state.group_bounds.iterrows()
+            }
+        st.divider()
+        render_layer_builder(
+            list(returns.columns),
+            groups=asset_groups,
+            currencies=dict(st.session_state.asset_currency),
+            base_currency=base_currency,
+            base_layer_limits=base_limits,
+        )
     else:
         st.caption(
-            f"_{req.display_name} does not enforce group bounds — editor hidden._"
+            f"_{req.display_name} does not enforce group or layered bucket "
+            "budgets — the editors are hidden._"
         )
 
     if optimizer_name == "risk_parity":
@@ -1586,6 +1618,7 @@ def _build_config() -> EngineConfig:
         bounds=bounds,
         groups=groups,
         group_bounds=group_bounds,
+        constraint_layers=current_layers(list(returns.columns)),
         currencies=dict(st.session_state.asset_currency),
         base_currency=base_currency,
         periods_per_year=int(periods_per_year),
@@ -1764,6 +1797,7 @@ with tab_optimize:
         )
         render_portfolio_diagnostics(run.diagnostics)
         render_projection_distance(run.result)
+        render_layer_exposures(run)
 
         if run.benchmark is not None and run.benchmark.weights is not None:
             st.markdown("**Against the benchmark, before the fact**")
@@ -1866,12 +1900,24 @@ with tab_optimize:
                 "`contribution` is in annualized volatility units and sums "
                 f"exactly to the portfolio's {run.result.expected_volatility:.2%}."
             )
-            groups_rc = run.group_risk_contributions()
-            if len(groups_rc) > 1:
-                st.markdown("**Risk by group**")
+            # Weight limits are set on capital; what they are trying to
+            # control is risk. Showing both per layer is what makes the gap
+            # visible — a 30% bond sleeve rarely carries 30% of the risk.
+            for _layer in run.constraint_layers:
+                try:
+                    _rc = run.layer_risk_contributions(_layer.name)
+                except ValueError:
+                    continue
+                if len(_rc) < 2:
+                    continue
+                _frame = _rc.to_frame("Share of risk")
+                _frame["Weight"] = (
+                    run.result.weights.groupby(_layer.assignments).sum()
+                )
+                st.markdown(f"**Risk by {_layer.name.lower()}**")
                 st.dataframe(
-                    groups_rc.to_frame("Share of risk").style.format(
-                        {"Share of risk": "{:.2%}"}
+                    _frame[["Weight", "Share of risk"]].style.format(
+                        {"Weight": "{:.2%}", "Share of risk": "{:.2%}"}
                     ),
                     width="stretch",
                 )
