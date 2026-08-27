@@ -7,12 +7,13 @@ The engine is opinionated about one thing: **an allocation is not a result
 until you can see what it rests on.** Every solve returns the weights *and*
 the evidence — which solver answered, whether the constraints were actually
 respected, how well-conditioned the covariance estimate was, how concentrated
-the book is in risk rather than capital, and how much of the backtest
-survives out of sample.
+the book is in risk rather than capital, how much of the backtest survives out
+of sample, and how much of *that* survives the number of configurations you
+tried before settling on this one.
 
 ![The Optimize tab: compliance banner, concentration diagnostics, allocation and risk decomposition](docs/images/app-optimize.png)
 
-## The four questions it answers
+## The five questions it answers
 
 ### 1. Where does this portfolio sit, and what else was available?
 
@@ -57,6 +58,30 @@ walk-forward.**
 
 ![In-sample and out-of-sample wealth curves diverging over time](docs/images/walk-forward.png)
 
+### 5. Is any of that real, or did you try forty things and report the best?
+
+A library with ten methods, six covariance estimators and a grid of
+constraints makes it easy to run forty configurations and present the winner.
+The maximum of forty noisy estimates is a biased estimate of the best true
+value, and nothing about that bias shows up in the number itself.
+
+Take 50 strategies drawn from the *same zero-mean distribution* — no skill
+anywhere. The best posts an annualized Sharpe of 1.24, and the probabilistic
+Sharpe ratio calls it significant at 99.3%. Deflate it for the fact that it was
+the best of 50 and it drops to **45.9%**: a coin flip, which is what it is.
+
+`optengine optimize --trials 40` makes that declaration part of the run, and
+`probability_of_backtest_overfitting()` asks the complementary question — across
+every balanced split of the sample, how often does the in-sample winner land
+below the out-of-sample median?
+
+There is a prior question too, which `monte_carlo_optimization_selection()`
+answers: given a universe like this one and a sample this long, which method
+can be trusted to find the right answer at all? On the sample panel a direct
+mean-variance solve misplaces its weights by 14.8% RMSE between simulated
+histories drawn from the same distribution. Nested Clustered Optimization
+misplaces them by 0.01%.
+
 *Every figure above is produced by `python scripts/render_docs_images.py` from
 the built-in sample dataset, using the same plotting code the app calls — so
 what the README shows is what the library draws.*
@@ -65,6 +90,7 @@ what the README shows is what the library draws.*
 
 **Optimization techniques**
 
+
 | Method | Class | When to use |
 | --- | --- | --- |
 | Mean-variance (target return / vol / utility) | `MeanVarianceOptimizer` | Classic Markowitz with full constraints |
@@ -72,8 +98,11 @@ what the README shows is what the library draws.*
 | Maximum Sharpe ratio | `MaxSharpeOptimizer` | Tangency portfolio, sized separately against cash |
 | Risk parity / risk budgeting (ERC) | `RiskParityOptimizer` | Spread *risk* evenly, not capital |
 | Hierarchical Risk Parity (HRP) | `HRPOptimizer` | Many assets, ill-conditioned covariance, small T/N |
+| Hierarchical Equal Risk Contribution (HERC) | `HERCOptimizer` | HRP's robustness, but splitting at the tree's own branches — and optionally on drawdown or tail risk |
+| Nested Clustered Optimization (NCO) | `NCOOptimizer` | Mean-variance keeps producing corner solutions on a correlated universe |
 | Black-Litterman | `BlackLittermanOptimizer` | A few specific views on top of equilibrium |
 | Mean-CVaR (Rockafellar-Uryasev) | `CVaROptimizer` | Skewed or fat-tailed returns; variance is the wrong measure |
+| Mean-CDaR (Chekhlov-Uryasev) | `CDaROptimizer` | The mandate is written in drawdown terms — a stop-loss, a high-water mark |
 | Maximum diversification | `MaxDiversificationOptimizer` | Correlation benefit as the objective |
 | Inverse volatility | `InverseVolatilityOptimizer` | Cheap risk-parity approximation |
 | Equal weight (1/N) | `EqualWeightOptimizer` | The baseline everything else has to beat |
@@ -102,12 +131,35 @@ constraint and any breach is reported.
 **Covariance estimators**
 
 `sample`, `ledoit_wolf`, `oas`, `ewma` (RiskMetrics), `semi`,
-`shrink` (riskfolio passthrough when installed).
+`shrink` (riskfolio passthrough when installed), and `denoised`.
 
 Every estimate is symmetrized and PSD-repaired, and comes with diagnostics:
 observations per asset, condition number, smallest eigenvalue, and effective
 sample size — with a warning when the estimate is too thin or too
 ill-conditioned to optimize against.
+
+Shrinkage pulls the whole matrix toward a target, attenuating signal and noise
+alike. **Denoising** (López de Prado, 2020) is a sharper instrument: fit the
+Marchenko-Pastur law to the eigenvalue spectrum, replace the eigenvalues below
+the noise edge λ₊ with their average, and leave the factor eigenvectors
+untouched. **Detoning** additionally strips the market eigenvector, which is
+what the clustering methods want to see — with the market component in place
+every pair of equities looks alike and the hierarchy degenerates.
+
+Both compose with any estimator (`covariance_matrix(..., denoise=True,
+detone=1)`), and both report what they found rather than what they hoped for:
+
+```
+Marchenko-Pastur fit on 2015 observations of 13 assets (T/N = 155.0) put the
+noise edge at λ₊ = 1.167. 2 of 13 eigenvalues sit above it, carrying 62.9% of
+total variance. The correlation's condition number went 18.4 → 11.2; the
+covariance's went 1.25e+04 → 1.23e+04 — so this covariance's conditioning is
+driven by the spread of the volatilities, not by correlation noise, and no
+eigenvalue filter will improve it.
+```
+
+That last clause is the honest half. Denoising did what it claims and this
+panel's problem was somewhere else.
 
 **Expected returns**
 
@@ -127,6 +179,50 @@ benchmark-relative statistics: tracking error, information ratio, CAPM alpha
 with its t-statistic and R², up/down capture, conditional (up/down) beta, and
 active share.
 
+**How many bets is this, really?**
+
+Effective N counts positions and effective N of risk counts risk shares, but
+both are computed asset by asset — so neither notices that ten European bank
+stocks are one bet. Meucci's effective number of bets rotates the portfolio
+into *uncorrelated* factors first. The two available rotations disagree, and
+the disagreement is the diagnostic. An equal-weight book on the sample panel:
+
+| Rotation | Effective bets | Largest single bet |
+| --- | --- | --- |
+| Minimum torsion | 9.78 of 13 | 15% |
+| PCA | 1.56 of 13 | 89% |
+
+Thirteen distinct, nameable positions; one dominant driver. `run.diversification_comparison()`
+reports both, because neither is "the" answer — PCA measures how much
+independent variation you are exposed to, minimum torsion how many distinct
+positions you take.
+
+**Active management (Grinold-Kahn)**
+
+For a portfolio measured against a benchmark, the engine computes the pieces of
+the fundamental law `IR ≈ TC · IC · √BR`:
+
+* The **information coefficient** from a forecast panel, with the t-statistic
+  that says whether the skill is distinguishable from zero.
+* The **transfer coefficient** — how much of the forecast survived the mandate.
+  The engine knows exactly which constraints were applied and what the
+  unconstrained answer would have been, so this is a measurement rather than an
+  estimate. A transfer coefficient of 0.35 says two thirds of the skill is
+  being absorbed by the constraints, which points at a different fix than "get
+  better signals".
+* **Grinold's alpha**, `α = IC · σ · z`, which turns a score into a defensible
+  expected return. With an IC of 0.05, a two-standard-deviation view on a
+  20%-vol asset is worth 2% — not the 10% that gets typed into a spreadsheet,
+  and the difference is exactly what stops mean-variance cornering.
+* **Risk-aversion calibration**, `λ_A = IR / (2ψ*)`: a tracking-error budget
+  and a believed information ratio imply the utility coefficient, rather than
+  it being guessed.
+* The Euler decomposition of **tracking error**, which disagrees with the
+  absolute one precisely on the large benchmark positions that carry plenty of
+  risk and no *active* risk at all.
+* `implied_breadth()` run backwards is a plausibility check: an IR of 1.0 on an
+  IC of 0.03 needs 1,111 independent bets a year.
+
 **Estimation error**
 
 The engine spends a lot of effort saying that expected returns and
@@ -144,6 +240,44 @@ leave it there:
   averaging weights across draws at each frontier rank, which lifts the mean
   effective N from 3.3 to 5.2 on the sample panel because the optimizer stops
   acting on differences the data cannot resolve.
+* `monte_carlo_optimization_selection()` asks the prior question: given a
+  universe like this one and a sample this long, *which method can be trusted
+  to find the right answer at all?* It declares the fitted `μ` and `Σ` to be
+  the truth, draws synthetic histories from them, re-estimates and re-solves on
+  each, and measures how far each method lands from the answer that truth
+  implies (López de Prado, 2019). Over 20 draws on the sample panel:
+
+  | Method | Weight RMSE | Worst single position |
+  | --- | --- | --- |
+  | `nco` | 0.01% | 0.01% |
+  | `herc` | 0.02% | 0.05% |
+  | `hrp` | 0.05% | 0.13% |
+  | `min_variance` | 0.59% | 1.51% |
+  | `mean_variance` | **14.79%** | **35.53%** |
+
+  Each method is scored against *its own* answer on the truth, not a common
+  one — the question is estimation stability, not which objective is right.
+
+**Selection bias**
+
+Running forty configurations and reporting the best one is easy in a library
+with ten methods, six covariance estimators and a grid of constraints. The
+maximum of forty noisy estimates is a biased estimate of the best true value,
+and nothing about that bias is visible in the number itself.
+
+* `deflated_sharpe_ratio()` (Bailey & López de Prado, 2014) deflates against
+  the expected maximum across the trials you actually ran, adjusted for skew
+  and kurtosis. Take 50 strategies drawn from the *same zero-mean
+  distribution*: the best posts an annualized Sharpe of 1.24 and a
+  probabilistic Sharpe of 99.3%. Its deflated Sharpe is **45.9%**.
+* `minimum_track_record_length()` says how much history you would need before
+  the observed Sharpe is significant. Usually a bracing answer.
+* `probability_of_backtest_overfitting()` implements CSCV: across every
+  balanced split of the sample, how often does the in-sample winner land below
+  the out-of-sample median? Above ~50% your selection process is a coin flip.
+
+`optengine optimize --trials 40` makes the declaration explicit. The default of
+1 is a claim, and the output says so.
 
 **Backtesting**
 
@@ -193,18 +327,21 @@ flowchart TD
 ```
 src/optimization_engine/
 ├── analytics/        # performance · risk · relative · backtest
-├── data/             # loaders · covariance · data-quality analysis
+│                     # active (Grinold-Kahn) · diversification (Meucci)
+│                     # selection (deflated Sharpe · PBO)
+├── data/             # loaders · covariance · denoising · data-quality
 ├── optimizers/       # one file per technique + diagnostics + feasibility
 ├── reporting/        # Excel exporter + Plotly figures
 ├── config.py         # YAML/JSON-driven config
 ├── engine.py         # high-level façade (run_engine)
 ├── frontier.py       # efficient frontier sweep
-├── resampling.py     # bootstrap bands + Michaud resampling
+├── resampling.py     # bootstrap bands · Michaud resampling · MCOS
 └── cli.py            # `optengine` entrypoint
 app/
 ├── streamlit_app.py  # interactive UI
 └── components.py     # reusable render blocks
 config/               # example configs
+docs/RESEARCH.md      # the literature behind the methods, and what was left out
 docs/images/          # README figures (regenerate with scripts/)
 notebooks/            # quickstart notebook
 scripts/              # batch runners + docs-figure renderer
@@ -244,9 +381,10 @@ could make the next one wrong.
    drawdown-episode table with peak, trough, recovery and time underwater.
 3. **Assumptions & constraints** — editable expected returns, weight bounds,
    groups, group budgets, per-method inputs (risk budgets, Black-Litterman
-   views both absolute and relative), and a **live feasibility check** that
-   names the constraint making the problem impossible and what to change,
-   before you ever press solve.
+   views both absolute and relative, cluster counts and linkage for HERC/NCO,
+   the CDaR tail), the covariance estimator with its **denoising and detoning**
+   toggles, and a **live feasibility check** that names the constraint making
+   the problem impossible and what to change, before you ever press solve.
 
    ![The constraints tab, with the method card and the live feasibility check](docs/images/app-constraints.png)
 4. **Optimize** — a compliance banner, KPI cards, concentration and
@@ -281,6 +419,11 @@ optengine check --config config/example_multi_asset.yaml --sample
 # Solve, and refuse rather than fail obscurely if the mandate is impossible.
 optengine optimize --config config/example_multi_asset.yaml --sample \
     --frontier --resample 50 --walk-forward --cost-bps 10 --strict
+
+# Filter the covariance's noise eigenvalues, declare how many configurations
+# you tried, and rank the methods by how reliably each recovers the truth.
+optengine optimize --config config/example_multi_asset.yaml --sample \
+    --denoise --walk-forward --trials 40 --mcos 20
 ```
 
 `check` exits non-zero when the data has errors or the constraints have no
@@ -314,6 +457,47 @@ print(run.risk_decomposition())       # contributions in volatility units
 # What survives out of sample?
 wf = run.walk_forward(transaction_cost_bps=10)
 print(run.in_vs_out_of_sample(wf))
+
+# ...and how much of *that* is the forty configurations you tried first?
+from optimization_engine import deflated_sharpe_ratio
+print(deflated_sharpe_ratio(wf.returns, n_trials=40).describe())
+
+# How many bets is this, once correlations are accounted for?
+print(run.diversification_comparison())
+```
+
+Which method should you even be using? Measure it rather than argue about it:
+
+```python
+from optimization_engine import monte_carlo_optimization_selection
+
+selection = monte_carlo_optimization_selection(
+    returns, config,
+    methods=("mean_variance", "min_variance", "hrp", "herc", "nco"),
+    n_simulations=20,
+)
+print(selection.describe())
+print(selection.ranking())
+```
+
+For a benchmark-relative mandate, the Grinold-Kahn diagnostics:
+
+```python
+from optimization_engine import fundamental_law, grinold_alpha
+
+config.benchmark_weights = {c: 1 / len(returns.columns) for c in returns.columns}
+run = run_engine(returns, config)
+
+# Needs an expected-return vector that actually varies across assets — a flat
+# one carries no cross-sectional view, and the engine says so rather than
+# returning a NaN you find out about later.
+tc = run.transfer_coefficient()               # how much survived the mandate
+print(fundamental_law(0.05, breadth=200, transfer_coefficient=tc).describe())
+print(run.active_risk_decomposition())        # tracking error, not total risk
+
+# Turn scores into expected returns you can defend. `scores` is your own
+# cross-sectionally z-scored forecast; `residual_vol` is per-asset volatility.
+alphas = grinold_alpha(scores, residual_vol, information_coefficient=0.05)
 ```
 
 Relative (spread) Black-Litterman views:
@@ -350,6 +534,26 @@ optimizer, frontier monotonicity and reachability, ERC properties,
 Black-Litterman blending with absolute and relative views, constraint
 compliance, feasibility diagnosis, backtest drift/costs, walk-forward
 look-ahead safety, data-quality detection, and the CLI's exit codes.
+
+The methods added in 0.3 are tested against the claims that justify them, not
+just for smoke: that the Marchenko-Pastur fit recovers a known number of
+planted factors and improves conditioning while leaving the dominant
+eigenvector alone; that the cluster search recovers a known block structure;
+that NCO's weights move less than a direct solve's between two halves of the
+same generated history; that mean-CDaR beats equal weight on realized maximum
+drawdown; that the deflated Sharpe rejects the best of fifty skill-free
+strategies while the probabilistic Sharpe accepts it; that the transfer
+coefficient is exactly 1 for the unconstrained optimum, −1 for its negative,
+and invariant to gearing; and that the minimum-torsion factors are uncorrelated
+to machine precision.
+
+## Where the methods come from
+
+[`docs/RESEARCH.md`](docs/RESEARCH.md) is the reading behind these methods: what
+López de Prado, Cajas, Grinold & Kahn, Meucci, Raffinot and the rest actually
+claim, which of it this engine implements, and — the part usually left out —
+which of it was read and deliberately deferred, with the reason. If you want to
+know why there is no EVaR here yet, that is where it says so.
 
 ## License
 

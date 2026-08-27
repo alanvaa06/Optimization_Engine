@@ -114,6 +114,57 @@ _HRP_LINKAGE = ExtraInput(
     choices=("single", "average", "complete", "ward"),
     help="Hierarchical clustering linkage rule.",
 )
+_CLUSTER_LINKAGE = ExtraInput(
+    key="cluster_linkage", label="Linkage method",
+    kind="choice", required=False, default="ward",
+    choices=("single", "average", "complete", "ward"),
+    help=(
+        "Linkage rule for the dendrogram. Ward, not single: these methods "
+        "partition the tree rather than merely order it, and single linkage "
+        "chains into one dominant cluster."
+    ),
+)
+_N_CLUSTERS = ExtraInput(
+    key="n_clusters", label="Number of clusters",
+    kind="scalar", required=False, default=None,
+    help=(
+        "Force a cluster count. Empty selects it by maximizing the silhouette "
+        "t-statistic — the ONC criterion."
+    ),
+)
+_MAX_CLUSTERS = ExtraInput(
+    key="max_clusters", label="Maximum clusters to consider",
+    kind="scalar", required=False, default=None,
+    help="Upper bound of the cluster-count search. Defaults to min(10, N-1).",
+)
+_HERC_RISK_MEASURE = ExtraInput(
+    key="herc_risk_measure", label="Cluster risk measure",
+    kind="choice", required=False, default="variance",
+    choices=("variance", "std", "cvar", "cdar", "equal_weight"),
+    help=(
+        "How a cluster's risk is measured when splitting the budget between "
+        "two branches. CVaR and CDaR need a return history."
+    ),
+)
+_NCO_OBJECTIVE = ExtraInput(
+    key="nco_objective", label="Objective at both layers",
+    kind="choice", required=False, default="min_variance",
+    choices=("min_variance", "max_sharpe"),
+    help="Solved inside each cluster and again across clusters.",
+)
+_NCO_DETONE = ExtraInput(
+    key="nco_detone_for_clustering", label="Detone before clustering",
+    kind="scalar", required=False, default=True,
+    help=(
+        "Remove the market eigenvector before measuring correlation distance. "
+        "Leaving it in makes every pair look alike and the partition degenerate."
+    ),
+)
+_CDAR_ALPHA = ExtraInput(
+    key="cdar_alpha", label="CDaR tail probability α",
+    kind="scalar", required=False, default=0.05,
+    help="0.05 averages the worst 5% of the drawdown path.",
+)
 
 
 REQUIREMENTS: dict[str, MethodRequirements] = {
@@ -231,6 +282,62 @@ REQUIREMENTS: dict[str, MethodRequirements] = {
             "Weight bounds are applied by projection after allocation.",
         ),
     ),
+    "herc": MethodRequirements(
+        name="herc",
+        label="Hierarchical Equal Risk Contribution",
+        requires_mu=False, requires_cov=True, requires_returns=False,
+        supports_target_return=False, supports_target_volatility=False,
+        supports_risk_aversion=False, supports_risk_free_rate=False,
+        supports_group_bounds=True, bounds_mode="soft_iterated",
+        supports_frontier=False, supports_turnover=False,
+        extras=(_CLUSTER_LINKAGE, _N_CLUSTERS, _MAX_CLUSTERS, _HERC_RISK_MEASURE),
+        summary=(
+            "Split the budget at the dendrogram's own branch points, equalizing "
+            "risk between siblings, and stop at the number of clusters the data "
+            "supports."
+        ),
+        when_to_use=(
+            "You want HRP's robustness but the clusters to be respected: HRP "
+            "bisects a sorted list and can cut through a genuine group, HERC "
+            "splits where the tree actually branches. Also the way in when "
+            "drawdown or tail risk, not variance, is the measure that matters."
+        ),
+        assumptions=(
+            "The correlation hierarchy is economically meaningful — check the "
+            "reported clusters and the silhouette score.",
+            "The chosen number of clusters is a real feature of the data, not "
+            "of the linkage rule. A silhouette near zero means it is not.",
+            "Group budgets cannot be enforced inside the allocation; bounds are "
+            "applied by projection afterwards.",
+        ),
+    ),
+    "nco": MethodRequirements(
+        name="nco",
+        label="Nested Clustered Optimization",
+        requires_mu=False, requires_cov=True, requires_returns=False,
+        supports_target_return=False, supports_target_volatility=False,
+        supports_risk_aversion=False, supports_risk_free_rate=True,
+        supports_group_bounds=True, bounds_mode="soft_iterated",
+        supports_frontier=False, supports_turnover=False,
+        extras=(_NCO_OBJECTIVE, _CLUSTER_LINKAGE, _N_CLUSTERS, _MAX_CLUSTERS, _NCO_DETONE),
+        summary=(
+            "Optimize inside each correlation cluster, then across the "
+            "clusters, so no single ill-conditioned matrix is ever inverted."
+        ),
+        when_to_use=(
+            "Markowitz gives you corner solutions and you can see why: a "
+            "condition number in the thousands, or clusters of near-identical "
+            "assets. NCO keeps the mean-variance objective and removes the "
+            "instability that comes from the block structure."
+        ),
+        assumptions=(
+            "The universe genuinely clusters. Without block structure the "
+            "two-layer solve adds the clustering's noise and little else.",
+            "The same objective is appropriate at both layers.",
+            "Per-asset and group limits are applied to the combined result by "
+            "projection, not inside either solve.",
+        ),
+    ),
     "black_litterman": MethodRequirements(
         name="black_litterman",
         label="Black-Litterman",
@@ -279,6 +386,35 @@ REQUIREMENTS: dict[str, MethodRequirements] = {
             "Enough observations fall in the tail to estimate it: at α = 5% "
             "you are averaging roughly T/20 scenarios.",
             "Scenarios are equally likely and drawn from one regime.",
+        ),
+    ),
+    "cdar": MethodRequirements(
+        name="cdar",
+        label="Mean-CDaR (conditional drawdown)",
+        requires_mu=False, requires_cov=False, requires_returns=True,
+        supports_target_return=True, supports_target_volatility=False,
+        supports_risk_aversion=False, supports_risk_free_rate=True,
+        supports_group_bounds=True, bounds_mode="hard",
+        supports_frontier=True, supports_turnover=True,
+        extras=(_CDAR_ALPHA,), risk_measure="CDaR",
+        summary=(
+            "Minimize the average of the worst α of drawdowns along the "
+            "realized path."
+        ),
+        when_to_use=(
+            "The mandate is written in drawdown terms — a stop-loss, a "
+            "high-water mark, a client who redeems at −20%. Variance and CVaR "
+            "are both order-independent and cannot see how long the book "
+            "stayed underwater."
+        ),
+        assumptions=(
+            "The single realized return path is representative. This is the "
+            "strongest assumption in the library: reorder the same returns and "
+            "the objective changes.",
+            "The equity curve is accumulated uncompounded, which is what keeps "
+            "the problem linear.",
+            "Enough distinct underwater episodes occurred to estimate a tail of "
+            "drawdowns rather than describe one crisis.",
         ),
     ),
     "max_diversification": MethodRequirements(

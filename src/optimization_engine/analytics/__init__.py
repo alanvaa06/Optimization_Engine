@@ -1,5 +1,18 @@
 """Performance, risk, relative-return, and backtesting analytics."""
 
+from optimization_engine.analytics.active import (
+    FundamentalLawReport,
+    InformationCoefficient,
+    active_risk_decomposition,
+    fundamental_law,
+    grinold_alpha,
+    implied_breadth,
+    information_coefficient,
+    optimal_active_risk,
+    risk_aversion_from_information_ratio,
+    transfer_coefficient,
+    value_added,
+)
 from optimization_engine.analytics.backtest import (
     BacktestResult,
     WalkForwardResult,
@@ -7,6 +20,14 @@ from optimization_engine.analytics.backtest import (
     compare_in_and_out_of_sample,
     rebalance_dates,
     walk_forward_backtest,
+)
+from optimization_engine.analytics.diversification import (
+    DiversificationReport,
+    compare_diversification,
+    diversification_distribution,
+    effective_number_of_bets,
+    minimum_torsion,
+    pca_torsion,
 )
 from optimization_engine.analytics.performance import (
     annualize_returns,
@@ -53,8 +74,39 @@ from optimization_engine.analytics.risk import (
     var_gaussian,
     var_historic,
 )
+from optimization_engine.analytics.selection import (
+    DeflatedSharpe,
+    OverfittingReport,
+    deflated_sharpe_ratio,
+    expected_maximum_sharpe,
+    minimum_track_record_length,
+    probability_of_backtest_overfitting,
+)
 
 __all__ = [
+    "FundamentalLawReport",
+    "InformationCoefficient",
+    "active_risk_decomposition",
+    "fundamental_law",
+    "grinold_alpha",
+    "implied_breadth",
+    "information_coefficient",
+    "optimal_active_risk",
+    "risk_aversion_from_information_ratio",
+    "transfer_coefficient",
+    "value_added",
+    "DiversificationReport",
+    "compare_diversification",
+    "diversification_distribution",
+    "effective_number_of_bets",
+    "minimum_torsion",
+    "pca_torsion",
+    "DeflatedSharpe",
+    "OverfittingReport",
+    "deflated_sharpe_ratio",
+    "expected_maximum_sharpe",
+    "minimum_track_record_length",
+    "probability_of_backtest_overfitting",
     "BacktestResult",
     "WalkForwardResult",
     "backtest_weights",

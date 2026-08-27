@@ -11,7 +11,9 @@ from optimization_engine.config import EngineConfig, OptimizerSpec
 from optimization_engine.optimizers import ConfigurationError
 from optimization_engine.optimizers.base import BaseOptimizer, PortfolioConstraints
 from optimization_engine.optimizers.black_litterman import BlackLittermanOptimizer
+from optimization_engine.optimizers.cdar import CDaROptimizer
 from optimization_engine.optimizers.cvar import CVaROptimizer
+from optimization_engine.optimizers.herc import HERCOptimizer
 from optimization_engine.optimizers.hrp import HRPOptimizer
 from optimization_engine.optimizers.max_diversification import MaxDiversificationOptimizer
 from optimization_engine.optimizers.mean_variance import (
@@ -23,6 +25,7 @@ from optimization_engine.optimizers.naive import (
     EqualWeightOptimizer,
     InverseVolatilityOptimizer,
 )
+from optimization_engine.optimizers.nco import NCOOptimizer
 from optimization_engine.optimizers.requirements import requirements_for
 from optimization_engine.optimizers.risk_parity import RiskParityOptimizer
 
@@ -34,8 +37,11 @@ _REGISTRY: dict[str, type[BaseOptimizer]] = {
     "max_sharpe": MaxSharpeOptimizer,
     "risk_parity": RiskParityOptimizer,
     "hrp": HRPOptimizer,
+    "herc": HERCOptimizer,
+    "nco": NCOOptimizer,
     "black_litterman": BlackLittermanOptimizer,
     "cvar": CVaROptimizer,
+    "cdar": CDaROptimizer,
     "max_diversification": MaxDiversificationOptimizer,
     "equal_weight": EqualWeightOptimizer,
     "inverse_vol": InverseVolatilityOptimizer,
@@ -230,7 +236,7 @@ def optimizer_factory(
         constraints=constraints,
         risk_free_rate=spec.risk_free_rate,
     )
-    if cls is not CVaROptimizer:
+    if cls not in (CVaROptimizer, CDaROptimizer):
         common["expected_returns"] = expected_returns
 
     if cls is MeanVarianceOptimizer:
@@ -239,6 +245,27 @@ def optimizer_factory(
         return cls(risk_budget=spec.risk_budget, **common, **overrides)
     if cls is HRPOptimizer:
         return cls(linkage_method=spec.hrp_linkage, **common, **overrides)
+    if cls is HERCOptimizer:
+        return cls(
+            linkage_method=spec.cluster_linkage,
+            n_clusters=spec.n_clusters,
+            max_clusters=spec.max_clusters,
+            risk_measure=spec.herc_risk_measure,
+            alpha=spec.cvar_alpha,
+            returns=returns,
+            **common,
+            **overrides,
+        )
+    if cls is NCOOptimizer:
+        return cls(
+            objective=spec.nco_objective,
+            linkage_method=spec.cluster_linkage,
+            n_clusters=spec.n_clusters,
+            max_clusters=spec.max_clusters,
+            detone_for_clustering=spec.nco_detone_for_clustering,
+            **common,
+            **overrides,
+        )
     if cls is BlackLittermanOptimizer:
         return cls(
             market_weights=spec.bl_market_caps,
@@ -255,6 +282,18 @@ def optimizer_factory(
         return cls(
             returns=returns,
             alpha=spec.cvar_alpha,
+            target_return=spec.target_return,
+            periods_per_year=config.periods_per_year,
+            expected_returns=expected_returns,
+            cov_matrix=cov_matrix,
+            constraints=constraints,
+            risk_free_rate=spec.risk_free_rate,
+            **overrides,
+        )
+    if cls is CDaROptimizer:
+        return cls(
+            returns=returns,
+            alpha=spec.cdar_alpha,
             target_return=spec.target_return,
             periods_per_year=config.periods_per_year,
             expected_returns=expected_returns,

@@ -20,7 +20,7 @@ import numpy as np
 import pandas as pd
 
 CovarianceMethod = Literal[
-    "sample", "ledoit_wolf", "oas", "shrink", "ewma", "semi"
+    "sample", "ledoit_wolf", "oas", "shrink", "ewma", "semi", "denoised"
 ]
 
 ExpectedReturnMethod = Literal["mean", "ema", "capm", "shrunk_mean"]
@@ -56,6 +56,12 @@ COVARIANCE_DESCRIPTIONS: dict[str, str] = {
         "Targets downside co-movement rather than total variance; "
         "portfolio 'volatility' from this matrix is a semi-deviation, not "
         "a standard deviation."
+    ),
+    "denoised": (
+        "Sample covariance with the Marchenko-Pastur noise eigenvalues "
+        "replaced by their average (López de Prado, 2020). Keeps the factor "
+        "structure intact instead of shrinking it along with the noise, so "
+        "it conditions the matrix without flattening the signal."
     ),
 }
 
@@ -272,6 +278,10 @@ def covariance_matrix(
     ewma_lambda: float = 0.94,
     semi_mar: float | pd.Series | None = None,
     ensure_psd: bool = True,
+    denoise: bool = False,
+    denoise_method: str = "constant_residual",
+    denoise_alpha: float = 0.0,
+    detone: int = 0,
 ) -> pd.DataFrame:
     """Estimate a covariance matrix on returns.
 
@@ -287,6 +297,23 @@ def covariance_matrix(
             ``None`` uses the per-asset sample mean.
         ensure_psd: Repair the estimate with :func:`nearest_psd`. Leave on
             unless you specifically want the raw estimator output.
+        denoise: Apply the Marchenko-Pastur eigenvalue filter after
+            estimating (López de Prado, 2020). Implied by
+            ``method="denoised"``, and composable with any other estimator —
+            denoising a Ledoit-Wolf matrix is legitimate, if belt-and-braces.
+        denoise_method: ``"constant_residual"`` or ``"targeted_shrinkage"``;
+            see :func:`~optimization_engine.data.denoise.denoise_correlation`.
+        denoise_alpha: Noise-block shrinkage retained under
+            ``"targeted_shrinkage"``.
+        detone: Remove this many leading eigenvectors (the market component)
+            after denoising. Non-zero values make the result **singular** —
+            correct for clustering methods, fatal for anything that inverts
+            the matrix.
+
+    Returns:
+        The estimate. When denoising ran, the :class:`DenoiseReport` is
+        attached as ``result.attrs["denoise_report"]`` so callers that want
+        the spectrum diagnostics can reach them without a second API.
 
     Raises:
         ValueError: If ``returns`` is empty or ``method`` is unknown.
@@ -305,7 +332,7 @@ def covariance_matrix(
             "change the sample each asset is estimated on."
         )
 
-    if method == "sample":
+    if method in ("sample", "denoised"):
         cov = _sample(returns)
     elif method == "ledoit_wolf":
         cov = _ledoit_wolf(returns)
@@ -325,9 +352,45 @@ def covariance_matrix(
 
     if annualize:
         cov = cov * periods_per_year
+
+    report = None
+    if denoise or method == "denoised" or detone:
+        from optimization_engine.data.denoise import denoise_covariance
+
+        cov, report = denoise_covariance(
+            cov,
+            n_observations=len(returns),
+            method=denoise_method,
+            alpha=denoise_alpha,
+            detone=detone,
+        )
+
     if ensure_psd:
         cov = nearest_psd(cov)
+    if report is not None:
+        cov.attrs["denoise_report"] = report
     return cov
+
+
+def covariance_from_config(returns: pd.DataFrame, config) -> pd.DataFrame:
+    """Estimate the covariance the way one :class:`EngineConfig` asks for.
+
+    Every part of the engine that re-estimates a covariance — the frontier
+    sweep, the bootstrap, the walk-forward, the CLI, the UI — has to make the
+    same choices about estimator, annualization, decay and denoising. Doing
+    that inline five times is how a run ends up bootstrapping a different
+    matrix than it optimized. This is the single place those choices live.
+    """
+    return covariance_matrix(
+        returns,
+        method=config.covariance_method,
+        periods_per_year=config.periods_per_year,
+        ewma_lambda=config.ewma_lambda,
+        denoise=getattr(config, "denoise", False),
+        denoise_method=getattr(config, "denoise_method", "constant_residual"),
+        denoise_alpha=getattr(config, "denoise_alpha", 0.0),
+        detone=getattr(config, "detone", 0),
+    )
 
 
 # ---------------------------------------------------------------------------

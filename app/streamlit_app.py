@@ -60,6 +60,7 @@ from optimization_engine.config import EngineConfig, OptimizerSpec  # noqa: E402
 from optimization_engine.data.covariance import (  # noqa: E402
     COVARIANCE_DESCRIPTIONS,
     EXPECTED_RETURN_DESCRIPTIONS,
+    covariance_from_config,
     covariance_matrix,
 )
 from optimization_engine.data.fx import (  # noqa: E402
@@ -227,6 +228,15 @@ if _pending and _pending in st.session_state.scenarios:
     st.session_state["risk_free_rate"] = float(_cfg.optimizer.risk_free_rate)
     st.session_state["risk_aversion"] = float(_cfg.optimizer.risk_aversion)
     st.session_state["cvar_alpha"] = float(_cfg.optimizer.cvar_alpha)
+    st.session_state["cdar_alpha"] = float(_cfg.optimizer.cdar_alpha)
+    st.session_state["denoise"] = bool(_cfg.denoise)
+    st.session_state["detone"] = int(_cfg.detone)
+    st.session_state["cluster_linkage"] = str(_cfg.optimizer.cluster_linkage)
+    st.session_state["auto_clusters"] = _cfg.optimizer.n_clusters is None
+    st.session_state["n_clusters"] = _cfg.optimizer.n_clusters
+    st.session_state["herc_risk_measure"] = str(_cfg.optimizer.herc_risk_measure)
+    st.session_state["nco_objective"] = str(_cfg.optimizer.nco_objective)
+    st.session_state["nco_detone"] = bool(_cfg.optimizer.nco_detone_for_clustering)
     st.session_state["long_only"] = bool(_cfg.long_only)
     if _cfg.optimizer.target_return is not None:
         st.session_state["mv_mode"] = "Target return"
@@ -533,7 +543,9 @@ with st.sidebar:
         key="periods_per_year",
         help="252 for daily data, 52 for weekly, 12 for monthly.",
     )
-    cov_options = ["ledoit_wolf", "oas", "sample", "ewma", "semi", "shrink"]
+    cov_options = [
+        "ledoit_wolf", "oas", "sample", "ewma", "semi", "shrink", "denoised"
+    ]
     cov_method = st.selectbox(
         "Covariance estimator",
         options=cov_options,
@@ -544,6 +556,35 @@ with st.sidebar:
     )
     if ws["cov_method"]["enabled"]:
         st.caption(COVARIANCE_DESCRIPTIONS.get(cov_method, ""))
+    denoise = st.checkbox(
+        "Denoise (Marchenko-Pastur)",
+        value=(cov_method == "denoised"),
+        key="denoise",
+        disabled=not ws["cov_method"]["enabled"] or cov_method == "denoised",
+        help=(
+            "Replace the eigenvalues that are indistinguishable from noise "
+            "with their average, leaving the factor structure alone. Composes "
+            "with any estimator."
+        ),
+    )
+    detone = int(
+        st.number_input(
+            "Detone: eigenvectors to remove",
+            min_value=0, max_value=3, value=0, step=1,
+            key="detone",
+            disabled=not ws["cov_method"]["enabled"],
+            help=(
+                "Strip the market component before clustering. Makes the "
+                "covariance singular, so use it only with HRP, HERC or NCO."
+            ),
+        )
+    )
+    if detone and st.session_state.get("optimizer_name") not in ("hrp", "herc", "nco"):
+        st.warning(
+            "Detoning removes the market eigenvector, which leaves the "
+            "covariance singular. Only the clustering methods (HRP, HERC, NCO) "
+            "can use it — everything else inverts the matrix."
+        )
     ewma_lambda = (
         st.slider(
             "EWMA λ", 0.80, 0.999, 0.94, 0.005,
@@ -1130,6 +1171,93 @@ with tab_constraints:
             help="Hierarchical clustering linkage rule.",
         )
 
+    elif optimizer_name in ("herc", "nco"):
+        linkages = ["ward", "average", "complete", "single"]
+        st.session_state["cluster_linkage"] = st.selectbox(
+            "Linkage method",
+            options=linkages,
+            index=linkages.index(st.session_state.get("cluster_linkage", "ward")),
+            key="cluster_linkage_select",
+            help=(
+                "These methods partition the tree rather than merely order it, "
+                "so single linkage's chaining tends to produce one dominant "
+                "cluster."
+            ),
+        )
+        auto_k = st.checkbox(
+            "Choose the number of clusters automatically",
+            value=st.session_state.get("auto_clusters", True),
+            key="auto_clusters",
+            help=(
+                "Maximizes the silhouette t-statistic — the criterion behind "
+                "López de Prado's ONC."
+            ),
+        )
+        st.session_state["n_clusters"] = (
+            None
+            if auto_k
+            else int(
+                st.number_input(
+                    "Number of clusters", min_value=2,
+                    max_value=max(2, len(returns.columns) - 1),
+                    value=min(4, max(2, len(returns.columns) - 1)), step=1,
+                    key="n_clusters_input",
+                )
+            )
+        )
+        if optimizer_name == "herc":
+            measures = ["variance", "std", "cvar", "cdar", "equal_weight"]
+            st.session_state["herc_risk_measure"] = st.selectbox(
+                "Cluster risk measure",
+                options=measures,
+                index=measures.index(
+                    st.session_state.get("herc_risk_measure", "variance")
+                ),
+                key="herc_risk_measure_select",
+                help=(
+                    "How the budget is split between two sibling branches. "
+                    "CVaR and CDaR let downside risk drive the split."
+                ),
+            )
+        else:
+            objectives = ["min_variance", "max_sharpe"]
+            st.session_state["nco_objective"] = st.selectbox(
+                "Objective at both layers",
+                options=objectives,
+                index=objectives.index(
+                    st.session_state.get("nco_objective", "min_variance")
+                ),
+                key="nco_objective_select",
+                help="Solved inside each cluster and again across clusters.",
+            )
+            st.session_state["nco_detone"] = st.checkbox(
+                "Detone before clustering",
+                value=bool(st.session_state.get("nco_detone", True)),
+                key="nco_detone_check",
+                help=(
+                    "Remove the market eigenvector from the distance metric. "
+                    "Without it every pair looks alike and the partition "
+                    "degenerates."
+                ),
+            )
+
+    elif optimizer_name == "cdar":
+        st.session_state["cdar_alpha"] = float(
+            st.slider(
+                "CDaR tail probability α", 0.01, 1.0,
+                float(st.session_state.get("cdar_alpha", 0.05)), 0.01,
+                key="cdar_alpha_slider",
+                help=(
+                    "0.05 averages the worst 5% of the drawdown path; 1.0 is "
+                    "the average drawdown."
+                ),
+            )
+        )
+        st.caption(
+            "Drawdown is a path statistic: reorder the same returns and this "
+            "objective changes. Check the walk-forward before believing it."
+        )
+
     if use_turnover:
         st.markdown("**Previous allocation** (what the turnover budget trades from)")
         if (
@@ -1178,6 +1306,14 @@ def _build_config() -> EngineConfig:
         cvar_alpha=float(cvar_alpha),
         bl_tau=float(st.session_state.get("bl_tau", 0.05)),
         hrp_linkage=str(st.session_state.get("hrp_linkage", "single")),
+        cdar_alpha=float(st.session_state.get("cdar_alpha", 0.05)),
+        cluster_linkage=str(st.session_state.get("cluster_linkage", "ward")),
+        n_clusters=st.session_state.get("n_clusters"),
+        herc_risk_measure=str(
+            st.session_state.get("herc_risk_measure", "variance")
+        ),
+        nco_objective=str(st.session_state.get("nco_objective", "min_variance")),
+        nco_detone_for_clustering=bool(st.session_state.get("nco_detone", True)),
     )
 
     if optimizer_name == "risk_parity" and "risk_budget" in st.session_state:
@@ -1249,6 +1385,8 @@ def _build_config() -> EngineConfig:
         periods_per_year=int(periods_per_year),
         covariance_method=cov_method,
         ewma_lambda=float(ewma_lambda),
+        denoise=bool(denoise),
+        detone=int(detone),
         expected_returns_method=str(
             st.session_state.get("expected_returns_method", "historical_mean")
         ),
@@ -1271,12 +1409,7 @@ def _build_config() -> EngineConfig:
 @st.cache_data(show_spinner=False, max_entries=16)
 def _feasibility_cached(signature: str, returns_hash: str, _returns: pd.DataFrame):
     cfg = EngineConfig.from_dict(json.loads(signature))
-    cov = covariance_matrix(
-        _returns,
-        method=cfg.covariance_method,
-        periods_per_year=cfg.periods_per_year,
-        ewma_lambda=cfg.ewma_lambda,
-    )
+    cov = covariance_from_config(_returns, cfg)
     mu = pd.Series(cfg.expected_returns).reindex(_returns.columns).fillna(0.0)
     return analyze_feasibility(
         list(_returns.columns),

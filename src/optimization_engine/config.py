@@ -40,6 +40,17 @@ class OptimizerSpec:
         bl_calibrate_risk_aversion: Imply δ from the market Sharpe ratio
             instead of using ``risk_aversion`` verbatim.
         hrp_linkage: Hierarchical clustering linkage rule for HRP.
+        cdar_alpha: Tail probability for mean-CDaR (``0.05`` ⇒ the worst 5%
+            of the drawdown path).
+        cluster_linkage: Linkage rule for the clustering methods that
+            *partition* the tree (HERC, NCO) rather than merely order it.
+        n_clusters: Force a cluster count for HERC/NCO. ``None`` selects it
+            by maximizing the silhouette t-statistic.
+        max_clusters: Upper bound for that search.
+        herc_risk_measure: Cluster-level risk measure for HERC.
+        nco_objective: Objective solved at both NCO layers.
+        nco_detone_for_clustering: Strip the market eigenvector before
+            clustering in NCO.
     """
 
     name: str = "mean_variance"
@@ -54,6 +65,15 @@ class OptimizerSpec:
     bl_tau: float = 0.05
     bl_market_caps: dict[str, float] | None = None
     hrp_linkage: Literal["single", "average", "complete", "ward"] = "single"
+    cdar_alpha: float = 0.05
+    cluster_linkage: Literal["single", "average", "complete", "ward"] = "ward"
+    n_clusters: int | None = None
+    max_clusters: int | None = None
+    herc_risk_measure: Literal[
+        "variance", "std", "cvar", "cdar", "equal_weight"
+    ] = "variance"
+    nco_objective: Literal["min_variance", "max_sharpe"] = "min_variance"
+    nco_detone_for_clustering: bool = True
     bl_market_return: float | None = None
     bl_calibrate_risk_aversion: bool = False
     extra: dict[str, Any] = field(default_factory=dict)
@@ -74,8 +94,19 @@ class EngineConfig:
         periods_per_year: Number of return observations per year.
         covariance_method: ``sample``, ``ledoit_wolf``, ``oas``,
             ``shrink`` (Ledoit-Wolf via riskfolio when available),
-            or ``ewma``.
+            ``ewma``, ``semi``, or ``denoised`` (sample covariance filtered
+            through the Marchenko-Pastur eigenvalue cutoff).
         ewma_lambda: Decay used when ``covariance_method == "ewma"``.
+        denoise: Apply the Marchenko-Pastur eigenvalue filter to the
+            covariance estimate (López de Prado, 2020). Composable with any
+            estimator; implied by ``covariance_method="denoised"``.
+        denoise_method: ``constant_residual`` or ``targeted_shrinkage``.
+        denoise_alpha: Noise-block shrinkage retained under
+            ``targeted_shrinkage``.
+        detone: Number of leading eigenvectors (the market component) to
+            remove after denoising. Non-zero makes the covariance singular —
+            appropriate for the clustering methods, not for solves that
+            invert it.
         expected_returns_method: How to seed expected returns when
             ``expected_returns`` is empty: ``historical_mean``, ``ema``,
             or ``capm``.
@@ -107,7 +138,13 @@ class EngineConfig:
     periods_per_year: int = 252
     covariance_method: str = "ledoit_wolf"
     ewma_lambda: float = 0.94
-    expected_returns_method: Literal["historical_mean", "ema", "capm"] = "historical_mean"
+    denoise: bool = False
+    denoise_method: str = "constant_residual"
+    denoise_alpha: float = 0.0
+    detone: int = 0
+    expected_returns_method: Literal[
+        "historical_mean", "ema", "capm", "shrunk_mean"
+    ] = "historical_mean"
     ema_span: int = 180
     market_return: float | None = None
     market_weights: dict[str, float] | None = None
@@ -140,6 +177,10 @@ class EngineConfig:
             "periods_per_year": self.periods_per_year,
             "covariance_method": self.covariance_method,
             "ewma_lambda": self.ewma_lambda,
+            "denoise": self.denoise,
+            "denoise_method": self.denoise_method,
+            "denoise_alpha": self.denoise_alpha,
+            "detone": self.detone,
             "expected_returns_method": self.expected_returns_method,
             "ema_span": self.ema_span,
             "market_return": self.market_return,
@@ -170,6 +211,10 @@ class EngineConfig:
             periods_per_year=int(data.get("periods_per_year", 252)),
             covariance_method=str(data.get("covariance_method", "ledoit_wolf")),
             ewma_lambda=float(data.get("ewma_lambda", 0.94)),
+            denoise=bool(data.get("denoise", False)),
+            denoise_method=str(data.get("denoise_method", "constant_residual")),
+            denoise_alpha=float(data.get("denoise_alpha", 0.0)),
+            detone=int(data.get("detone", 0) or 0),
             expected_returns_method=str(
                 data.get("expected_returns_method", "historical_mean")
             ),

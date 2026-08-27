@@ -31,7 +31,10 @@ import numpy as np
 import pandas as pd
 
 from optimization_engine.config import EngineConfig
-from optimization_engine.data.covariance import covariance_matrix, expected_returns_from_history
+from optimization_engine.data.covariance import (
+    covariance_from_config,
+    expected_returns_from_history,
+)
 from optimization_engine.frontier import FrontierResult, efficient_frontier
 
 BootstrapMethod = Literal["iid", "block", "parametric"]
@@ -170,12 +173,7 @@ def bootstrap_frontier(
 
     point_estimate = efficient_frontier(
         config,
-        covariance_matrix(
-            returns,
-            method=config.covariance_method,
-            periods_per_year=config.periods_per_year,
-            ewma_lambda=config.ewma_lambda,
-        ),
+        covariance_from_config(returns, config),
         expected_returns=(
             pd.Series(config.expected_returns) if config.expected_returns else None
         ),
@@ -192,12 +190,7 @@ def bootstrap_frontier(
         sample = resample_returns(returns, method=method, rng=rng)
         try:
             draw_config = copy.deepcopy(config)
-            cov = covariance_matrix(
-                sample,
-                method=config.covariance_method,
-                periods_per_year=config.periods_per_year,
-                ewma_lambda=config.ewma_lambda,
-            )
+            cov = covariance_from_config(sample, config)
             if reestimate_expected_returns:
                 mu = expected_returns_from_history(
                     sample,
@@ -312,12 +305,7 @@ def resampled_efficient_frontier(
         sample = resample_returns(returns, method=method, rng=rng)
         try:
             draw_config = copy.deepcopy(config)
-            cov = covariance_matrix(
-                sample,
-                method=config.covariance_method,
-                periods_per_year=config.periods_per_year,
-                ewma_lambda=config.ewma_lambda,
-            )
+            cov = covariance_from_config(sample, config)
             mu = expected_returns_from_history(
                 sample,
                 method=(
@@ -356,3 +344,279 @@ def resampled_efficient_frontier(
     averaged = sum(s.iloc[:, :common] for s in stacks) / len(stacks)
     averaged.columns = [f"rank_{i}" for i in range(common)]
     return averaged
+
+
+# ---------------------------------------------------------------------------
+# Monte Carlo Optimization Selection
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class MCOSResult:
+    """Which method/estimator combination recovers the truth most reliably.
+
+    Attributes:
+        weight_rmse: Per method, the root-mean-square distance between the
+            weights it produced on a noisy sample and the weights the same
+            method produces on the ground truth. This is the headline: it is
+            estimation error expressed in the only unit that matters, the
+            allocation.
+        variance_error: Mean absolute error in the portfolio's *true*
+            volatility — how wrong the risk turns out to be, not how far the
+            weights moved.
+        return_error: Mean absolute error in the portfolio's true expected
+            return.
+        max_weight_drift: Largest single-position error, averaged across
+            draws. A method can look fine on RMSE and still move one position
+            by 20%.
+        n_simulations: Successful draws.
+        n_failed: Draws in which a method failed to solve.
+        n_observations: Sample length drawn per simulation.
+        denoised: Whether the per-draw covariance was denoised.
+    """
+
+    weight_rmse: pd.Series
+    variance_error: pd.Series
+    return_error: pd.Series
+    max_weight_drift: pd.Series
+    n_simulations: int
+    n_failed: int
+    n_observations: int
+    denoised: bool
+
+    def ranking(self) -> pd.DataFrame:
+        """Methods ordered by weight RMSE, best first."""
+        frame = pd.DataFrame(
+            {
+                "weight_rmse": self.weight_rmse,
+                "max_weight_drift": self.max_weight_drift,
+                "volatility_error": self.variance_error,
+                "return_error": self.return_error,
+            }
+        )
+        return frame.sort_values("weight_rmse")
+
+    def describe(self) -> str:
+        ranked = self.ranking()
+        if ranked.empty:
+            return "No method produced a usable allocation on any draw."
+        best = ranked.index[0]
+        worst = ranked.index[-1]
+        line = (
+            f"Over {self.n_simulations} simulated histories of "
+            f"{self.n_observations} observations drawn from the fitted "
+            f"distribution, '{best}' recovered the true allocation most "
+            f"reliably (weight RMSE {ranked.loc[best, 'weight_rmse']:.2%}) and "
+            f"'{worst}' least ({ranked.loc[worst, 'weight_rmse']:.2%})."
+        )
+        if self.denoised:
+            line += " Each draw's covariance was denoised before optimizing."
+        if self.n_failed:
+            line += f" {self.n_failed} solve(s) failed and were dropped."
+        return line
+
+
+def monte_carlo_optimization_selection(
+    returns: pd.DataFrame,
+    config: EngineConfig,
+    methods: tuple[str, ...] = ("mean_variance", "min_variance", "hrp", "nco"),
+    n_simulations: int = 20,
+    n_observations: int | None = None,
+    denoise: bool | None = None,
+    seed: int | None = 0,
+) -> MCOSResult:
+    """Monte Carlo Optimization Selection (López de Prado, 2019).
+
+    Every backtest in this library asks "would this have worked?". MCOS asks
+    the prior question: *given a universe like this one, and a sample this
+    long, which method can be trusted to find the right answer at all?*
+
+    The experiment sidesteps the usual problem — that nobody knows the true
+    ``μ`` and ``Σ`` — by declaring the sample estimates to be the truth, and
+    then testing whether each method can recover the allocation that truth
+    implies from a noisy sample of it:
+
+    1. Fit ``μ`` and ``Σ`` on the observed history; call them the truth.
+    2. Solve each method against the truth. Those are the target weights.
+    3. Draw ``n_simulations`` synthetic histories from that distribution,
+       re-estimate ``μ`` and ``Σ`` on each, and re-solve.
+    4. Report how far each method's weights land from its own target.
+
+    The comparison is deliberately self-referential — each method is scored
+    against *its own* answer on the truth, not against a common one — because
+    the question is estimation stability, not which objective is right. A
+    method that is wrong but consistent scores well here, and should: it is
+    telling you the method is not the source of your uncertainty.
+
+    In López de Prado's original experiment this is what shows NCO cutting
+    the weight RMSE of a direct mean-variance solve roughly in half, and it is
+    the cleanest way to justify a method choice to someone who does not accept
+    "the literature says so".
+
+    Args:
+        returns: Observed history, used to fit the ground-truth distribution.
+        config: Run configuration. Its constraints apply to every solve.
+        methods: Optimizer names to compare.
+        n_simulations: Number of synthetic histories. Cost is linear in this
+            times the number of methods.
+        n_observations: Length of each synthetic history. Defaults to the
+            length of ``returns`` — change it to ask "what would another five
+            years of data buy me?".
+        denoise: Denoise each draw's covariance before optimizing. ``None``
+            follows ``config``. Setting it explicitly is how you isolate the
+            benefit of denoising from the benefit of the method.
+        seed: Base seed, for reproducibility.
+
+    Returns:
+        An :class:`MCOSResult`.
+
+    Raises:
+        ValueError: If ``n_simulations < 2``, no method is supplied, or every
+            simulation fails.
+    """
+    import copy
+
+    from optimization_engine.data.covariance import covariance_matrix
+    from optimization_engine.optimizers.factory import optimizer_factory
+
+    if n_simulations < 2:
+        raise ValueError(
+            f"Need at least 2 simulations to describe a spread; got "
+            f"{n_simulations}."
+        )
+    if not methods:
+        raise ValueError("Supply at least one optimizer name to compare.")
+
+    assets = list(returns.columns)
+    n_obs = int(n_observations or len(returns))
+    use_denoise = config.denoise if denoise is None else bool(denoise)
+
+    def estimate(sample: pd.DataFrame) -> tuple[pd.Series, pd.DataFrame]:
+        cov = covariance_matrix(
+            sample,
+            method=config.covariance_method,
+            periods_per_year=config.periods_per_year,
+            ewma_lambda=config.ewma_lambda,
+            denoise=use_denoise,
+            denoise_method=config.denoise_method,
+            denoise_alpha=config.denoise_alpha,
+        )
+        mu = expected_returns_from_history(
+            sample,
+            method=(
+                "mean"
+                if config.expected_returns_method == "historical_mean"
+                else config.expected_returns_method
+            ),
+            periods_per_year=config.periods_per_year,
+            span=config.ema_span,
+            risk_free_rate=config.optimizer.risk_free_rate,
+            cov_matrix=cov,
+        )
+        return mu, cov
+
+    def solve(name: str, mu: pd.Series, cov: pd.DataFrame, sample: pd.DataFrame) -> pd.Series:
+        run_config = copy.deepcopy(config)
+        run_config.optimizer.name = name
+        run_config.expected_returns = mu.to_dict()
+        optimizer = optimizer_factory(
+            run_config, cov, expected_returns=mu, returns=sample
+        )
+        return optimizer.optimize().weights.reindex(assets).fillna(0.0)
+
+    true_mu, true_cov = estimate(returns)
+    targets: dict[str, pd.Series] = {}
+    for name in methods:
+        try:
+            targets[name] = solve(name, true_mu, true_cov, returns)
+        except Exception as exc:  # noqa: BLE001 - a method may not fit this universe
+            raise ValueError(
+                f"Optimizer {name!r} could not be solved on the fitted "
+                f"distribution, so there is nothing to compare its draws "
+                f"against: {exc}"
+            ) from exc
+
+    # The ground-truth solves above already logged, once per method, anything
+    # the config asks for that a method cannot honour (a return target on HRP,
+    # say). Repeating that on every draw would bury the result under hundreds
+    # of identical lines, so the simulation loop runs quiet.
+    import logging
+
+    factory_log = logging.getLogger("optimization_engine.optimizers.factory")
+    previous_level = factory_log.level
+    factory_log.setLevel(logging.ERROR)
+
+    rng = np.random.default_rng(seed)
+    mean_vector = returns.mean().values
+    covariance = np.cov(returns.values, rowvar=False)
+    errors: dict[str, list[float]] = {name: [] for name in methods}
+    drifts: dict[str, list[float]] = {name: [] for name in methods}
+    vol_errors: dict[str, list[float]] = {name: [] for name in methods}
+    ret_errors: dict[str, list[float]] = {name: [] for name in methods}
+    n_failed = 0
+    n_done = 0
+
+    true_sigma = true_cov.reindex(assets, axis=0).reindex(assets, axis=1).values
+    true_mu_vector = true_mu.reindex(assets).fillna(0.0).values
+
+    try:
+        for _ in range(n_simulations):
+            draws = rng.multivariate_normal(mean_vector, covariance, size=n_obs)
+            sample = pd.DataFrame(draws, columns=assets)
+            try:
+                mu, cov = estimate(sample)
+            except Exception:
+                n_failed += 1
+                continue
+            any_solved = False
+            for name in methods:
+                try:
+                    weights = solve(name, mu, cov, sample)
+                except Exception:
+                    n_failed += 1
+                    continue
+                gap = (weights - targets[name]).values
+                errors[name].append(float(np.sqrt(np.mean(gap**2))))
+                drifts[name].append(float(np.max(np.abs(gap))))
+                # Evaluated against the *truth*, which is the point: a wrong
+                # allocation is only expensive to the extent the real world
+                # punishes it.
+                w = weights.values
+                t = targets[name].values
+                vol_errors[name].append(
+                    abs(
+                        float(np.sqrt(max(w @ true_sigma @ w, 0.0)))
+                        - float(np.sqrt(max(t @ true_sigma @ t, 0.0)))
+                    )
+                )
+                ret_errors[name].append(abs(float((w - t) @ true_mu_vector)))
+                any_solved = True
+            if any_solved:
+                n_done += 1
+    finally:
+        factory_log.setLevel(previous_level)
+
+    if n_done == 0:
+        raise ValueError(
+            f"Every one of the {n_simulations} simulations failed to solve. "
+            "The constraints may only be feasible on the observed sample."
+        )
+
+    def collect(store: dict[str, list[float]]) -> pd.Series:
+        return pd.Series(
+            {
+                name: (float(np.mean(values)) if values else float("nan"))
+                for name, values in store.items()
+            }
+        )
+
+    return MCOSResult(
+        weight_rmse=collect(errors),
+        variance_error=collect(vol_errors),
+        return_error=collect(ret_errors),
+        max_weight_drift=collect(drifts),
+        n_simulations=n_done,
+        n_failed=n_failed,
+        n_observations=n_obs,
+        denoised=use_denoise,
+    )
