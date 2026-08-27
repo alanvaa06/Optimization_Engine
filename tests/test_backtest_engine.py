@@ -645,3 +645,47 @@ def test_a_walk_forward_prices_its_first_trades_off_the_whole_history(returns):
     )
     assert blind.meta.degradations
     assert blind.total_cost < walk.run.total_cost
+
+
+# -- the audit trail's own plumbing -----------------------------------------
+
+
+def _git_ignores(path: str) -> bool:
+    """Whether git would ignore ``path``, per the repository's own rules."""
+    import subprocess
+
+    result = subprocess.run(
+        ["git", "check-ignore", "-q", "--", path],
+        cwd=str(ROOT),
+        capture_output=True,
+    )
+    if result.returncode not in (0, 1):
+        pytest.skip(f"git check-ignore unavailable here: {result.stderr!r}")
+    return result.returncode == 0
+
+
+def test_the_audit_log_is_committed_while_run_artifacts_are_not():
+    """The log only works if it survives clones, so it must not be ignored.
+
+    This is load-bearing and easy to break by "simplifying" the ignore rule:
+    `runs/` stops git descending into the directory at all, which silently
+    kills the negation and turns the audit trail into a per-laptop file that
+    any researcher resets by cloning fresh. Nothing else would fail.
+    """
+    assert not _git_ignores("runs/holdout_audit.jsonl")
+    # Everything else under runs/ is an artifact and stays out of the history.
+    assert _git_ignores("runs/tearsheet.xlsx")
+    assert _git_ignores("runs/cells/cell_0001.parquet")
+
+
+def test_the_audit_log_merges_by_union():
+    """Append-only from every branch, so the default driver conflicts always."""
+    attributes = (ROOT / ".gitattributes").read_text(encoding="utf-8")
+    assert "runs/holdout_audit.jsonl merge=union" in attributes
+
+
+def test_the_default_audit_path_is_the_one_the_repository_protects():
+    """The ignore rule and the code must name the same file."""
+    from optimization_engine.backtest.holdout import DEFAULT_AUDIT_PATH
+
+    assert DEFAULT_AUDIT_PATH.as_posix() == "runs/holdout_audit.jsonl"

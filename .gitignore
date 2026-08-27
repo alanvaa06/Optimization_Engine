@@ -42,6 +42,18 @@ outputs/
 !config/*.xlsx
 !data/sample/*.xlsx
 
+# Run artifacts are noise; the holdout audit log is not. It is the record of
+# every look taken at the held-out segment, and it only does its job — making
+# a second look visible — if it survives across sessions, clones and analysts.
+# A log any one researcher can reset by cloning fresh is a decorative control.
+#
+# This must stay `runs/*` and never `runs/`: a directory-level ignore stops git
+# descending into it at all, which silently kills the negation below.
+# `.gitattributes` gives the log a union merge so concurrent appends from two
+# branches do not conflict on every merge.
+runs/*
+!runs/holdout_audit.jsonl
+
 # OS
 .DS_Store
 Thumbs.db

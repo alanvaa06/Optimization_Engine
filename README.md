@@ -452,6 +452,14 @@ On top of the core:
   for the same specification seen twice, `SHIFTED_HOLDOUT` for the same strategy
   evaluated against a boundary that *moved*. The flags block nothing. They make
   the second look visible, which is all a diagnostic can honestly do.
+
+  **The log is committed** — `runs/holdout_audit.jsonl` is the one file this
+  repository keeps out of its own `runs/` ignore rule. Selection bias
+  accumulates across people as much as across sessions, and a log living on one
+  laptop is a control the controlled party resets by cloning fresh.
+  `.gitattributes` gives it a union merge so concurrent appends never conflict.
+  Since it is published, keep the `strategy` mapping to identifiers — a config
+  path, a spec hash — rather than a payload.
 * `build_tearsheet()` — the assembled reading. Performance, drawdowns, costs,
   position statistics and the selection-bias correction in one object, with the
   caveats attached to the numbers rather than to a footnote. A tearsheet over an

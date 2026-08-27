@@ -23,6 +23,18 @@ finished, and a record of every time it was. This module provides both:
 
 The flags do not block anything. They make the second look visible, which is
 all a diagnostic can honestly do.
+
+The log is meant to be **committed**. Selection bias accumulates across people
+as much as across sessions — two analysts looking once each is two trials on
+the same segment — and a log that lives only on one laptop is a control the
+controlled party can reset by cloning the repository fresh. The default path
+is under ``runs/``, which this repository ignores except for this one file;
+``.gitattributes`` gives it a union merge so concurrent appends from two
+branches do not conflict.
+
+That it is committed is also why ``strategy`` should stay a *description* and
+never a payload: whatever a caller puts in that mapping is hashed, written to
+the log, and published with it.
 """
 
 from __future__ import annotations
@@ -170,7 +182,9 @@ def final_holdout_run(
         evaluate: Takes the held-out returns and produces a return stream.
         strategy: A serializable description of what is being evaluated. It
             identifies the *strategy* across boundaries, which is what makes
-            ``SHIFTED_HOLDOUT`` detectable.
+            ``SHIFTED_HOLDOUT`` detectable. Keep it to identifiers — a config
+            path, a spec hash, an optimizer name. The log is committed, so
+            anything put here is published with it.
         label: A human-readable name for the log.
         audit_path: Where to append. Opened in append mode only.
         periods_per_year: Annualization basis for the summary.
