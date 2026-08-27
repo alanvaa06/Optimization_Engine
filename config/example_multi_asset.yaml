@@ -64,11 +64,67 @@ groups:
   EM_Debt:       FixedIncome
   Cash:          FixedIncome
 
-# Optional group bounds.
+# Optional group bounds. This is layer 1 of the allocation policy.
 group_bounds:
   Equity:       [0.30, 0.70]
   Alternatives: [0.00, 0.20]
   FixedIncome:  [0.20, 0.60]
+
+# Further layers of the same policy, all binding at once. Each one slices the
+# universe its own way and caps each slice; every limit stays linear in the
+# weights, so the problem stays convex and every optimizer keeps its
+# guarantees.
+#
+#   basis: portfolio  — the limit is a share of the whole book (the default)
+#   basis: parent     — the limit is a share of the parent layer's bucket, so
+#                       "30% emerging" means 30% *of the equity sleeve* and
+#                       moves with whatever the optimizer allocates to equity.
+#                       Name the parent layer with `parent:`; the parent
+#                       *bucket* of each child is derived from the assignments
+#                       rather than typed twice.
+#
+# The layer built from `groups` above is called "Asset class".
+constraint_layers:
+  # "Inside equity, at most 30% emerging; inside fixed income, at most 25%."
+  - name: Sub-asset class
+    basis: parent
+    parent: Asset class
+    assignments:
+      US_Equity:     DM Equity
+      Intl_Equity:   DM Equity
+      EM_Equity:     EM Equity
+      US_Treasuries: DM Fixed Income
+      TIPS:          DM Fixed Income
+      IG_Credit:     DM Fixed Income
+      HY_Credit:     DM Fixed Income
+      EM_Debt:       EM Fixed Income
+      Cash:          DM Fixed Income
+    limits:
+      DM Equity:       [0.70, 1.00]
+      EM Equity:       [0.00, 0.30]
+      DM Fixed Income: [0.75, 1.00]
+      EM Fixed Income: [0.00, 0.25]
+
+  # "At most 30% of the book in foreign currency." Cuts across asset classes,
+  # which is exactly what a single flat grouping cannot express.
+  - name: FX exposure
+    assignments:
+      US_Equity:     Local FX
+      Intl_Equity:   Foreign FX
+      EM_Equity:     Foreign FX
+      Real_Estate:   Local FX
+      Commodities:   Foreign FX
+      Infra:         Local FX
+      Gold:          Foreign FX
+      US_Treasuries: Local FX
+      TIPS:          Local FX
+      IG_Credit:     Local FX
+      HY_Credit:     Local FX
+      EM_Debt:       Foreign FX
+      Cash:          Local FX
+    limits:
+      Local FX:   [0.70, 1.00]
+      Foreign FX: [0.00, 0.30]
 
 # What the portfolio is measured — and, with a limit set below, optimized —
 # against. Stated once so the report and the solve cannot disagree about it.

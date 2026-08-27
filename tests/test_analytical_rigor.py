@@ -329,7 +329,7 @@ def test_hrp_warns_instead_of_silently_dropping_group_bounds(returns, cov):
     cons = PortfolioConstraints(
         groups={a: "All" for a in cov.columns}, group_bounds={"All": (1.0, 1.0)}
     )
-    with pytest.warns(UserWarning, match="group budgets"):
+    with pytest.warns(UserWarning, match="bucket budgets"):
         HRPOptimizer(cov_matrix=cov, constraints=cons).optimize()
 
 

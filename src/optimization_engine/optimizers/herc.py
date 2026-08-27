@@ -212,12 +212,12 @@ class HERCOptimizer(BaseOptimizer):
         assignment = optimal_clusters(
             corr, link, max_clusters=self.max_clusters, n_clusters=self.n_clusters
         )
-        if self.constraints.group_bounds and self.constraints.groups:
+        if self.constraints.has_layer_limits:
             warnings.warn(
                 "HERC allocates down its own correlation-derived clusters, "
-                "which generally disagree with a hand-specified grouping. Group "
-                "budgets will be met by projecting the result, which moves it "
-                "away from HERC's own answer.",
+                "which generally disagree with a hand-specified grouping. The "
+                "layered bucket budgets will be met by projecting the result, "
+                "which moves it away from HERC's own answer.",
                 stacklevel=3,
             )
 

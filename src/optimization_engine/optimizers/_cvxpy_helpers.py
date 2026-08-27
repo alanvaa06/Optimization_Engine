@@ -10,6 +10,7 @@ from dataclasses import dataclass
 import cvxpy as cp
 import numpy as np
 
+from optimization_engine.constraints import layer_cvxpy_constraints
 from optimization_engine.optimizers.base import PortfolioConstraints
 
 _LOG = logging.getLogger(__name__)
@@ -220,7 +221,12 @@ def bounds_arrays(
 def group_index_map(
     assets: list[str], constraints: PortfolioConstraints
 ) -> dict[str, list[int]]:
-    """Map each constrained group to the positions of its member assets."""
+    """Map each constrained group to the positions of its member assets.
+
+    Covers the flat ``groups`` mapping only. Kept because callers outside this
+    package use it; every optimizer in the engine now goes through
+    :func:`layer_constraints`, which sees the whole layered policy.
+    """
     grouped: dict[str, list[int]] = {}
     if not (constraints.groups and constraints.group_bounds):
         return grouped
@@ -229,6 +235,22 @@ def group_index_map(
         if g is not None and g in constraints.group_bounds:
             grouped.setdefault(g, []).append(i)
     return grouped
+
+
+def layer_constraints(
+    weights: cp.Variable,
+    assets: list[str],
+    constraints: PortfolioConstraints,
+    scale: cp.Variable | None = None,
+) -> list[cp.Constraint]:
+    """Every layered bucket budget, in weight space or in ray space.
+
+    ``scale`` is ``None`` for the direct formulations and the ``κ`` variable
+    for the homogeneous ``w = y/κ`` ones. See
+    :func:`optimization_engine.constraints.layer_cvxpy_constraints` for why a
+    percent-of-parent limit needs no rescaling in either.
+    """
+    return layer_cvxpy_constraints(weights, assets, constraints.layers, scale=scale)
 
 
 def build_constraints(
@@ -263,10 +285,7 @@ def build_constraints(
     cons.append(weights >= lb)
     cons.append(weights <= ub)
 
-    for group, idx in group_index_map(assets, constraints).items():
-        lo, hi = constraints.group_bounds[group]
-        cons.append(cp.sum(weights[idx]) >= float(lo))
-        cons.append(cp.sum(weights[idx]) <= float(hi))
+    cons.extend(layer_constraints(weights, assets, constraints))
 
     if constraints.previous_weights and constraints.turnover_limit is not None:
         prev = np.array(
@@ -360,8 +379,11 @@ def build_scaled_constraints(
     Max-Sharpe and max-diversification are both solved by minimizing a
     quadratic over a ray and normalizing afterwards. Every constraint that is
     *linear and homogeneous of degree one* in ``w`` carries over exactly once
-    it is scaled by ``κ = Σy`` — so per-asset bounds and group budgets stay
-    hard constraints instead of being applied by post-hoc projection.
+    it is scaled by ``κ = Σy`` — so per-asset bounds and every layer's bucket
+    budgets stay hard constraints instead of being applied by post-hoc
+    projection. A percent-of-parent limit needs no rescaling at all: both
+    sides are homogeneous, so ``Σ_child y ≤ hi·Σ_parent y`` says the same
+    thing in ray space as in weight space.
 
     The benchmark-relative limits carry over too, though they are not linear.
     With ``w − b = (y − κb)/κ`` and ``κ > 0``, an active-share cap becomes
@@ -392,10 +414,7 @@ def build_scaled_constraints(
     cons.append(y >= cp.multiply(lb, kappa))
     cons.append(y <= cp.multiply(ub, kappa))
 
-    for group, idx in group_index_map(assets, constraints).items():
-        lo, hi = constraints.group_bounds[group]
-        cons.append(cp.sum(y[idx]) >= float(lo) * kappa)
-        cons.append(cp.sum(y[idx]) <= float(hi) * kappa)
+    cons.extend(layer_constraints(y, assets, constraints, scale=kappa))
 
     benchmark = constraints.benchmark_vector(assets)
     if benchmark is None:

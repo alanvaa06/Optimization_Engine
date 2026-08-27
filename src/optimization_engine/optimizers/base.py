@@ -11,6 +11,12 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from optimization_engine.constraints import (
+    ConstraintLayer,
+    coerce_layers,
+    effective_layers,
+)
+
 _LOG = logging.getLogger(__name__)
 
 
@@ -47,6 +53,11 @@ class PortfolioConstraints:
         max_active_share: Cap on ``½·Σ|w_i − b_i|``. A positions-based limit
             that binds even in a calm market, where a tracking-error budget
             quietly permits a portfolio that shares nothing with its index.
+        constraint_layers: Additional levels of the allocation policy, each
+            slicing the universe its own way — sub-asset-class inside asset
+            class, currency across all of them. ``groups``/``group_bounds``
+            remain the first layer, so nothing that worked before changes;
+            see :mod:`optimization_engine.constraints`.
     """
 
     bounds: dict[str, tuple[float, float]] = field(default_factory=dict)
@@ -62,6 +73,27 @@ class PortfolioConstraints:
     benchmark_weights: dict[str, float] | None = None
     max_tracking_error: float | None = None
     max_active_share: float | None = None
+    constraint_layers: tuple[ConstraintLayer, ...] = field(default_factory=tuple)
+
+    def __post_init__(self) -> None:
+        # Accept the mapping form a YAML round-trip produces, so a config
+        # loaded from disk and one built in memory behave identically.
+        self.constraint_layers = coerce_layers(self.constraint_layers)
+
+    @property
+    def layers(self) -> tuple[ConstraintLayer, ...]:
+        """Every level of the policy, the legacy grouping first.
+
+        One accessor for the solver, the projection, the compliance check and
+        the feasibility report, so none of them can be reading a different
+        policy from the others.
+        """
+        return effective_layers(self)
+
+    @property
+    def has_layer_limits(self) -> bool:
+        """Whether anything is constrained above the per-asset level."""
+        return any(lyr.is_active for lyr in self.layers)
 
     @property
     def is_benchmark_relative(self) -> bool:

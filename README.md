@@ -114,7 +114,15 @@ what it assumes — the same text the UI shows next to the method picker.
 **Constraints**
 
 * Per-asset weight bounds.
-* Group / asset-class bounds (e.g. equity 30–70%).
+* **Layered allocation limits** — any number of levels, all binding at once:
+  asset class (equity ≤ 60%, fixed income ≤ 30%, commodities ≤ 10%),
+  sub-asset class inside each of those (developed ≤ 40%, emerging ≤ 20%), and
+  a currency split cutting across all of them (foreign FX ≤ 30%). A level's
+  limits are read either as a share of the whole book or as a share of the
+  parent bucket — "30% emerging" can mean 30% of the portfolio or 30% *of the
+  equity sleeve*, and the second one moves with whatever the optimizer
+  allocates to equity. Both are linear in the weights, so the problems stay
+  convex; see [Layered constraints](#layered-constraints).
 * Long-only or long-short with a gross-exposure cap.
 * Target return, target volatility, or risk-aversion utility.
 * Turnover budget against a previous allocation.
@@ -466,16 +474,23 @@ surfaces what could make the next one wrong.
 2. **Assets** — per-asset statistics (extended metrics on a toggle) plus a
    drawdown-episode table with peak, trough, recovery and time underwater.
 3. **Assumptions & constraints** — editable expected returns, weight bounds,
-   groups, group budgets, per-method inputs (risk budgets, Black-Litterman
-   views both absolute and relative, cluster counts and linkage for HERC/NCO,
-   the CDaR tail), the covariance estimator with its **denoising and detoning**
-   toggles, and a **live feasibility check** that names the constraint making
-   the problem impossible and what to change, before you ever press solve.
+   asset-class budgets, a **layered-limit builder** where you add as many
+   levels of the mandate as it has (name the buckets, assign assets from a
+   dropdown or fill them in one click from the Group or Currency column, and
+   cap each bucket as a share of the portfolio or of its parent), per-method
+   inputs (risk budgets, Black-Litterman views both absolute and relative,
+   cluster counts and linkage for HERC/NCO, the CDaR tail), the covariance
+   estimator with its **denoising and detoning** toggles, and a **live
+   feasibility check** that names the constraint making the problem
+   impossible and what to change, before you ever press solve.
 
    ![The constraints tab, with the method card and the live feasibility check](docs/images/app-constraints.png)
 4. **Optimize** — a compliance banner, KPI cards, concentration and
-   diversification measures, a capital-vs-risk chart, the full Euler
-   decomposition, and a frontier marked with the minimum-variance and
+   diversification measures, a **policy-exposure table** that says where the
+   book landed on every layer and marks which bucket actually stopped it, a
+   capital-vs-risk chart, the full Euler decomposition (with risk shares per
+   layer, because a 30% bond sleeve rarely carries 30% of the risk), and a
+   frontier marked with the minimum-variance and
    tangency portfolios, the capital allocation line, and where your portfolio
    actually sits — plus an opt-in panel that redraws the frontier as a
    confidence band and names the positions the sample cannot pin down.
@@ -603,6 +618,71 @@ print(deflated_sharpe_ratio(wf.returns, n_trials=40).describe())
 # How many bets is this, once correlations are accounted for?
 print(run.diversification_comparison())
 ```
+
+### Layered constraints
+
+A mandate is written in levels, and a single flat grouping can only express
+one of them. `constraint_layers` takes as many as the policy has; all of them
+bind at once.
+
+```python
+from optimization_engine import (
+    EngineConfig, OptimizerSpec, currency_layer, layer_from_mapping, run_engine,
+)
+
+asset_class = {"SPY": "Equity", "EFA": "Equity", "EEM": "Equity",
+               "AGG": "Fixed Income", "EMB": "Fixed Income", "GLD": "Commodities"}
+
+config = EngineConfig(
+    expected_returns=mu,
+    # Layer 1: no more than 60% equity, 30% fixed income, 10% commodities.
+    groups=asset_class,
+    group_bounds={"Equity": [0.0, 0.60],
+                  "Fixed Income": [0.0, 0.30],
+                  "Commodities": [0.0, 0.10]},
+    constraint_layers=[
+        # Layer 2: inside equity, at most 30% emerging — of the *sleeve*, so
+        # the cap moves with whatever the optimizer puts in equity. The parent
+        # bucket of each child is derived from the assignments, not typed twice.
+        layer_from_mapping(
+            "Sub-asset class",
+            {"SPY": "DM", "EFA": "DM", "EEM": "EM", "AGG": "DM FI", "EMB": "EM FI"},
+            {"EM": 0.30, "EM FI": 0.25},
+            basis="parent", parent="Asset class",
+        ),
+        # Layer 3: at most 30% foreign currency, cutting across both.
+        currency_layer(
+            "FX exposure",
+            {"SPY": "USD", "EFA": "EUR", "EEM": "EUR",
+             "AGG": "USD", "EMB": "USD", "GLD": "EUR"},
+            base_currency="USD", foreign_max=0.30,
+        ),
+    ],
+    optimizer=OptimizerSpec(name="max_sharpe"),
+)
+
+run = run_engine(returns, config)
+print(run.layer_exposures())            # every bucket, its limit, its headroom
+print(run.layer_risk_contributions("Sub-asset class"))   # risk, not capital
+```
+
+`layer_exposures()` restates a percent-of-parent limit as a share of the book
+— a 30% cap on a 55% equity sleeve is a 16.5% cap on the portfolio — and marks
+the buckets that are binding, which is the answer to "why this portfolio": a
+book held at 60% equity by the asset-class cap is a different portfolio from
+one held there because the emerging sub-limit ran out.
+
+Every method honours every layer. The convex solves impose them directly; the
+allocate-then-constrain methods project onto the closest feasible allocation
+and report the distance. A percent-of-parent limit is homogeneous of degree
+one, so it survives the change of variables in max-Sharpe and
+max-diversification rather than being applied afterwards.
+
+Before solving, `analyze_feasibility` checks each layer's arithmetic and says
+what to change — caps that cannot fund a full book, a bucket with limits and
+no members, sub-limits that cannot fill the sleeve they sit in, or a bucket
+whose members straddle two parents (where "40% of the parent" has no meaning
+and the engine refuses rather than guessing).
 
 Which method should you even be using? Measure it rather than argue about it:
 

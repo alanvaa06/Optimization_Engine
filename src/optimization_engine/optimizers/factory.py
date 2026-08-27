@@ -75,6 +75,7 @@ def constraints_from_config(
     bounds = {k: tuple(v) for k, v in config.bounds.items()}
     group_bounds = {k: tuple(v) for k, v in config.group_bounds.items()}
     return PortfolioConstraints(
+        constraint_layers=tuple(config.constraint_layers),
         benchmark_weights=config.benchmark_weight_map(assets),
         max_tracking_error=config.max_tracking_error,
         max_active_share=config.max_active_share,

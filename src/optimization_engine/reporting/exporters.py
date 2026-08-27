@@ -149,6 +149,12 @@ def run_sheets(
     if performance is not None:
         sheets.update(performance_sheets(performance))
 
+    exposures = run.layer_exposures()
+    if not exposures.empty:
+        # The policy as realized, not as written: which bucket on which layer
+        # actually stopped the optimizer is the first thing a committee asks.
+        sheets["allocation_layers"] = exposures.set_index(["layer", "bucket"])
+
     if run.diagnostics is not None:
         sheets["portfolio_diagnostics"] = pd.DataFrame(
             [

@@ -15,6 +15,7 @@ from dataclasses import dataclass, field
 import numpy as np
 import pandas as pd
 
+from optimization_engine.constraints import layer_breaches
 from optimization_engine.optimizers.base import PortfolioConstraints
 
 #: Weight drift below this is floating-point noise, not a real violation.
@@ -90,22 +91,12 @@ def check_constraints(
                 )
             )
 
-    if constraints.groups and constraints.group_bounds:
-        group_sum: dict[str, float] = {}
-        for asset, w in weights.items():
-            g = constraints.groups.get(str(asset))
-            if g is not None:
-                group_sum[g] = group_sum.get(g, 0.0) + float(w)
-        for group, (lo, hi) in constraints.group_bounds.items():
-            total = group_sum.get(group, 0.0)
-            if total < float(lo) - tolerance:
-                out.append(
-                    ConstraintViolation("group", f"Group {group!r} lower bound", float(lo), total)
-                )
-            if total > float(hi) + tolerance:
-                out.append(
-                    ConstraintViolation("group", f"Group {group!r} upper bound", float(hi), total)
-                )
+    # Every layer of the policy at once — asset class, sub-asset class,
+    # currency — measured against the limit as a share of the book, so a
+    # percent-of-parent cap is reported in the same units as the weights it
+    # is being compared with.
+    for label, _side, limit, actual in layer_breaches(weights, constraints.layers, tolerance):
+        out.append(ConstraintViolation("group", label, limit, actual))
 
     if constraints.previous_weights and constraints.turnover_limit is not None:
         prev = pd.Series(constraints.previous_weights).reindex(weights.index).fillna(0.0)
