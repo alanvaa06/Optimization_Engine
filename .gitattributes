@@ -1,0 +1,5 @@
+# The holdout audit log is append-only and written independently on every
+# branch, so the default merge driver conflicts on it every single time.
+# `union` keeps both sides' lines, which is exactly right for a log whose
+# whole purpose is that no entry ever goes missing.
+runs/holdout_audit.jsonl merge=union
