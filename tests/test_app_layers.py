@@ -27,6 +27,9 @@ from streamlit.testing.v1 import AppTest  # noqa: E402
 
 from optimization_engine.ui_state import layer_states_to_layers  # noqa: E402
 
+sys.path.insert(0, str(ROOT / "app"))
+from layer_editor import _current_bucket_weights  # noqa: E402
+
 APP = ROOT / "app" / "streamlit_app.py"
 
 ASSET_CLASS = {
@@ -174,3 +177,38 @@ def test_removing_a_layer_removes_it_from_the_solve(app):
     assert "Region" not in [
         s["name"] for s in app.session_state["constraint_layer_states"]
     ]
+
+
+def test_the_live_column_states_the_book_in_the_units_of_the_limit_beside_it(app):
+    """A number in the wrong units next to a limit invites the very mistake
+    the column exists to prevent, so both bases are checked explicitly."""
+    run = app.session_state["last_run"]
+    assert run is not None, "depends on the solve in the first test"
+    weights = run.result.weights
+    state = dict(app.session_state["constraint_layer_states"][0])
+    state["assignments"] = {
+        a: SUB_CLASS.get(a, "—") for a in app.session_state["config_table"].index
+    }
+
+    equity = sum(w for a, w in weights.items() if ASSET_CLASS[a] == "Equity")
+    em = sum(w for a, w in weights.items() if SUB_CLASS.get(a) == "EM Equity")
+    assert equity > 0.01 and em > 0.001
+
+    state["basis"] = "portfolio"
+    absolute = _current_bucket_weights(state, weights)
+    assert absolute["EM Equity"] == pytest.approx(100 * em)
+
+    state["basis"] = "parent"
+    state["parent"] = "Asset class"
+    relative = _current_bucket_weights(state, weights, parent_assignments=ASSET_CLASS)
+    assert relative["EM Equity"] == pytest.approx(100 * em / equity)
+
+
+def test_the_live_column_is_absent_when_there_is_nothing_to_compare_against(app):
+    state = dict(app.session_state["constraint_layer_states"][0])
+    assert _current_bucket_weights(state, None) is None
+    state["basis"] = "parent"
+    # Relative units cannot be formed without the parent's assignments.
+    assert _current_bucket_weights(
+        state, app.session_state["last_run"].result.weights
+    ) is None

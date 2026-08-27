@@ -1249,12 +1249,19 @@ with tab_constraints:
                 for g, row in st.session_state.group_bounds.iterrows()
             }
         st.divider()
+        _last_run = st.session_state.get("last_run")
         render_layer_builder(
             list(returns.columns),
             groups=asset_groups,
             currencies=dict(st.session_state.asset_currency),
             base_currency=base_currency,
             base_layer_limits=base_limits,
+            # The previous solve, so each limit sits next to where the book
+            # actually landed. That turns the builder into a loop instead of
+            # a form filled in blind.
+            current_weights=(
+                None if _last_run is None else _last_run.result.weights
+            ),
         )
     else:
         st.caption(

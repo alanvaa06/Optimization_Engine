@@ -43,6 +43,7 @@ from optimization_engine.ui_state import (
 #: Where the editor's per-layer state lives.
 STATE_KEY = "constraint_layer_states"
 _UID_KEY = "constraint_layer_next_uid"
+_NEWEST_KEY = "constraint_layer_newest_uid"
 
 _BASIS_LABELS = {
     BASIS_PORTFOLIO: "% of total portfolio",
@@ -70,7 +71,17 @@ def _states() -> list[dict]:
 def _next_uid() -> int:
     uid = int(st.session_state.get(_UID_KEY, 1))
     st.session_state[_UID_KEY] = uid + 1
+    st.session_state[_NEWEST_KEY] = uid
     return uid
+
+
+def _newest_uid() -> int:
+    """The layer added most recently, which is the one worth leaving open.
+
+    Expanding every layer turns a four-layer mandate into a page of editors
+    nobody scrolls; collapsing all of them hides the one just created.
+    """
+    return int(st.session_state.get(_NEWEST_KEY, -1))
 
 
 def _forget_widgets(uid: int) -> None:
@@ -122,6 +133,7 @@ def render_layer_builder(
     base_currency: str,
     base_layer_name: str = LEGACY_LAYER_NAME,
     base_layer_limits: dict | None = None,
+    current_weights: pd.Series | None = None,
 ) -> list[ConstraintLayer]:
     """Draw the whole builder and return the layers it describes.
 
@@ -134,9 +146,18 @@ def render_layer_builder(
         base_layer_name: What the first (Group-column) layer is called.
         base_layer_limits: That layer's ``bucket -> (lo, hi)``, so a relative
             layer can show what it nests inside.
+        current_weights: The last solved allocation, if there is one. Shown
+            beside each limit as a read-only column, which is what turns the
+            builder into a loop: set a cap, solve, see where the book landed,
+            adjust. Without it the analyst is typing limits blind until the
+            next solve.
     """
     assets = [str(a) for a in assets]
     states = _states()
+    if current_weights is not None and set(current_weights.index) != set(assets):
+        # A book solved over a different universe would put numbers next to
+        # limits they do not describe.
+        current_weights = None
 
     st.markdown("**Layered allocation limits**")
     st.caption(
@@ -151,6 +172,7 @@ def render_layer_builder(
     _render_base_layer(assets, groups, base_layer_name, base_layer_limits)
 
     kept: list[dict] = []
+    parent_lookup: dict[str, dict] = {base_layer_name: dict(groups)}
     for position, state in enumerate(states):
         synced = sync_layer_state(state, assets)
         parent_options = _parent_options(base_layer_name, kept, synced["name"])
@@ -163,6 +185,9 @@ def render_layer_builder(
             base_currency=base_currency,
             parent_options=parent_options,
             taken_names=[base_layer_name] + [s["name"] for s in kept],
+            current_weights=current_weights,
+            parent_lookup=dict(parent_lookup),
+            expanded=(len(states) == 1 or state["uid"] == _newest_uid()),
         )
         if removed:
             # Redraw straight away rather than finishing a page that still
@@ -171,6 +196,7 @@ def render_layer_builder(
             _forget_widgets(synced["uid"])
             st.rerun()
         kept.append(updated)
+        parent_lookup[updated["name"]] = dict(updated["assignments"])
     if kept != states:
         st.session_state[STATE_KEY] = kept
 
@@ -219,6 +245,9 @@ def _render_layer(
     base_currency: str,
     parent_options: list[str],
     taken_names: list[str],
+    current_weights: pd.Series | None = None,
+    parent_lookup: dict | None = None,
+    expanded: bool = True,
 ) -> tuple[dict, bool]:
     """Draw one layer's editor. Returns ``(new_state, removed)``."""
     uid = state["uid"]
@@ -231,7 +260,7 @@ def _render_layer(
     )
     with st.expander(
         f"Layer {position + 2} · {label} — {n_capped} limit(s){basis_note}",
-        expanded=True,
+        expanded=expanded,
     ):
         head_l, head_m, head_r = st.columns([3, 3, 1])
         with head_l:
@@ -334,26 +363,42 @@ def _render_layer(
                 else "% of portfolio"
             )
             st.caption(f"**Limits per bucket** ({unit})")
-            limits_frame = pd.DataFrame(
-                {
-                    "Min": [float(state["limits"][b][0]) for b in state["buckets"]],
-                    "Max": [float(state["limits"][b][1]) for b in state["buckets"]],
-                },
-                index=state["buckets"],
+            columns = {
+                "Min": [float(state["limits"][b][0]) for b in state["buckets"]],
+                "Max": [float(state["limits"][b][1]) for b in state["buckets"]],
+            }
+            column_config = {
+                "Min": st.column_config.NumberColumn(
+                    min_value=0.0, max_value=1.5, step=0.05, format="%.2f"
+                ),
+                "Max": st.column_config.NumberColumn(
+                    min_value=0.0, max_value=1.5, step=0.05, format="%.2f"
+                ),
+            }
+            now = _current_bucket_weights(
+                state,
+                current_weights,
+                (parent_lookup or {}).get(state["parent"]),
             )
+            if now is not None:
+                columns["Now"] = [now.get(b, 0.0) for b in state["buckets"]]
+                column_config["Now"] = st.column_config.NumberColumn(
+                    "Now",
+                    disabled=True,
+                    format="%.1f%%",
+                    help=(
+                        "Where the last solved portfolio put this bucket, on "
+                        "the same basis as the limits beside it. A cap above "
+                        "it will not bind."
+                    ),
+                )
+            limits_frame = pd.DataFrame(columns, index=state["buckets"])
             edited_limits = st.data_editor(
                 limits_frame,
                 width="stretch",
                 num_rows="fixed",
                 key=f"layer_limits_{uid}",
-                column_config={
-                    "Min": st.column_config.NumberColumn(
-                        min_value=0.0, max_value=1.5, step=0.05, format="%.2f"
-                    ),
-                    "Max": st.column_config.NumberColumn(
-                        min_value=0.0, max_value=1.5, step=0.05, format="%.2f"
-                    ),
-                },
+                column_config=column_config,
             )
             state["limits"] = {
                 b: (
@@ -366,6 +411,57 @@ def _render_layer(
 
         _render_layer_health(state, assets)
     return state, False
+
+
+def _current_bucket_weights(
+    state: dict,
+    weights: pd.Series | None,
+    parent_assignments: dict | None = None,
+):
+    """The last solved book aggregated to this layer's buckets, as percents.
+
+    Stated on the *same basis as the limits sitting beside it* — a share of
+    the parent sleeve for a relative layer, a share of the book otherwise — so
+    the two columns can be read against each other without arithmetic. Getting
+    this wrong would be worse than omitting it: a number in the wrong units
+    next to a limit invites exactly the mistake the column exists to prevent.
+
+    Returns ``None`` when there is nothing to compare against.
+    """
+    if weights is None or not state["buckets"]:
+        return None
+    assignments = {
+        a: b for a, b in state["assignments"].items() if b != UNASSIGNED
+    }
+    if not assignments:
+        return None
+    totals: dict[str, float] = {}
+    for asset, bucket in assignments.items():
+        if asset in weights.index:
+            totals[bucket] = totals.get(bucket, 0.0) + float(weights[asset])
+
+    if state["basis"] != BASIS_PARENT:
+        return {b: 100.0 * v for b, v in totals.items()}
+    if not parent_assignments:
+        return None
+
+    sleeve: dict[str, float] = {}
+    for asset, up in parent_assignments.items():
+        if asset in weights.index:
+            sleeve[up] = sleeve.get(up, 0.0) + float(weights[asset])
+    out: dict[str, float] = {}
+    for bucket, held in totals.items():
+        parents = {
+            parent_assignments.get(a)
+            for a, b in assignments.items()
+            if b == bucket and parent_assignments.get(a) is not None
+        }
+        if len(parents) != 1:
+            continue  # straddles two sleeves; the feasibility panel says so
+        base = sleeve.get(parents.pop(), 0.0)
+        if base > 1e-9:
+            out[bucket] = 100.0 * held / base
+    return out or None
 
 
 def _rename_buckets(state: dict, typed: list[str]) -> dict:
