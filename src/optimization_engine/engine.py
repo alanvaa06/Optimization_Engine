@@ -23,9 +23,14 @@ from optimization_engine.analytics.backtest import (
 )
 from optimization_engine.analytics.performance import summary_stats
 from optimization_engine.analytics.relative import summary_relative
+from optimization_engine.analytics.report import PerformanceReport, performance_report
 from optimization_engine.analytics.risk import (
     group_risk_contribution,
     risk_contribution,
+)
+from optimization_engine.benchmark import (
+    ResolvedBenchmark,
+    resolve_benchmark,
 )
 from optimization_engine.config import EngineConfig
 from optimization_engine.data.covariance import (
@@ -34,6 +39,7 @@ from optimization_engine.data.covariance import (
     covariance_from_config,
 )
 from optimization_engine.frontier import FrontierResult, efficient_frontier
+from optimization_engine.optimizers._cvxpy_helpers import SolverFailure
 from optimization_engine.optimizers.base import OptimizationResult
 from optimization_engine.optimizers.diagnostics import (
     PortfolioDiagnostics,
@@ -43,6 +49,7 @@ from optimization_engine.optimizers.factory import (
     constraints_from_config,
     effective_expected_returns,
     optimizer_factory,
+    validate_benchmark_constraints,
 )
 from optimization_engine.optimizers.feasibility import (
     FeasibilityReport,
@@ -92,6 +99,9 @@ class EngineRun:
     feasibility: FeasibilityReport | None = None
     covariance_diagnostics: CovarianceDiagnostics | None = None
     warnings: tuple[str, ...] = field(default_factory=tuple)
+    #: The benchmark this run was measured — and possibly optimized — against,
+    #: resolved once at solve time so every downstream view uses the same one.
+    benchmark: ResolvedBenchmark | None = None
 
     # -- allocation views ---------------------------------------------------
 
@@ -141,24 +151,37 @@ class EngineRun:
 
     # -- benchmark-relative -------------------------------------------------
 
+    @property
+    def benchmark_returns(self) -> pd.Series | None:
+        """The benchmark's return stream, or None when none was chosen."""
+        return None if self.benchmark is None else self.benchmark.returns
+
+    @property
+    def benchmark_label(self) -> str | None:
+        return None if self.benchmark is None else self.benchmark.label
+
     def _benchmark_weights(self) -> pd.Series:
-        """The benchmark this run is measured against.
+        """The benchmark's weights over this run's universe.
 
         Raises:
-            ValueError: When the config carries no benchmark. Active analytics
-                are meaningless without one, and defaulting to equal weights
-                would invent a benchmark nobody chose.
+            ValueError: When no benchmark is set, or when the one that is set
+                has no positions in the investable universe. Active analytics
+                are meaningless without a weight vector, and defaulting to
+                equal weights would invent a benchmark nobody chose.
         """
-        if not self.config.benchmark_weights:
+        assets = list(self.result.weights.index)
+        weights = self.config.benchmark_weight_map(assets)
+        if weights is None and self.benchmark is not None:
+            resolved = self.benchmark.weights
+            weights = None if resolved is None else resolved.to_dict()
+        if not weights:
             raise ValueError(
-                "This run has no benchmark_weights, so there are no active "
-                "positions to analyze. Set config.benchmark_weights first."
+                "This run has no position-based benchmark, so there are no "
+                "active positions to analyze. Choose a benchmark defined by "
+                "weights (1/N, a single asset, or a custom vector) — an "
+                "external index has no holdings in this universe."
             )
-        return (
-            pd.Series(self.config.benchmark_weights)
-            .reindex(self.result.weights.index)
-            .fillna(0.0)
-        )
+        return pd.Series(weights).reindex(assets).fillna(0.0)
 
     def active_risk_decomposition(self) -> pd.DataFrame:
         """Euler decomposition of *tracking error*, per asset.
@@ -204,6 +227,8 @@ class EngineRun:
         """
         port = (self.returns * self.result.weights.reindex(self.returns.columns).fillna(0.0)).sum(axis=1)
         out = pd.DataFrame({"portfolio": port})
+        if benchmark_returns is None and self.benchmark is not None:
+            benchmark_returns = self.benchmark.returns
         if benchmark_returns is not None:
             out["benchmark"] = benchmark_returns.reindex(port.index)
         return out
@@ -321,6 +346,88 @@ class EngineRun:
             extended=extended,
         )
 
+    def performance(
+        self,
+        riskfree_rate: float | None = None,
+        frequency: RebalanceFrequency | None = "monthly",
+        transaction_cost_bps: float = 0.0,
+        benchmark_returns: pd.Series | None = None,
+        rolling_window: int | None = None,
+        period_freq: str = "yearly",
+        returns_override: pd.Series | None = None,
+    ) -> PerformanceReport:
+        """Absolute and relative performance of this run, in one object.
+
+        Args:
+            riskfree_rate: Annual rate for the ratios. Defaults to the
+                optimizer's own, so the report and the solve agree on cash.
+            frequency: Rebalancing rule for the replay. ``None`` uses the
+                costless constant-weight replay instead, which is the older
+                and more optimistic convention.
+            transaction_cost_bps: One-way cost charged at each rebalance.
+            benchmark_returns: Override the run's own benchmark stream — used
+                to report against something other than the one optimized
+                against, and by the walk-forward view.
+            rolling_window: Window for the rolling frames. Defaults to a year.
+            period_freq: ``yearly``, ``quarterly`` or ``monthly`` table.
+            returns_override: Use this return stream as the portfolio's
+                instead of replaying the weights. This is how a walk-forward
+                track record gets the same report as the fitted one.
+
+        Note:
+            Unless ``returns_override`` carries an out-of-sample stream, every
+            number here is in-sample: the optimizer estimated its inputs from
+            these same returns.
+        """
+        rf = (
+            self.config.optimizer.risk_free_rate
+            if riskfree_rate is None
+            else float(riskfree_rate)
+        )
+        metadata: dict[str, Any] = {
+            "optimizer": self.config.optimizer.name,
+            "rebalancing": str(frequency or "none (constant weights)"),
+            "transaction_cost_bps": float(transaction_cost_bps),
+            "out_of_sample": returns_override is not None,
+        }
+        if returns_override is not None:
+            portfolio = pd.Series(returns_override).dropna()
+        elif frequency is None:
+            portfolio = self.backtest_returns()["portfolio"]
+        else:
+            bt = self.backtest(
+                frequency=frequency, transaction_cost_bps=transaction_cost_bps
+            )
+            portfolio = bt.returns
+            metadata["annualized_turnover"] = float(bt.annualized_turnover)
+            metadata["total_cost"] = float(bt.total_cost)
+
+        bench = benchmark_returns
+        if bench is None and self.benchmark is not None:
+            bench = self.benchmark.returns
+        label = self.benchmark_label if benchmark_returns is None else "Benchmark"
+
+        benchmark_weights = None
+        if self.benchmark is not None and self.benchmark.weights is not None:
+            benchmark_weights = self.benchmark.weights
+        elif self.config.benchmark_weight_map(list(self.result.weights.index)):
+            benchmark_weights = pd.Series(
+                self.config.benchmark_weight_map(list(self.result.weights.index))
+            )
+
+        return performance_report(
+            portfolio,
+            bench,
+            periods_per_year=self.config.periods_per_year,
+            riskfree_rate=rf,
+            portfolio_weights=self.result.weights,
+            benchmark_weights=benchmark_weights,
+            benchmark_label=label,
+            rolling_window=rolling_window,
+            period_freq=period_freq,
+            metadata=metadata,
+        )
+
     def relative_summary(self, benchmark_returns: pd.Series) -> pd.DataFrame:
         bt = self.backtest_returns(benchmark_returns)
         return summary_relative(
@@ -363,6 +470,12 @@ class EngineRun:
             "fully_invested": self.config.fully_invested,
             "leverage_cap": self.config.leverage,
             "turnover_limit": self.config.turnover_limit,
+            "benchmark": (self.benchmark_label or "—"),
+            "benchmark_kind": (
+                self.benchmark.spec.kind if self.benchmark is not None else "none"
+            ),
+            "max_tracking_error": self.config.max_tracking_error,
+            "max_active_share": self.config.max_active_share,
             "solver": self.result.extras.get("solver"),
             "solver_status": self.result.extras.get("solver_status"),
         }
@@ -377,6 +490,7 @@ def run_engine(
     return_range: tuple[float, float] | None = None,
     check_feasibility: bool = True,
     raise_on_infeasible: bool = False,
+    external_returns: pd.DataFrame | pd.Series | None = None,
 ) -> EngineRun:
     """Run the engine end-to-end.
 
@@ -394,6 +508,8 @@ def run_engine(
             turns ``status=infeasible`` into an actionable message.
         raise_on_infeasible: Raise :class:`InfeasibleConstraintsError` instead
             of letting the solver fail with a less informative error.
+        external_returns: Return series from outside the investable universe,
+            needed only when ``config.benchmark`` names an external index.
 
     Raises:
         ValueError: If ``returns`` is empty or has no columns.
@@ -434,6 +550,13 @@ def run_engine(
         )
     expected_returns = expected_returns.reindex(returns.columns).fillna(0.0)
 
+    benchmark = resolve_benchmark(config.benchmark, returns, external_returns)
+    constraints = constraints_from_config(config, list(returns.columns))
+    # Before the feasibility LP, not after: a budget with no benchmark to
+    # measure it against is a configuration error, and the LP would otherwise
+    # be the first thing to trip over it and report it as a solver problem.
+    validate_benchmark_constraints(config.optimizer, constraints)
+
     feasibility: FeasibilityReport | None = None
     if check_feasibility:
         # Black-Litterman optimizes against its equilibrium posterior, not the
@@ -441,7 +564,7 @@ def run_engine(
         # returns the solver will really see.
         feasibility = analyze_feasibility(
             list(returns.columns),
-            constraints_from_config(config),
+            constraints,
             expected_returns=effective_expected_returns(config, cov, expected_returns),
             cov_matrix=cov,
         )
@@ -451,7 +574,21 @@ def run_engine(
     optimizer = optimizer_factory(
         config, cov, expected_returns=expected_returns, returns=returns
     )
-    result = optimizer.optimize()
+    try:
+        result = optimizer.optimize()
+    except SolverFailure as exc:
+        # A solver that reports "infeasible" has found the same thing the
+        # pre-solve analysis did, but says it in solver terms. When the
+        # analysis named the culprit, attach its findings rather than leaving
+        # the caller with "no allocation satisfies every constraint at once" —
+        # the useful sentence is "the 7% return target is above the 6.8% these
+        # constraints reach". The exception type is unchanged, so callers
+        # catching SolverFailure keep working.
+        if feasibility is not None and not feasibility.is_feasible:
+            raise SolverFailure(
+                exc.status, exc.attempts, detail=feasibility.describe()
+            ) from exc
+        raise
 
     frontier = None
     if build_frontier:
@@ -479,4 +616,5 @@ def run_engine(
         feasibility=feasibility,
         covariance_diagnostics=cov_diag,
         warnings=tuple(run_warnings),
+        benchmark=benchmark,
     )

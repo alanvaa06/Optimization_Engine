@@ -66,7 +66,9 @@ class MaxDiversificationOptimizer(BaseOptimizer):
         sigma_psd = cp.psd_wrap(sigma)
         objective = cp.Minimize(cp.quad_form(y, sigma_psd))
         cons = [std @ y == 1]
-        cons += build_scaled_constraints(y, kappa, self.assets, self.constraints)
+        cons += build_scaled_constraints(
+            y, kappa, self.assets, self.constraints, cov_matrix=sigma
+        )
 
         problem = cp.Problem(objective, cons)
         try:

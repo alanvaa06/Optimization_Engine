@@ -39,7 +39,9 @@ class MinVarianceOptimizer(BaseOptimizer):
         n = len(self.assets)
         w = cp.Variable(n)
         objective = cp.Minimize(cp.quad_form(w, cp.psd_wrap(sigma)))
-        constraints = build_constraints(w, self.assets, self.constraints)
+        constraints = build_constraints(
+            w, self.assets, self.constraints, cov_matrix=sigma
+        )
         problem = cp.Problem(objective, constraints)
         info = solve_problem(problem)
         if w.value is None:
@@ -109,7 +111,9 @@ class MeanVarianceOptimizer(BaseOptimizer):
             objective = cp.Maximize(mu @ w - self.risk_aversion * cp.quad_form(w, sigma_psd))
             extra = []
 
-        cons = build_constraints(w, self.assets, self.constraints, extra)
+        cons = build_constraints(
+            w, self.assets, self.constraints, extra, cov_matrix=sigma
+        )
         problem = cp.Problem(objective, cons)
         info = solve_problem(problem)
         if w.value is None:
@@ -170,7 +174,9 @@ class MaxSharpeOptimizer(BaseOptimizer):
         sigma_psd = cp.psd_wrap(sigma)
         objective = cp.Minimize(cp.quad_form(y, sigma_psd))
         cons = [excess @ y == 1]
-        cons += build_scaled_constraints(y, kappa, self.assets, self.constraints)
+        cons += build_scaled_constraints(
+            y, kappa, self.assets, self.constraints, cov_matrix=sigma
+        )
 
         problem = cp.Problem(objective, cons)
         info = solve_problem(problem)

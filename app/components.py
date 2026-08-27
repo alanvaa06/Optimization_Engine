@@ -24,11 +24,24 @@ PERCENT_COLUMNS = {
     "Annualized Excess", "Annualized T.E.", "Expected Return", "Expected Vol",
     "Historic VaR(5%)", "Cornish-Fisher VaR(5%)", "Historic CVaR(5%)",
     "In-sample (fitted)", "Out-of-sample (walk-forward)", "Degradation",
+    # Absolute and relative performance additions.
+    "Best Period", "Worst Period", "Alpha (annualized)", "Residual Vol",
+    "Downside T.E.", "Worst Relative Drawdown", "M-squared", "Treynor Ratio",
+    # Calendar-period tables, whose columns are the series themselves.
+    "Portfolio", "Benchmark", "Excess",
 }
 RATIO_COLUMNS = {
     "Sharpe Ratio", "Sortino Ratio", "Calmar Ratio", "Omega Ratio",
     "Tail Ratio", "Skewness", "Kurtosis", "Ulcer Index", "Beta",
     "Information Ratio", "Up Capture", "Down Capture", "Capture", "Sharpe",
+    "Martin Ratio", "Gain-to-Pain", "Win/Loss Ratio", "Appraisal Ratio",
+    "Correlation", "R-squared", "Up Beta", "Down Beta", "Beta Asymmetry",
+    "Alpha t-stat",
+}
+#: Reported as percentages of *periods* rather than of money.
+SHARE_COLUMNS = {
+    "Hit Rate", "Prob. Sharpe > 0", "Time Under Water", "Batting Average",
+    "Up Number Ratio", "Down Number Ratio", "Prob. Excess > 0", "Active Share",
 }
 
 
@@ -303,6 +316,46 @@ def render_method_card(req) -> None:
             needs.append("the full return history")
         if needs:
             st.caption(f"Inputs used: {', '.join(needs)}.")
+
+
+def render_benchmark(run) -> None:
+    """State which benchmark is in force, and what it does and does not offer.
+
+    Rendered wherever relative numbers appear, because "information ratio
+    0.6" is not a fact until the reader knows what it is 0.6 against.
+    """
+    bench = getattr(run, "benchmark", None)
+    if bench is None:
+        st.info(
+            "No benchmark is set. Absolute numbers say what happened; only a "
+            "benchmark says whether the process earned its fee. Choose one in "
+            "the sidebar under **6 · Benchmark**."
+        )
+        return
+
+    bits = [f"**{bench.label}**"]
+    if bench.spec.kind != "external":
+        bits.append(
+            "rebalanced every period"
+            if bench.spec.rebalance == "periodic"
+            else "bought and held"
+        )
+    limits = []
+    cfg = getattr(run, "config", None)
+    if cfg is not None and cfg.max_tracking_error is not None:
+        limits.append(f"tracking error ≤ {cfg.max_tracking_error:.2%}")
+    if cfg is not None and cfg.max_active_share is not None:
+        limits.append(f"active share ≤ {cfg.max_active_share:.0%}")
+    line = " · ".join(bits)
+    if limits:
+        line += f" — optimized subject to {', '.join(limits)}"
+    st.caption(line)
+    if not bench.has_weights:
+        st.caption(
+            "This benchmark is a return series with no holdings in the "
+            "universe, so active share and the active-risk decomposition are "
+            "unavailable. Every return-based metric below still applies."
+        )
 
 
 def render_assumptions(assumptions: dict[str, Any]) -> None:

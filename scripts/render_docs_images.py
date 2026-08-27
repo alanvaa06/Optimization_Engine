@@ -28,15 +28,19 @@ if str(SRC) not in sys.path:
 import plotly.io as pio  # noqa: E402
 
 from optimization_engine import (  # noqa: E402
+    BenchmarkSpec,
     EngineConfig,
     OptimizerSpec,
     prices_to_returns,
     run_engine,
     sample_dataset,
 )
+from optimization_engine.analytics.report import BENCHMARK, PORTFOLIO  # noqa: E402
 from optimization_engine.reporting.plots import (  # noqa: E402
     plot_efficient_frontier,
     plot_frontier_uncertainty,
+    plot_period_returns,
+    plot_relative_wealth,
     plot_walk_forward_comparison,
     plot_weight_vs_risk,
 )
@@ -174,6 +178,43 @@ def build(output: Path) -> None:
         f"{comparison.loc['Sharpe Ratio', 'In-sample (fitted)']:.2f} in-sample vs "
         f"{comparison.loc['Sharpe Ratio', 'Out-of-sample (walk-forward)']:.2f} "
         "walk-forward"
+    )
+
+    print("relative performance…")
+    # A mandate written relative to an index: beat 1/N, at no more than 3% of
+    # tracking error. The budget is what makes the two curves comparable.
+    relative_config = config("mean_variance", risk_aversion=3.0)
+    relative_config.benchmark = BenchmarkSpec(kind="equal_weight")
+    relative_config.max_tracking_error = 0.03
+    relative_run = run_engine(returns, relative_config)
+    report = relative_run.performance(
+        riskfree_rate=0.03, frequency="quarterly", transaction_cost_bps=15
+    )
+    shoot(
+        plot_relative_wealth(
+            report.returns[PORTFOLIO],
+            report.returns[BENCHMARK],
+            title=(
+                "Ahead or behind: portfolio wealth relative to the benchmark's"
+            ),
+        ),
+        output / "relative-performance.png",
+        height=470,
+    )
+    shoot(
+        plot_period_returns(
+            report.periods,
+            title="Year by year, against the benchmark it is measured on",
+        ),
+        output / "period-returns.png",
+        height=470,
+    )
+    head = report.headline()
+    print(
+        f"    excess {head['excess_return']:.2%} at "
+        f"{head['tracking_error']:.2%} tracking error "
+        f"(IR {head['information_ratio']:.2f}, "
+        f"active share {head['active_share']:.1%})"
     )
 
 

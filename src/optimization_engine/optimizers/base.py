@@ -36,6 +36,17 @@ class PortfolioConstraints:
             turnover budget and for reporting realized turnover.
         turnover_limit: Cap on ``Σ|w_i − w_prev,i|``. A one-way turnover of
             0.20 means at most 20% of the portfolio changes hands.
+        benchmark_weights: The index the mandate is measured against. Carried
+            on the constraints rather than on the objective because it is what
+            the two limits below are expressed relative to.
+        max_tracking_error: Cap on annualized active risk,
+            ``√((w−b)'Σ(w−b)) ≤ TE*``. Imposed as the equivalent quadratic so
+            the problem stays a QP. Needs both a benchmark and a covariance
+            matrix; an optimizer that has neither reports the limit rather
+            than silently dropping it.
+        max_active_share: Cap on ``½·Σ|w_i − b_i|``. A positions-based limit
+            that binds even in a calm market, where a tracking-error budget
+            quietly permits a portfolio that shares nothing with its index.
     """
 
     bounds: dict[str, tuple[float, float]] = field(default_factory=dict)
@@ -48,6 +59,30 @@ class PortfolioConstraints:
     target_volatility: float | None = None
     previous_weights: dict[str, float] | None = None
     turnover_limit: float | None = None
+    benchmark_weights: dict[str, float] | None = None
+    max_tracking_error: float | None = None
+    max_active_share: float | None = None
+
+    @property
+    def is_benchmark_relative(self) -> bool:
+        """Whether any constraint is expressed against a benchmark."""
+        return bool(self.benchmark_weights) and (
+            self.max_tracking_error is not None or self.max_active_share is not None
+        )
+
+    def benchmark_vector(self, assets: list[str]) -> np.ndarray | None:
+        """The benchmark's weights aligned to ``assets``, or None if unset.
+
+        Assets the benchmark does not name are held at zero — for a benchmark
+        that is a *subset* of the investable universe that is exactly right,
+        and it is the only reading that lets a manager hold something the
+        index does not.
+        """
+        if not self.benchmark_weights:
+            return None
+        return np.array(
+            [float(self.benchmark_weights.get(a, 0.0)) for a in assets], dtype=float
+        )
 
     def get_bounds(
         self, asset: str, default: tuple[float, float] | None = None

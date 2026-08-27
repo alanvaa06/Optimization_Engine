@@ -228,6 +228,75 @@ factor returns, specific risk — rather than an additional function.
 
 ## 4. Other sources
 
+### Benchmark-relative measurement and constraint
+
+*Sources:* Modigliani & Modigliani (1997) on risk-adjusted performance;
+Treynor (1965); Treynor & Black (1973) on the appraisal ratio; Cremers &
+Petajisto (2009) on active share; Roll (1992) on the mean-tracking-error
+frontier; Schwager (1996) on the gain-to-pain ratio; Martin & McCann (1989)
+on the Ulcer index and the ratio built from it.
+
+The engine could already compute tracking error, the information ratio and a
+CAPM alpha, but the benchmark itself was a local widget on one page: chosen
+again in each place it was needed, absent from the config, absent from the
+export, and invisible to the optimizer. Three consequences followed. Two tabs
+could quote information ratios against different indices with nothing saying
+so. A workbook carried absolute numbers only. And a mandate written as "beat
+this index by 150bp at no more than 3% tracking error" could not be solved —
+only checked afterwards, by which point the constraint had not been applied.
+
+**Added** in `optimization_engine.benchmark` and
+`optimization_engine.analytics.report`:
+
+* **`BenchmarkSpec`** — one declarative statement of the choice (1/N, a single
+  asset, a policy vector, or an external index), resolved once per run and read
+  by every consumer. It distinguishes the two things a benchmark is: a return
+  stream, and a weight vector. An external index is only the former, so it
+  raises when asked for an active share rather than inventing positions it does
+  not hold in the investable universe.
+* **The rebalancing convention, stated rather than assumed.** `(returns · w)`
+  silently assumes the benchmark is rebalanced to its stated weights every
+  period. That is the right convention for a published index and the wrong one
+  for an untouched policy portfolio, whose winners compound into a larger share.
+  Both are available and the choice is recorded with the result.
+* **A tracking-error budget and an active-share cap as constraints.** Both are
+  convex in `w`: `(w−b)'Σ(w−b) ≤ TE*²` is a quadratic form and `½‖w−b‖₁ ≤ AS*`
+  an L1 ball. They carry into the homogeneous `w = y/κ` reformulations that
+  max-Sharpe and maximum-diversification use, as `‖Σ^½(y − κb)‖₂ ≤ TE·κ` and
+  `‖y − κb‖₁ ≤ 2·AS·κ` — both still convex, so those two methods honour an
+  active-risk mandate rather than reporting a breach after the fact. The
+  projection-based methods (HRP, 1/N, inverse volatility) cannot impose them
+  and say so instead of dropping them.
+* **`ActiveMeanVarianceOptimizer`** — Grinold-Kahn's problem stated directly:
+  maximize `α'x − λ·x'Σx` over active weights `x = w − b`, or maximize expected
+  active return subject to an active-risk budget. With `b = 0` it reduces
+  exactly to `MeanVarianceOptimizer`, which is the test that the reformulation
+  is the same problem in different coordinates.
+* **A second tier of relative statistics** the engine lacked: batting average
+  and the up/down *count* ratios (capture ratios are magnitudes, and a
+  flattering down-capture can come from one well-timed month); Treynor and M²;
+  the appraisal ratio, which isolates selection skill from a deliberate beta
+  tilt in a way the information ratio does not; downside tracking error; and
+  the drawdown of the portfolio's wealth *relative to* the benchmark's — the
+  series a plan sponsor actually watches, and not the same thing as the
+  drawdown of the excess return, which compounds a difference of returns as
+  though it were a return.
+* **Absolute metrics that do not assume symmetric risk**: gain-to-pain, the
+  Martin ratio (return over the Ulcer index, which prices the *duration* of a
+  drawdown where Calmar sees only its depth), the win/loss ratio read next to
+  the hit rate, and time under water.
+* **`PerformanceReport`** — both halves computed on one aligned sample. The
+  alignment is the point: assembling absolute statistics from the full history
+  and relative ones from the benchmark's shorter overlap produces a table where
+  the Sharpe ratio and the information ratio describe different periods, and
+  nothing in the output reveals it.
+
+**Deferred:** a benchmark-relative *frontier* (Roll's mean-TE frontier is a
+different curve from the mean-variance one, and drawing them on the same axes
+is a well-known way to mislead), and multi-benchmark attribution
+(Brinson-style allocation/selection effects), which needs sector or factor
+membership the engine does not currently carry.
+
 ### Attilio Meucci — the effective number of bets
 
 *Managing Diversification* (2009); Meucci, Santangelo & Deguest (2015).
@@ -358,6 +427,27 @@ Cajas, D. (2023). "Portfolio Optimization of Relativistic Value at Risk".
 
 Cajas, D. (2025). *Advanced Portfolio Optimization: A Cutting-edge Quantitative
 Approach*. Springer.
+
+Cremers, M. and Petajisto, A. (2009). "How Active Is Your Fund Manager? A New
+Measure That Predicts Performance". *Review of Financial Studies* 22(9).
+
+Martin, P. and McCann, B. (1989). *The Investor's Guide to Fidelity Funds*.
+Wiley. (The Ulcer index.)
+
+Modigliani, F. and Modigliani, L. (1997). "Risk-Adjusted Performance". *The
+Journal of Portfolio Management* 23(2).
+
+Roll, R. (1992). "A Mean/Variance Analysis of Tracking Error". *The Journal of
+Portfolio Management* 18(4).
+
+Schwager, J. (1996). *Managed Trading: Myths and Truths*. Wiley. (The
+gain-to-pain ratio.)
+
+Treynor, J. (1965). "How to Rate Management of Investment Funds". *Harvard
+Business Review* 43(1).
+
+Treynor, J. and Black, F. (1973). "How to Use Security Analysis to Improve
+Portfolio Selection". *The Journal of Business* 46(1).
 [Riskfolio-Lib](https://github.com/dcajasn/Riskfolio-Lib)
 
 Chekhlov, A., Uryasev, S. and Zabarankin, M. (2005). "Drawdown Measure in

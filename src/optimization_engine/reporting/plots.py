@@ -714,3 +714,223 @@ def plot_weight_dispersion(
         height=max(300, 24 * len(d)), **_LAYOUT,
     )
     return fig
+
+
+# ---------------------------------------------------------------------------
+# Benchmark-relative
+# ---------------------------------------------------------------------------
+
+
+def plot_relative_wealth(
+    portfolio: pd.Series,
+    benchmark: pd.Series,
+    title: str = "Cumulative performance vs. benchmark",
+) -> go.Figure:
+    """Growth of the portfolio's wealth *relative to* the benchmark's.
+
+    The ratio of the two wealth curves, baselined at 1. Rising means the
+    portfolio is pulling ahead; the shaded area below the running maximum is
+    the relative drawdown — the stretch a plan sponsor experiences as "we have
+    been behind the index since 2022", which no absolute chart shows.
+
+    Plotting the ratio rather than the cumulative sum of excess returns is
+    deliberate: compounding a difference of returns as though it were a return
+    overstates the gap, and the error grows with the sample.
+    """
+    common = portfolio.dropna().index.intersection(benchmark.dropna().index)
+    p = portfolio.loc[common]
+    b = benchmark.loc[common]
+    ratio = (1.0 + p).cumprod() / (1.0 + b).cumprod()
+    peak = ratio.cummax()
+
+    fig = go.Figure()
+    fig.add_trace(
+        go.Scatter(
+            x=ratio.index, y=peak, name="Relative high-water mark",
+            line=dict(color=BASELINE, width=1, dash="dot"),
+            hoverinfo="skip", showlegend=False,
+        )
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=ratio.index, y=ratio, name="Relative wealth",
+            line=dict(color=PALETTE[0], width=2),
+            fill="tonexty", fillcolor="rgba(42,120,214,0.10)",
+            hovertemplate="%{x|%Y-%m-%d}<br>%{y:.3f}×<extra></extra>",
+        )
+    )
+    fig.add_hline(y=1.0, line_width=1, line_color=MUTED)
+    fig.update_layout(
+        title=title,
+        yaxis_title="Portfolio wealth ÷ benchmark wealth",
+        xaxis_title="",
+        showlegend=False,
+        **_LAYOUT,
+    )
+    return fig
+
+
+def plot_period_returns(
+    periods: pd.DataFrame,
+    title: str = "Calendar-period returns",
+    excess_column: str = "Excess",
+) -> go.Figure:
+    """Grouped bars per calendar period, with the excess drawn as a marker.
+
+    Annualized numbers say what happened on average; this says whether the
+    average is a description of anything. The excess is a marker rather than a
+    third bar so the eye compares portfolio against benchmark first, which is
+    the comparison the chart exists to make.
+    """
+    if periods is None or periods.empty:
+        return go.Figure()
+    bars = [c for c in periods.columns if c != excess_column]
+    fig = go.Figure()
+    for i, col in enumerate(bars):
+        fig.add_trace(
+            go.Bar(
+                x=list(periods.index), y=periods[col], name=str(col),
+                marker_color=series_color(i, col),
+                hovertemplate=f"{col}<br>%{{x}}: %{{y:.2%}}<extra></extra>",
+            )
+        )
+    if excess_column in periods.columns:
+        fig.add_trace(
+            go.Scatter(
+                x=list(periods.index), y=periods[excess_column],
+                name=excess_column, mode="markers",
+                marker=dict(
+                    symbol="diamond", size=9, color=PALETTE[3],
+                    line=dict(width=1, color="#0b0b0b"),
+                ),
+                hovertemplate=f"{excess_column}<br>%{{x}}: %{{y:.2%}}<extra></extra>",
+            )
+        )
+    fig.add_hline(y=0, line_width=1, line_color=BASELINE)
+    fig.update_layout(
+        title=title, barmode="group", yaxis_tickformat=".0%",
+        yaxis_title="Return", xaxis_title="",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0),
+        **_LAYOUT,
+    )
+    return fig
+
+
+def plot_rolling_relative(
+    rolling: pd.DataFrame, title: str = "Rolling performance vs. benchmark"
+) -> go.Figure:
+    """Rolling excess return, tracking error, information ratio and beta.
+
+    Stacked panels for the same reason as :func:`plot_rolling_metrics`: an
+    information ratio and a beta occupy similar numeric ranges and would read
+    as one duplicated line on a shared axis.
+    """
+    from plotly.subplots import make_subplots
+
+    panels = [
+        ("rolling_excess", "Excess return", ".1%", ".0%"),
+        ("rolling_tracking_error", "Tracking error", ".1%", ".0%"),
+        ("rolling_information_ratio", "Information ratio", ".2f", ".1f"),
+        ("rolling_beta", "Beta", ".2f", ".1f"),
+    ]
+    present = [p for p in panels if p[0] in rolling.columns]
+    if not present:
+        return go.Figure()
+
+    fig = make_subplots(
+        rows=len(present), cols=1, shared_xaxes=True, vertical_spacing=0.045,
+        subplot_titles=[p[1] for p in present],
+    )
+    for row, (col, label, hover_fmt, tick_fmt) in enumerate(present, start=1):
+        fig.add_trace(
+            go.Scatter(
+                x=rolling.index, y=rolling[col], name=label,
+                line=dict(color=PALETTE[(row - 1) % len(PALETTE)], width=1.6),
+                hovertemplate=(
+                    f"{label}<br>%{{x|%Y-%m-%d}}: %{{y:{hover_fmt}}}<extra></extra>"
+                ),
+            ),
+            row=row, col=1,
+        )
+        fig.update_yaxes(tickformat=tick_fmt, row=row, col=1)
+        # Zero for the excess measures, one for beta: each panel's own
+        # "no active decision" line, which is what the eye should compare to.
+        fig.add_hline(
+            y=1.0 if col == "rolling_beta" else 0.0,
+            line_width=1, line_color=MUTED, row=row, col=1,
+        )
+
+    fig.update_layout(
+        title=title, showlegend=False, height=170 * len(present) + 90, **_LAYOUT
+    )
+    fig.update_annotations(font_size=12)
+    return fig
+
+
+def plot_risk_return_scatter(
+    points: pd.DataFrame,
+    highlight: dict[str, str] | None = None,
+    title: str = "Risk and return",
+) -> go.Figure:
+    """Volatility against annualized return, one marker per series.
+
+    Args:
+        points: Frame with ``Annualized Vol`` and ``Annualized Return``
+            columns, indexed by series name — the layout
+            :func:`~optimization_engine.analytics.performance.summary_stats`
+            already returns.
+        highlight: ``name -> role`` for the series that should stand out
+            (``"portfolio"`` and ``"benchmark"``). Everything else is drawn as
+            recessive context, because the assets are the backdrop against
+            which the two decisions are read, not the subject.
+        title: Chart title.
+    """
+    required = {"Annualized Vol", "Annualized Return"}
+    if points is None or points.empty or not required.issubset(points.columns):
+        return go.Figure()
+    highlight = highlight or {}
+    styles = {
+        "portfolio": dict(color=PALETTE[0], size=15, symbol="star"),
+        "benchmark": dict(color=PALETTE[1], size=13, symbol="diamond"),
+    }
+
+    fig = go.Figure()
+    context = [i for i in points.index if str(i) not in highlight]
+    if context:
+        sub = points.loc[context]
+        fig.add_trace(
+            go.Scatter(
+                x=sub["Annualized Vol"], y=sub["Annualized Return"],
+                mode="markers+text", text=[str(i) for i in sub.index],
+                textposition="top center", textfont=dict(size=9, color=MUTED),
+                marker=dict(color=OTHER_COLOR, size=8, opacity=0.65),
+                name="Universe",
+                hovertemplate=(
+                    "%{text}<br>vol %{x:.2%}<br>return %{y:.2%}<extra></extra>"
+                ),
+            )
+        )
+    for name, role in highlight.items():
+        if name not in points.index:
+            continue
+        row = points.loc[name]
+        fig.add_trace(
+            go.Scatter(
+                x=[row["Annualized Vol"]], y=[row["Annualized Return"]],
+                mode="markers+text", text=[str(name)],
+                textposition="bottom center", textfont=dict(size=11),
+                marker=styles.get(role, styles["portfolio"]), name=str(name),
+                hovertemplate=(
+                    f"{name}<br>vol %{{x:.2%}}<br>return %{{y:.2%}}<extra></extra>"
+                ),
+            )
+        )
+    fig.update_layout(
+        title=title,
+        xaxis_title="Annualized volatility", yaxis_title="Annualized return",
+        xaxis_tickformat=".0%", yaxis_tickformat=".0%",
+        showlegend=False,
+        **_LAYOUT,
+    )
+    fig.add_hline(y=0, line_width=1, line_color=BASELINE)
+    return fig

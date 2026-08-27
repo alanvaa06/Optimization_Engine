@@ -72,10 +72,23 @@ def project_to_bounds_iterated(
 
 
 def _without_turnover(constraints):
-    """Copy of ``constraints`` with the turnover budget dropped."""
+    """Copy of ``constraints`` with the constraints a projection cannot use.
+
+    Turnover is meaningless here: a projection is not a trade. The
+    tracking-error budget is dropped for a different reason — it needs a
+    covariance matrix, which the projection is not given. Active share
+    survives, because it is a pure function of the weights and so is exactly
+    the kind of constraint a projection can honour. Anything dropped still
+    shows up in the post-solve compliance report rather than disappearing.
+    """
     from dataclasses import replace
 
-    return replace(constraints, turnover_limit=None, previous_weights=None)
+    return replace(
+        constraints,
+        turnover_limit=None,
+        previous_weights=None,
+        max_tracking_error=None,
+    )
 
 
 def project_to_constraints(
@@ -115,7 +128,9 @@ def project_to_constraints(
     w = np.asarray(w, dtype=float).flatten()
     lb, ub = bounds_arrays(assets, constraints)
 
-    if not (constraints.groups and constraints.group_bounds):
+    has_groups = bool(constraints.groups and constraints.group_bounds)
+    has_active_share = constraints.max_active_share is not None
+    if not (has_groups or has_active_share):
         projected = project_to_bounds_iterated(w, lb, ub)
         return projected, float(np.abs(projected - w).sum()) / 2.0
 

@@ -8,12 +8,14 @@ from pathlib import Path
 
 import pandas as pd
 
+from optimization_engine.benchmark import BenchmarkError, BenchmarkSpec
 from optimization_engine.config import load_config
 from optimization_engine.data.fred import FREDError, load_fred_series
 from optimization_engine.data.fx import FXError
 from optimization_engine.data.loader import load_prices, prices_to_returns, sample_dataset
 from optimization_engine.data.yahoo import YahooFinanceError, load_prices_yahoo
 from optimization_engine.engine import apply_fx_conversion, run_engine
+from optimization_engine.optimizers._cvxpy_helpers import SolverFailure
 from optimization_engine.optimizers.factory import available_optimizers
 from optimization_engine.optimizers.requirements import requirements_for
 from optimization_engine.reporting.exporters import run_sheets, write_excel_report
@@ -97,6 +99,23 @@ def _build_parser() -> argparse.ArgumentParser:
         "--mcos-methods",
         default="mean_variance,min_variance,hrp,herc,nco",
         help="Comma-separated optimizer names for --mcos.",
+    )
+    optimize.add_argument(
+        "--benchmark", metavar="SPEC",
+        help="Benchmark to measure — and optionally optimize — against. Use "
+             "'equal_weight' for 1/N, an asset name for a single-asset index, "
+             "or 'none' to override the config. Omit to use the config's own "
+             "benchmark block.",
+    )
+    optimize.add_argument(
+        "--max-tracking-error", type=float, metavar="TE",
+        help="Cap annualized tracking error against the benchmark "
+             "(0.03 = 300bp). Imposed inside the solve by the mean-variance "
+             "family, mean-CVaR/CDaR and active_mean_variance.",
+    )
+    optimize.add_argument(
+        "--max-active-share", type=float, metavar="AS",
+        help="Cap active share against the benchmark (0.4 = 40%%).",
     )
     optimize.add_argument(
         "--strict", action="store_true",
@@ -191,6 +210,12 @@ def _cmd_optimize(args: argparse.Namespace) -> int:
     }
 
     try:
+        _apply_benchmark_flags(config, args, list(returns.columns))
+    except (BenchmarkError, ValueError) as exc:
+        print(f"Benchmark error: {exc}", file=sys.stderr)
+        return 2
+
+    try:
         run = run_engine(
             returns,
             config,
@@ -200,6 +225,17 @@ def _cmd_optimize(args: argparse.Namespace) -> int:
         )
     except InfeasibleConstraintsError as exc:
         print(str(exc), file=sys.stderr)
+        return 2
+    except SolverFailure as exc:
+        print(f"Optimization failed: {exc}", file=sys.stderr)
+        if config.max_tracking_error is not None or config.max_active_share is not None:
+            print(
+                "  A tracking-error or active-share budget is in force. A "
+                "benchmark holding an asset your bounds cap below its index "
+                "weight sets a floor on tracking error that no allocation can "
+                "go below — raise the limit, or relax the bound.",
+                file=sys.stderr,
+            )
         return 2
 
     for warning in run.warnings:
@@ -236,15 +272,6 @@ def _cmd_optimize(args: argparse.Namespace) -> int:
             except ValueError as exc:
                 print(f"Frontier resampling skipped: {exc}", file=sys.stderr)
 
-    sheets = run_sheets(
-        run,
-        riskfree_rate=config.optimizer.risk_free_rate,
-        data_quality=quality,
-        walk_forward=walk_forward,
-        frontier_uncertainty=uncertainty,
-    )
-    out = write_excel_report(args.output, sheets)
-
     print(
         f"{config.optimizer.name}: expected return "
         f"{run.result.expected_return:.2%}, volatility "
@@ -257,6 +284,17 @@ def _cmd_optimize(args: argparse.Namespace) -> int:
             f"{run.diagnostics.effective_n:.1f} · diversification ratio "
             f"{run.diagnostics.diversification_ratio:.2f}"
         )
+    performance = _report_versus_benchmark(run, config)
+
+    sheets = run_sheets(
+        run,
+        riskfree_rate=config.optimizer.risk_free_rate,
+        data_quality=quality,
+        walk_forward=walk_forward,
+        frontier_uncertainty=uncertainty,
+        performance=performance,
+    )
+    out = write_excel_report(args.output, sheets)
     if walk_forward is not None:
         comparison = run.in_vs_out_of_sample(
             walk_forward, config.optimizer.risk_free_rate
@@ -289,6 +327,70 @@ def _cmd_optimize(args: argparse.Namespace) -> int:
                 )
     print(f"Wrote {out} ({len(sheets)} sheets)")
     return 0
+
+
+def _apply_benchmark_flags(
+    config, args: argparse.Namespace, assets: list[str]
+) -> None:
+    """Let ``--benchmark`` and the two limits override the config's block.
+
+    ``--benchmark`` accepts a kind or an asset name, because on the command
+    line "compare this against SPY" is the common case and forcing the
+    ``kind: single_asset`` YAML for it would be ceremony.
+
+    Raises:
+        BenchmarkError: When the argument names neither a known kind nor an
+            asset in the universe — better than silently comparing against
+            something the caller did not ask for.
+    """
+    raw = getattr(args, "benchmark", None)
+    if raw:
+        value = str(raw).strip()
+        if value.lower() in ("none", "off"):
+            config.benchmark = BenchmarkSpec(kind="none")
+            config.benchmark_weights = None
+        elif value.lower() in ("equal_weight", "equal-weight", "ew", "1/n"):
+            config.benchmark = BenchmarkSpec(kind="equal_weight")
+        elif value in assets:
+            config.benchmark = BenchmarkSpec(kind="single_asset", asset=value)
+        else:
+            raise BenchmarkError(
+                f"--benchmark {value!r} is neither a benchmark kind nor an "
+                f"asset in the universe ({', '.join(assets[:8])}"
+                f"{' …' if len(assets) > 8 else ''}). Use 'equal_weight', an "
+                "asset name, or define the benchmark in the config."
+            )
+    if getattr(args, "max_tracking_error", None) is not None:
+        config.max_tracking_error = float(args.max_tracking_error)
+    if getattr(args, "max_active_share", None) is not None:
+        config.max_active_share = float(args.max_active_share)
+
+
+def _report_versus_benchmark(run, config):
+    """Print the relative headline and return the report for the workbook.
+
+    Returns ``None`` when the run has no benchmark, which is also what tells
+    :func:`run_sheets` there is nothing relative to write.
+    """
+    if run.benchmark is None:
+        return None
+    try:
+        report = run.performance(riskfree_rate=config.optimizer.risk_free_rate)
+    except ValueError as exc:
+        print(f"  Relative performance skipped: {exc}", file=sys.stderr)
+        return None
+    h = report.headline()
+    print(
+        f"  vs {run.benchmark_label}: excess {h['excess_return']:+.2%} · "
+        f"T.E. {h['tracking_error']:.2%} · IR {h['information_ratio']:.2f} · "
+        f"beta {h['beta']:.2f}"
+        + (
+            f" · active share {h['active_share']:.1%}"
+            if "active_share" in h
+            else ""
+        )
+    )
+    return report
 
 
 def _report_deflated_sharpe(returns, args: argparse.Namespace, config) -> None:
@@ -466,7 +568,7 @@ def _cmd_check(args: argparse.Namespace) -> int:
     mu = pd.Series(config.expected_returns).reindex(returns.columns).fillna(0.0)
     report = analyze_feasibility(
         list(returns.columns),
-        constraints_from_config(config),
+        constraints_from_config(config, list(returns.columns)),
         expected_returns=effective_expected_returns(config, cov, mu),
         cov_matrix=cov,
     )

@@ -152,7 +152,7 @@ def _anchor_portfolios(
         MinVarianceOptimizer,
     )
 
-    constraints = constraints_from_config(base_config)
+    constraints = constraints_from_config(base_config, list(cov_matrix.columns))
     constraints.target_return = None
     constraints.target_volatility = None
 
@@ -211,11 +211,11 @@ def _resolve_return_range(
     """
     from optimization_engine.optimizers.feasibility import reachable_return_range
 
-    constraints = constraints_from_config(base_config)
+    constraints = constraints_from_config(base_config, list(cov_matrix.columns))
     constraints.target_return = None
     constraints.target_volatility = None
     reachable = reachable_return_range(
-        expected_returns, constraints, list(cov_matrix.columns)
+        expected_returns, constraints, list(cov_matrix.columns), cov_matrix=cov_matrix
     )
 
     if return_range is not None:
