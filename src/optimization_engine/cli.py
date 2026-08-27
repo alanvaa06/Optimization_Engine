@@ -71,6 +71,34 @@ def _build_parser() -> argparse.ArgumentParser:
              "histories. Requires --frontier.",
     )
     optimize.add_argument(
+        "--denoise", action="store_true",
+        help="Filter the covariance's noise eigenvalues through the "
+             "Marchenko-Pastur cutoff before optimizing.",
+    )
+    optimize.add_argument(
+        "--detone", type=int, default=None, metavar="K",
+        help="Remove the K leading eigenvectors (the market component) after "
+             "denoising. Makes the covariance singular — use only with the "
+             "clustering methods (hrp, herc, nco).",
+    )
+    optimize.add_argument(
+        "--trials", type=int, default=1, metavar="N",
+        help="How many configurations you tried before settling on this one. "
+             "Used to deflate the walk-forward Sharpe for selection bias; "
+             "leaving it at 1 claims you tried exactly one.",
+    )
+    optimize.add_argument(
+        "--mcos", type=int, metavar="N",
+        help="Run Monte Carlo Optimization Selection over N simulated "
+             "histories, ranking the methods by how reliably each recovers "
+             "the allocation the fitted distribution implies.",
+    )
+    optimize.add_argument(
+        "--mcos-methods",
+        default="mean_variance,min_variance,hrp,herc,nco",
+        help="Comma-separated optimizer names for --mcos.",
+    )
+    optimize.add_argument(
         "--strict", action="store_true",
         help="Refuse to run when the constraints are infeasible, naming the "
              "constraint instead of letting the solver fail.",
@@ -85,6 +113,14 @@ def _build_parser() -> argparse.ArgumentParser:
     check.add_argument("--prices", help="Excel/CSV/Parquet file of prices.")
     check.add_argument("--sheet", default="Precios", help="Excel sheet name.")
     check.add_argument("--sample", action="store_true", help="Use built-in sample data.")
+    check.add_argument(
+        "--denoise", action="store_true",
+        help="Report the conditioning of the denoised covariance instead.",
+    )
+    check.add_argument(
+        "--detone", type=int, default=None, metavar="K",
+        help="Remove K leading eigenvectors after denoising.",
+    )
 
     describe = sub.add_parser(
         "describe", help="Explain one optimizer: what it needs and what it assumes."
@@ -117,6 +153,7 @@ def _cmd_optimize(args: argparse.Namespace) -> int:
         print(f"Yahoo Finance error: {exc}", file=sys.stderr)
         return 2
 
+    _apply_estimator_flags(config, args)
     if args.base_currency:
         config.base_currency = args.base_currency.upper()
     if config.currencies:
@@ -229,8 +266,76 @@ def _cmd_optimize(args: argparse.Namespace) -> int:
             f"  Walk-forward: {walk_forward.n_rebalances} re-solve(s), "
             f"Sharpe falls {gap:.2f} out of sample"
         )
+        _report_deflated_sharpe(walk_forward.returns, args, config)
+
+    if args.mcos:
+        from optimization_engine.resampling import monte_carlo_optimization_selection
+
+        methods = tuple(
+            m.strip() for m in str(args.mcos_methods).replace(" ", ",").split(",") if m.strip()
+        )
+        try:
+            selection = monte_carlo_optimization_selection(
+                returns, config, methods=methods, n_simulations=int(args.mcos)
+            )
+        except ValueError as exc:
+            print(f"MCOS skipped: {exc}", file=sys.stderr)
+        else:
+            print(f"  {selection.describe()}")
+            for name, row in selection.ranking().iterrows():
+                print(
+                    f"    {name:<18} weight RMSE {row['weight_rmse']:.2%} · "
+                    f"worst position {row['max_weight_drift']:.2%}"
+                )
     print(f"Wrote {out} ({len(sheets)} sheets)")
     return 0
+
+
+def _report_deflated_sharpe(returns, args: argparse.Namespace, config) -> None:
+    """Print the walk-forward Sharpe deflated for the number of trials.
+
+    An out-of-sample Sharpe is still a selected number when the configuration
+    that produced it was itself chosen by looking at results. ``--trials``
+    is how the analyst declares that search; the default of 1 is a claim, and
+    the printed line says so.
+    """
+    from optimization_engine.analytics.selection import (
+        deflated_sharpe_ratio,
+        minimum_track_record_length,
+    )
+
+    try:
+        deflated = deflated_sharpe_ratio(
+            returns,
+            n_trials=max(int(args.trials), 1),
+            riskfree_rate=config.optimizer.risk_free_rate,
+            periods_per_year=config.periods_per_year,
+        )
+    except ValueError as exc:
+        print(f"  Deflated Sharpe skipped: {exc}", file=sys.stderr)
+        return
+    print(f"  {deflated.describe()}")
+    try:
+        needed = minimum_track_record_length(
+            returns,
+            benchmark_sharpe=deflated.benchmark_sharpe,
+            riskfree_rate=config.optimizer.risk_free_rate,
+            periods_per_year=config.periods_per_year,
+        )
+    except ValueError:
+        return
+    if needed == float("inf"):
+        print(
+            "  Minimum track record: unreachable — this Sharpe does not "
+            "exceed the selection-bias threshold at any sample length."
+        )
+    else:
+        print(
+            f"  Minimum track record to call it significant at 95%: "
+            f"{needed / config.periods_per_year:.1f} year(s) "
+            f"({needed:.0f} periods); this run has "
+            f"{len(returns)}."
+        )
 
 
 def _cmd_list_optimizers() -> int:
@@ -280,6 +385,20 @@ def _cmd_describe(args: argparse.Namespace) -> int:
     return 0
 
 
+def _apply_estimator_flags(config, args: argparse.Namespace) -> None:
+    """Let command-line estimator flags override the config file.
+
+    Kept in one place so ``check`` and ``optimize`` cannot diverge: a
+    pre-flight that reports the conditioning of a matrix the solve will not
+    use is worse than no pre-flight at all.
+    """
+    if getattr(args, "denoise", False):
+        config.denoise = True
+    detone = getattr(args, "detone", None)
+    if detone is not None:
+        config.detone = int(detone)
+
+
 def _load_prices_for(args: argparse.Namespace, config):
     """Resolve the price panel from whichever source the flags name."""
     if getattr(args, "yahoo", None):
@@ -295,7 +414,10 @@ def _load_prices_for(args: argparse.Namespace, config):
 
 def _cmd_check(args: argparse.Namespace) -> int:
     """Pre-flight the inputs and constraints, and say what would go wrong."""
-    from optimization_engine.data.covariance import covariance_diagnostics, covariance_matrix
+    from optimization_engine.data.covariance import (
+        covariance_diagnostics,
+        covariance_from_config,
+    )
     from optimization_engine.data.quality import analyze_prices
     from optimization_engine.optimizers.factory import (
         constraints_from_config,
@@ -304,6 +426,7 @@ def _cmd_check(args: argparse.Namespace) -> int:
     from optimization_engine.optimizers.feasibility import analyze_feasibility
 
     config = load_config(args.config)
+    _apply_estimator_flags(config, args)
     prices = _load_prices_for(args, config)
     common = [c for c in prices.columns if c in config.expected_returns]
     if common:
@@ -323,12 +446,7 @@ def _cmd_check(args: argparse.Namespace) -> int:
         return 2
 
     print("\n== Estimation ==")
-    cov = covariance_matrix(
-        returns,
-        method=config.covariance_method,
-        periods_per_year=config.periods_per_year,
-        ewma_lambda=config.ewma_lambda,
-    )
+    cov = covariance_from_config(returns, config)
     diag = covariance_diagnostics(
         cov, len(returns), config.covariance_method, config.ewma_lambda
     )
@@ -336,6 +454,9 @@ def _cmd_check(args: argparse.Namespace) -> int:
         f"T/N = {diag.observations_per_asset:.1f} · "
         f"condition number = {diag.condition_number:.3g}"
     )
+    denoise_report = cov.attrs.get("denoise_report")
+    if denoise_report is not None:
+        print(f"  {denoise_report.describe()}")
     for w in diag.warnings:
         print(f"  ! {w}")
     if not diag.warnings:

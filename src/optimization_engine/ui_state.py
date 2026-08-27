@@ -116,6 +116,8 @@ def derive_widget_state(method_name: str) -> dict[str, dict[str, object]]:
     for extra_key in (
         "risk_budget", "bl_views", "bl_view_confidences",
         "bl_tau", "bl_market_caps", "cvar_alpha", "hrp_linkage",
+        "cdar_alpha", "cluster_linkage", "n_clusters", "max_clusters",
+        "herc_risk_measure", "nco_objective", "nco_detone_for_clustering",
     ):
         state[extra_key] = _state(
             extra_key in extra_keys,

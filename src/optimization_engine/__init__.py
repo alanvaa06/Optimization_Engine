@@ -1,11 +1,39 @@
 """Multi-asset portfolio optimization engine."""
 
+from optimization_engine.analytics.active import (
+    FundamentalLawReport,
+    InformationCoefficient,
+    active_risk_decomposition,
+    fundamental_law,
+    grinold_alpha,
+    implied_breadth,
+    information_coefficient,
+    optimal_active_risk,
+    risk_aversion_from_information_ratio,
+    transfer_coefficient,
+    value_added,
+)
 from optimization_engine.analytics.backtest import (
     BacktestResult,
     WalkForwardResult,
     backtest_weights,
     compare_in_and_out_of_sample,
     walk_forward_backtest,
+)
+from optimization_engine.analytics.diversification import (
+    DiversificationReport,
+    compare_diversification,
+    diversification_distribution,
+    effective_number_of_bets,
+    minimum_torsion,
+)
+from optimization_engine.analytics.selection import (
+    DeflatedSharpe,
+    OverfittingReport,
+    deflated_sharpe_ratio,
+    expected_maximum_sharpe,
+    minimum_track_record_length,
+    probability_of_backtest_overfitting,
 )
 from optimization_engine.config import (
     EngineConfig,
@@ -16,10 +44,18 @@ from optimization_engine.config import (
 from optimization_engine.data.covariance import (
     CovarianceDiagnostics,
     covariance_diagnostics,
+    covariance_from_config,
     covariance_matrix,
     expected_returns_from_history,
     james_stein_shrinkage,
     nearest_psd,
+)
+from optimization_engine.data.denoise import (
+    DenoiseReport,
+    denoise_covariance,
+    detone_correlation,
+    fit_marchenko_pastur,
+    marchenko_pastur_pdf,
 )
 from optimization_engine.data.fred import (
     FREDError,
@@ -51,14 +87,17 @@ from optimization_engine.frontier import FrontierResult, efficient_frontier
 from optimization_engine.optimizers import (
     BaseOptimizer,
     BlackLittermanOptimizer,
+    CDaROptimizer,
     CVaROptimizer,
     EqualWeightOptimizer,
+    HERCOptimizer,
     HRPOptimizer,
     InverseVolatilityOptimizer,
     MaxDiversificationOptimizer,
     MaxSharpeOptimizer,
     MeanVarianceOptimizer,
     MinVarianceOptimizer,
+    NCOOptimizer,
     RiskParityOptimizer,
     optimizer_factory,
 )
@@ -78,7 +117,9 @@ from optimization_engine.optimizers.feasibility import (
 )
 from optimization_engine.resampling import (
     FrontierUncertainty,
+    MCOSResult,
     bootstrap_frontier,
+    monte_carlo_optimization_selection,
     resample_returns,
     resampled_efficient_frontier,
 )
@@ -96,7 +137,7 @@ from optimization_engine.scenarios import (
     scenario_to_dict,
 )
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 __all__ = [
     "EngineConfig",
@@ -104,8 +145,14 @@ __all__ = [
     "load_config",
     "save_config",
     "covariance_matrix",
+    "covariance_from_config",
     "covariance_diagnostics",
     "CovarianceDiagnostics",
+    "DenoiseReport",
+    "denoise_covariance",
+    "detone_correlation",
+    "fit_marchenko_pastur",
+    "marchenko_pastur_pdf",
     "expected_returns_from_history",
     "james_stein_shrinkage",
     "nearest_psd",
@@ -144,9 +191,33 @@ __all__ = [
     "FrontierResult",
     "efficient_frontier",
     "FrontierUncertainty",
+    "MCOSResult",
     "bootstrap_frontier",
+    "monte_carlo_optimization_selection",
     "resample_returns",
     "resampled_efficient_frontier",
+    "DeflatedSharpe",
+    "OverfittingReport",
+    "deflated_sharpe_ratio",
+    "expected_maximum_sharpe",
+    "minimum_track_record_length",
+    "probability_of_backtest_overfitting",
+    "FundamentalLawReport",
+    "InformationCoefficient",
+    "active_risk_decomposition",
+    "fundamental_law",
+    "grinold_alpha",
+    "implied_breadth",
+    "information_coefficient",
+    "optimal_active_risk",
+    "risk_aversion_from_information_ratio",
+    "transfer_coefficient",
+    "value_added",
+    "DiversificationReport",
+    "compare_diversification",
+    "diversification_distribution",
+    "effective_number_of_bets",
+    "minimum_torsion",
     "Scenario",
     "config_signature",
     "delete_scenario",
@@ -160,14 +231,17 @@ __all__ = [
     "scenario_to_dict",
     "BaseOptimizer",
     "BlackLittermanOptimizer",
+    "CDaROptimizer",
     "CVaROptimizer",
     "EqualWeightOptimizer",
+    "HERCOptimizer",
     "HRPOptimizer",
     "InverseVolatilityOptimizer",
     "MaxDiversificationOptimizer",
     "MaxSharpeOptimizer",
     "MeanVarianceOptimizer",
     "MinVarianceOptimizer",
+    "NCOOptimizer",
     "RiskParityOptimizer",
     "optimizer_factory",
     "__version__",

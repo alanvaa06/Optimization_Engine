@@ -11,8 +11,10 @@ from optimization_engine.optimizers.base import (  # noqa: E402
     PortfolioConstraints,
 )
 from optimization_engine.optimizers.black_litterman import BlackLittermanOptimizer  # noqa: E402
+from optimization_engine.optimizers.cdar import CDaROptimizer  # noqa: E402
 from optimization_engine.optimizers.cvar import CVaROptimizer  # noqa: E402
 from optimization_engine.optimizers.factory import optimizer_factory  # noqa: E402
+from optimization_engine.optimizers.herc import HERCOptimizer  # noqa: E402
 from optimization_engine.optimizers.hrp import HRPOptimizer  # noqa: E402
 from optimization_engine.optimizers.max_diversification import (  # noqa: E402
     MaxDiversificationOptimizer,
@@ -26,6 +28,7 @@ from optimization_engine.optimizers.naive import (  # noqa: E402
     EqualWeightOptimizer,
     InverseVolatilityOptimizer,
 )
+from optimization_engine.optimizers.nco import NCOOptimizer  # noqa: E402
 from optimization_engine.optimizers.requirements import (  # noqa: E402
     MethodRequirements,
     requirements_for,
@@ -35,9 +38,11 @@ from optimization_engine.optimizers.risk_parity import RiskParityOptimizer  # no
 __all__ = [
     "BaseOptimizer",
     "BlackLittermanOptimizer",
+    "CDaROptimizer",
     "ConfigurationError",
     "CVaROptimizer",
     "EqualWeightOptimizer",
+    "HERCOptimizer",
     "HRPOptimizer",
     "InverseVolatilityOptimizer",
     "MaxDiversificationOptimizer",
@@ -45,6 +50,7 @@ __all__ = [
     "MeanVarianceOptimizer",
     "MethodRequirements",
     "MinVarianceOptimizer",
+    "NCOOptimizer",
     "OptimizationResult",
     "PortfolioConstraints",
     "RiskParityOptimizer",

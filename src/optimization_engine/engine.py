@@ -31,7 +31,7 @@ from optimization_engine.config import EngineConfig
 from optimization_engine.data.covariance import (
     CovarianceDiagnostics,
     covariance_diagnostics,
-    covariance_matrix,
+    covariance_from_config,
 )
 from optimization_engine.frontier import FrontierResult, efficient_frontier
 from optimization_engine.optimizers.base import OptimizationResult
@@ -112,6 +112,84 @@ class EngineRun:
         """Risk shares aggregated to asset-class level."""
         return group_risk_contribution(
             self.result.weights, self.cov_matrix, self.config.groups
+        )
+
+    def diversification(self, model: str = "minimum_torsion"):
+        """Effective number of bets on uncorrelated factors (Meucci).
+
+        Complements :attr:`diagnostics`, whose ``effective_n`` and
+        ``effective_n_risk`` are computed asset by asset and so cannot see
+        that several positions are the same bet. Not computed on every solve
+        because the minimum-torsion rotation is an iterative fixed point and
+        the engine should not pay for it unless asked.
+        """
+        from optimization_engine.analytics.diversification import (
+            diversification_distribution,
+        )
+
+        return diversification_distribution(
+            self.result.weights, self.cov_matrix, model=model
+        )
+
+    def diversification_comparison(self) -> pd.DataFrame:
+        """Effective bets under both rotations; the gap is the diagnostic."""
+        from optimization_engine.analytics.diversification import (
+            compare_diversification,
+        )
+
+        return compare_diversification(self.result.weights, self.cov_matrix)
+
+    # -- benchmark-relative -------------------------------------------------
+
+    def _benchmark_weights(self) -> pd.Series:
+        """The benchmark this run is measured against.
+
+        Raises:
+            ValueError: When the config carries no benchmark. Active analytics
+                are meaningless without one, and defaulting to equal weights
+                would invent a benchmark nobody chose.
+        """
+        if not self.config.benchmark_weights:
+            raise ValueError(
+                "This run has no benchmark_weights, so there are no active "
+                "positions to analyze. Set config.benchmark_weights first."
+            )
+        return (
+            pd.Series(self.config.benchmark_weights)
+            .reindex(self.result.weights.index)
+            .fillna(0.0)
+        )
+
+    def active_risk_decomposition(self) -> pd.DataFrame:
+        """Euler decomposition of *tracking error*, per asset.
+
+        Where :meth:`risk_decomposition` says where the risk is, this says
+        where the risk differs from the benchmark's — the two disagree
+        precisely on the large index positions that carry absolute risk and
+        no active risk at all.
+        """
+        from optimization_engine.analytics.active import active_risk_decomposition
+
+        return active_risk_decomposition(
+            self.result.weights, self._benchmark_weights(), self.cov_matrix
+        )
+
+    def transfer_coefficient(self, method: str = "optimal") -> float:
+        """How much of this run's expected returns survived the mandate.
+
+        The alphas are taken as the expected returns *in excess of the
+        benchmark's*, and the active weights as the solved book minus the
+        benchmark. A low number says the constraints, not the forecasts, are
+        determining the portfolio — which is a fixable problem, and a
+        different one from having poor forecasts.
+        """
+        from optimization_engine.analytics.active import transfer_coefficient
+
+        benchmark = self._benchmark_weights()
+        mu = self.expected_returns.reindex(self.result.weights.index).fillna(0.0)
+        alphas = mu - float(mu @ benchmark)
+        return transfer_coefficient(
+            alphas, self.result.weights - benchmark, self.cov_matrix, method=method
         )
 
     # -- backtests ----------------------------------------------------------
@@ -327,13 +405,7 @@ def run_engine(
     if returns.shape[1] == 0:
         raise ValueError("run_engine received returns with no asset columns.")
 
-    cov = covariance_matrix(
-        returns,
-        method=config.covariance_method,
-        annualize=True,
-        periods_per_year=config.periods_per_year,
-        ewma_lambda=config.ewma_lambda,
-    )
+    cov = covariance_from_config(returns, config)
     cov_diag = covariance_diagnostics(
         cov,
         n_observations=len(returns),
