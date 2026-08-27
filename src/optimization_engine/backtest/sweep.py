@@ -1,0 +1,388 @@
+"""Parameter sweeps, and the discipline that makes them safe to run.
+
+Running a grid is easy and reporting the best cell is fatal. The maximum of N
+noisy estimates is a biased estimate of the best true value, and the bias
+grows with N: a hundred strategies with a true Sharpe of zero produce a best
+in-sample Sharpe near 2.6 standard errors above zero, purely by chance.
+Nothing about that number looks wrong on its own.
+
+So this module takes a structural stance rather than a documentary one:
+
+* **The grid is evaluated whole.** :class:`SweepResults` cannot represent a
+  partial grid — the invariant is checked on construction. A cell that fails
+  to build or fails to solve becomes an error *row*, never a missing one.
+* **Nothing here selects, ranks, or recommends.** There is no ``best()``,
+  no ``top_n()``, no sorting by Sharpe. What the module does offer is the
+  diagnostics that tell you what the search cost you: the deflated Sharpe of
+  a cell given every trial you ran, and the probability of backtest
+  overfitting across the grid.
+
+The number of trials is the input those diagnostics need and the one nobody
+records. Running the grid through here records it.
+"""
+
+from __future__ import annotations
+
+import itertools
+from dataclasses import dataclass, field
+from typing import Any, Callable, Union
+
+import pandas as pd
+
+from optimization_engine.config import EngineConfig
+
+#: Absolute ceiling on grid size. Not raisable through the public API: a grid
+#: this large is a search, and a search needs the diagnostics below far more
+#: than it needs another thousand cells.
+HARD_CELL_CAP = 1000
+
+ParamScalar = Union[int, float, str, bool, None]
+
+#: Columns every results frame carries, before the parameter and metric columns.
+STATUS_COLUMNS = ("cell_id", "status", "error")
+
+#: Metrics computed per cell from its net return stream.
+METRIC_COLUMNS = (
+    "annual_return",
+    "annual_volatility",
+    "sharpe",
+    "max_drawdown",
+    "n_periods",
+)
+
+
+class SweepValidationError(ValueError):
+    """A grid that cannot be expanded against the base configuration."""
+
+
+@dataclass(frozen=True)
+class SweepSpec:
+    """A declarative grid: dotted config path -> values to try.
+
+    Attributes:
+        params: ``{"optimizer.name": ["mean_variance", "risk_parity"],
+            "covariance_method": ["sample", "ledoit_wolf"]}`` and so on. Paths
+            are validated against the base configuration before anything runs.
+        max_cells: Refuse to expand past this. Defaults low on purpose.
+    """
+
+    params: dict[str, list[ParamScalar]]
+    max_cells: int = 200
+
+    def __post_init__(self) -> None:
+        if not self.params:
+            raise SweepValidationError("A sweep needs at least one parameter.")
+        for path, values in self.params.items():
+            if not values:
+                raise SweepValidationError(f"Parameter {path!r} has an empty value list.")
+        if self.max_cells <= 0:
+            raise SweepValidationError(f"max_cells must be positive; got {self.max_cells}.")
+        if self.max_cells > HARD_CELL_CAP:
+            raise SweepValidationError(
+                f"max_cells {self.max_cells} exceeds the hard cap of {HARD_CELL_CAP}. "
+                "Shrink the grid — the cap is not raisable."
+            )
+
+    def cell_count(self) -> int:
+        count = 1
+        for values in self.params.values():
+            count *= len(values)
+        return count
+
+
+@dataclass(frozen=True)
+class GridCell:
+    """One cell: its overrides, and either the built config or the build error."""
+
+    cell_id: int
+    params: dict[str, ParamScalar]
+    config: EngineConfig | None
+    build_error: str | None
+
+
+def _config_document(config: EngineConfig) -> dict[str, Any]:
+    """The config as a plain dict, keeping optional optimizer fields visible.
+
+    ``OptimizerSpec.to_dict`` drops ``None`` values, which would make a path
+    like ``optimizer.target_volatility`` look nonexistent on a config that has
+    not set it — exactly the parameter someone would want to sweep.
+    """
+    document = config.to_dict()
+    document["optimizer"] = dict(config.optimizer.__dict__)
+    return document
+
+
+def _assert_path_exists(document: dict[str, Any], path: str) -> None:
+    node: Any = document
+    for segment in path.split("."):
+        if not isinstance(node, dict) or segment not in node:
+            raise SweepValidationError(
+                f"Sweep path {path!r} does not exist on the base configuration "
+                f"(failed at {segment!r}). Available top-level keys: "
+                f"{sorted(document)}"
+            )
+        node = node[segment]
+
+
+def _set_path(document: dict[str, Any], path: str, value: ParamScalar) -> None:
+    segments = path.split(".")
+    node: Any = document
+    for segment in segments[:-1]:
+        node = node[segment]
+    node[segments[-1]] = value
+
+
+def expand_grid(base_config: EngineConfig, sweep: SweepSpec) -> list[GridCell]:
+    """Validate the grid against the base config and expand it in full.
+
+    Deterministic order: paths sorted lexicographically, values in the order
+    given, the last path varying fastest. A cell whose overrides fail
+    validation is still a cell — it carries its ``build_error`` forward.
+    """
+    document = _config_document(base_config)
+    for path in sweep.params:
+        _assert_path_exists(document, path)
+    count = sweep.cell_count()
+    if count > sweep.max_cells:
+        raise SweepValidationError(
+            f"The grid expands to {count} cells, over max_cells={sweep.max_cells}. "
+            f"Drop values or raise max_cells (hard cap {HARD_CELL_CAP})."
+        )
+
+    paths = sorted(sweep.params)
+    cells: list[GridCell] = []
+    for cell_id, combination in enumerate(
+        itertools.product(*[sweep.params[path] for path in paths])
+    ):
+        params = dict(zip(paths, combination))
+        config: EngineConfig | None = None
+        build_error: str | None = None
+        try:
+            cell_document = _config_document(base_config)
+            for path, value in params.items():
+                _set_path(cell_document, path, value)
+            config = EngineConfig.from_dict(cell_document)
+        except Exception as exc:  # noqa: BLE001 — an unbuildable cell is a row
+            build_error = f"{type(exc).__name__}: {exc}"
+        cells.append(
+            GridCell(
+                cell_id=cell_id, params=params, config=config, build_error=build_error
+            )
+        )
+    return cells
+
+
+def _cell_metrics(returns: pd.Series, periods_per_year: int) -> dict[str, float]:
+    from optimization_engine.analytics.performance import (
+        annualize_returns,
+        annualize_volatility,
+        sharpe_ratio,
+    )
+    from optimization_engine.analytics.risk import drawdown_series
+
+    clean = returns.dropna()
+    if clean.empty:
+        return {name: float("nan") for name in METRIC_COLUMNS}
+    return {
+        "annual_return": float(annualize_returns(clean, periods_per_year)),
+        "annual_volatility": float(annualize_volatility(clean, periods_per_year)),
+        "sharpe": float(sharpe_ratio(clean, 0.0, periods_per_year)),
+        "max_drawdown": float(drawdown_series(clean).min()),
+        "n_periods": float(len(clean)),
+    }
+
+
+@dataclass
+class SweepResults:
+    """Every cell of an evaluated grid, with the diagnostics the search needs.
+
+    The frame has one row per cell — always, including the ones that failed.
+    Constructing it with fewer rows than cells raises, because a grid that
+    quietly lost its failures is a grid whose trial count is wrong, and the
+    trial count is precisely what the deflation below depends on.
+    """
+
+    frame: pd.DataFrame
+    returns: dict[int, pd.Series]
+    n_cells: int
+    base_config: EngineConfig
+    sweep: SweepSpec
+    periods_per_year: int = 252
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if len(self.frame) != self.n_cells:
+            raise ValueError(
+                f"Full-grid invariant violated: {len(self.frame)} rows for "
+                f"{self.n_cells} cells. Failed cells must be rows, never drops."
+            )
+
+    @property
+    def n_ok(self) -> int:
+        return int((self.frame["status"] == "ok").sum())
+
+    @property
+    def n_failed(self) -> int:
+        return self.n_cells - self.n_ok
+
+    def return_matrix(self) -> pd.DataFrame:
+        """A ``T x N`` frame of the successful cells' return streams.
+
+        Columns are named by cell id and ordered by it, and the rows are the
+        dates every cell has in common — the input the CSCV procedure wants.
+        """
+        if not self.returns:
+            return pd.DataFrame()
+        ordered = [self.returns[cell_id] for cell_id in sorted(self.returns)]
+        matrix = pd.concat(
+            ordered, axis=1, join="inner",
+            keys=[str(cell_id) for cell_id in sorted(self.returns)],
+        )
+        return matrix.dropna(how="any")
+
+    def trial_sharpes(self) -> pd.Series:
+        """Annualized Sharpe of every successful cell, indexed by cell id."""
+        ok = self.frame[self.frame["status"] == "ok"]
+        return pd.Series(
+            ok["sharpe"].to_numpy(dtype=float),
+            index=ok["cell_id"].to_numpy(),
+            name="sharpe",
+        )
+
+    def deflated_sharpe(self, cell_id: int):
+        """Deflate one cell's Sharpe for the whole grid behind it.
+
+        The grid *is* the trial count. Deflating against it is the difference
+        between "this configuration had a Sharpe of 1.4" and "this
+        configuration had a Sharpe of 1.4 after we tried forty-eight of them".
+        """
+        from optimization_engine.analytics.selection import deflated_sharpe_ratio
+
+        if cell_id not in self.returns:
+            raise KeyError(
+                f"Cell {cell_id} has no return stream "
+                f"(status: {self._status(cell_id)!r})."
+            )
+        return deflated_sharpe_ratio(
+            self.returns[cell_id],
+            n_trials=self.n_ok,
+            trial_sharpes=self.trial_sharpes(),
+            periods_per_year=self.periods_per_year,
+        )
+
+    def overfitting_report(self, n_partitions: int = 16):
+        """CSCV across the grid: does the in-sample winner survive out of sample?
+
+        Raises:
+            ValueError: If fewer than two cells produced a return stream —
+                there is no selection to diagnose.
+        """
+        from optimization_engine.analytics.selection import (
+            probability_of_backtest_overfitting,
+        )
+
+        matrix = self.return_matrix()
+        if matrix.shape[1] < 2:
+            raise ValueError(
+                "Backtest-overfitting analysis needs at least two successful "
+                f"cells; the grid produced {matrix.shape[1]}."
+            )
+        return probability_of_backtest_overfitting(matrix, n_partitions=n_partitions)
+
+    def _status(self, cell_id: int) -> str:
+        row = self.frame[self.frame["cell_id"] == cell_id]
+        return "unknown" if row.empty else str(row.iloc[0]["status"])
+
+    def describe(self) -> str:
+        return (
+            f"{self.n_cells} cells over {sorted(self.sweep.params)}: "
+            f"{self.n_ok} evaluated, {self.n_failed} failed."
+        )
+
+
+def run_sweep(
+    base_config: EngineConfig,
+    sweep: SweepSpec,
+    evaluate: Callable[[EngineConfig], pd.Series],
+    *,
+    periods_per_year: int | None = None,
+    progress: Callable[[int, int], None] | None = None,
+) -> SweepResults:
+    """Evaluate every cell of the grid and return all of them.
+
+    Args:
+        base_config: The configuration the grid perturbs.
+        sweep: The grid.
+        evaluate: Takes one cell's config and returns its net return stream.
+            Normally a walk-forward run — evaluating cells in-sample makes
+            the overfitting diagnostics measure the wrong thing.
+        periods_per_year: Annualization basis. Defaults to the base config's.
+        progress: Called as ``progress(done, total)`` after each cell.
+
+    Returns:
+        Every cell, evaluated or failed. See :class:`SweepResults`.
+    """
+    cells = expand_grid(base_config, sweep)
+    total = len(cells)
+    ppy = int(periods_per_year or base_config.periods_per_year)
+
+    rows: list[dict[str, Any]] = []
+    streams: dict[int, pd.Series] = {}
+    for done, cell in enumerate(cells, start=1):
+        row: dict[str, Any] = {"cell_id": cell.cell_id, "status": "ok", "error": None}
+        row.update(cell.params)
+        if cell.config is None:
+            row["status"] = "build_error"
+            row["error"] = cell.build_error
+            row.update({name: float("nan") for name in METRIC_COLUMNS})
+        else:
+            try:
+                stream = evaluate(cell.config)
+                if stream is None or len(stream) == 0:
+                    raise ValueError("evaluate returned an empty return stream")
+                streams[cell.cell_id] = stream.rename(str(cell.cell_id))
+                row.update(_cell_metrics(stream, ppy))
+            except Exception as exc:  # noqa: BLE001 — per-cell isolation
+                row["status"] = "run_error"
+                row["error"] = f"{type(exc).__name__}: {exc}"
+                row.update({name: float("nan") for name in METRIC_COLUMNS})
+        rows.append(row)
+        if progress is not None:
+            progress(done, total)
+
+    columns = (
+        list(STATUS_COLUMNS) + sorted(sweep.params) + list(METRIC_COLUMNS)
+    )
+    frame = pd.DataFrame(rows, columns=columns)
+    return SweepResults(
+        frame=frame,
+        returns=streams,
+        n_cells=total,
+        base_config=base_config,
+        sweep=sweep,
+        periods_per_year=ppy,
+        metadata={"n_trials": total},
+    )
+
+
+def sweep_from_optimizers(
+    names: list[str], extra: dict[str, list[ParamScalar]] | None = None
+) -> SweepSpec:
+    """The common case: try these optimizers, optionally crossed with more."""
+    params: dict[str, list[ParamScalar]] = {"optimizer.name": list(names)}
+    params.update(extra or {})
+    return SweepSpec(params=params)
+
+
+__all__ = [
+    "HARD_CELL_CAP",
+    "METRIC_COLUMNS",
+    "STATUS_COLUMNS",
+    "GridCell",
+    "SweepResults",
+    "SweepSpec",
+    "SweepValidationError",
+    "expand_grid",
+    "run_sweep",
+    "sweep_from_optimizers",
+]

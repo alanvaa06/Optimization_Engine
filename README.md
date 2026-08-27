@@ -374,15 +374,84 @@ and nothing about that bias is visible in the number itself.
 
 **Backtesting**
 
-Two things a constant-weight in-sample replay hides, and this doesn't:
+The simulation lives in `optimization_engine.backtest`, organized around one
+boundary: a **stateless core** that turns weights into a track record, and the
+layers that judge what came out. The core reads no files, keeps no state
+between calls, and is deterministic given its inputs — which is what makes the
+diagnostics above meaningful and lets a whole grid be run without the cells
+interfering with each other.
 
-* `backtest_weights()` lets positions drift between rebalances, trades the
-  book back on a chosen cadence, and charges transaction costs on traded
-  notional — reporting turnover and the annualized cost drag.
-* `walk_forward_backtest()` re-estimates and re-solves on a rolling (or
-  expanding) window and holds each solution forward over returns the
-  optimizer never saw. `compare_in_and_out_of_sample()` puts the two track
-  records side by side with the degradation between them.
+`BacktestSpec` is the declarative description of a run: cadence, cost model,
+execution lag, annualization. It is data rather than code, so it serializes,
+diffs, and hashes. Two runs carrying the same `spec_hash` were asked the same
+question; `result_hash` says whether they got the same answer.
+
+```python
+from optimization_engine import BacktestSpec, CostSpec, run_backtest
+
+spec = BacktestSpec(
+    frequency="monthly",
+    costs=CostSpec(commission_bps=8, slippage_bps=4, impact_coefficient=0.4),
+    execution_lag=1,          # decide on the close, fill on the next one
+)
+run = run_backtest(returns, weights, spec)
+```
+
+Three things that in-sample constant-weight replays quietly assume away:
+
+* **Drift and rebalancing.** Positions grow with their own return between
+  trades; pulling them back costs money. `run_backtest()` reports held weights
+  (not targets), per-trade costs, turnover, and NAV.
+* **Execution.** `execution_lag` separates the date a target is chosen from the
+  date it is traded. At zero — the conventional default — the book fills on a
+  close it has not seen.
+* **Cost that scales.** `CostSpec` splits commission (a broker problem) from
+  slippage and market impact (a size problem). With `impact_coefficient` set,
+  cost follows the square-root law `eta · sigma · sqrt(q / participation)`, so
+  the same allocation gets more expensive as the book grows — the only way
+  capacity shows up in a backtest at all. When the trailing volatility behind
+  that estimate is missing, the trade degrades to the linear charge and the run
+  says so on `meta.degradations` rather than silently charging zero.
+
+`walk_forward_run()` re-estimates and re-solves on a rolling (or expanding)
+window and holds each solution forward over returns the optimizer never saw;
+a failed solve carries the previous book forward and is recorded, because
+skipping the period would delete a real cost from the track record.
+`compare_in_and_out_of_sample()` puts the two track records side by side with
+the degradation between them.
+
+On top of the core:
+
+* `compute_tca()` — the cost panel. A total is uninformative on its own, so it
+  normalizes: cost per unit of traded notional, cost per rebalance, annualized
+  drag, and the commission/impact split. Ratios that cannot be computed come
+  back as `None` *with a reason*, never as a zero that reads like a
+  measurement. `cost_by_asset()` says where it went.
+* `compute_position_stats()` — the round trips hiding in the weight path. Every
+  asset's stay in the book is an episode with a contribution and a holding
+  period, so the usual win rate, profit factor and payoff ratio apply. A Sharpe
+  earned by three names is a different risk from the same Sharpe earned by two
+  hundred, and the return curve cannot tell you which one you have.
+* `run_sweep()` — grids, with the discipline that makes them safe. `SweepResults`
+  **cannot represent a partial grid**: the invariant is checked on construction,
+  and a cell that fails to build or fails to solve becomes an error *row*, never
+  a missing one. There is deliberately no `best()`, no `top_n()`, no sort by
+  Sharpe. What it does give you is the trial count — the input the deflated
+  Sharpe and the overfitting probability both need, and the one nobody records.
+  `results.deflated_sharpe(cell)` and `results.overfitting_report()` wire
+  straight into §5 above.
+* `final_holdout_run()` — the segment nothing was fitted on, and the audit log
+  that keeps it that way. `gate_returns()` physically truncates the history
+  before any run can see it; `assert_within_holdout()` fails loudly if
+  untruncated data reaches a gated path anyway. Every visit to the held-out
+  segment is appended to a JSONL log, and repeat visits earn flags: `REPEATED`
+  for the same specification seen twice, `SHIFTED_HOLDOUT` for the same strategy
+  evaluated against a boundary that *moved*. The flags block nothing. They make
+  the second look visible, which is all a diagnostic can honestly do.
+* `build_tearsheet()` — the assembled reading. Performance, drawdowns, costs,
+  position statistics and the selection-bias correction in one object, with the
+  caveats attached to the numbers rather than to a footnote. A tearsheet over an
+  in-sample, costless, same-period-fill run says all three things out loud.
 
   Expected returns are re-derived inside each window by default
   (`reestimate_expected_returns=True`). This matters more than it sounds:
@@ -419,9 +488,12 @@ flowchart TD
 
 ```
 src/optimization_engine/
-├── analytics/        # performance · risk · relative · backtest
+├── analytics/        # performance · risk · relative · backtest (compact API)
 │                     # active (Grinold-Kahn) · diversification (Meucci)
 │                     # selection (deflated Sharpe · PBO)
+├── backtest/         # spec · costs · calendar · runner · results (the core)
+│                     # walkforward · tca · positions · sweep · holdout
+│                     # tearsheet
 ├── data/             # loaders · covariance · denoising · data-quality
 ├── optimizers/       # one file per technique + diagnostics + feasibility
 ├── reporting/        # Excel exporter + Plotly figures
@@ -494,10 +566,11 @@ surfaces what could make the next one wrong.
    tangency portfolios, the capital allocation line, and where your portfolio
    actually sits — plus an opt-in panel that redraws the frontier as a
    confidence band and names the positions the sample cannot pin down.
-5. **Backtest** — choose a rebalancing cadence and transaction costs; see
-   weight drift, cost drag, rolling performance, the return distribution with
-   its VaR/CVaR cuts, and a walk-forward run that says in words how much of
-   the result was hindsight.
+5. **Backtest** — choose a rebalancing cadence, an execution lag, and a cost
+   model split into commission, spread and square-root market impact; see
+   weight drift, cost drag, where the cost went by name, rolling performance,
+   the return distribution with its VaR/CVaR cuts, and a walk-forward run that
+   says in words how much of the result was hindsight.
 6. **Performance** — absolute and relative on one page, both computed on the
    same aligned sample: KPI cards for each, cumulative wealth against the
    benchmark and the *relative* wealth curve with its underwater band,
@@ -545,7 +618,29 @@ optengine optimize --config config/example_multi_asset.yaml --sample \
 # override whatever the config's benchmark block says.
 optengine optimize --config config/example_multi_asset.yaml --sample \
     --benchmark equal_weight --max-tracking-error 0.03 --max-active-share 0.5
+
+# Walk the process forward, price the trading properly, and count the trials.
+# --execution-lag defaults to 1: a desk does not trade on a close it has not
+# seen. Every sweep cell is walk-forwarded, and its trial count is carried into
+# the deflated Sharpe rather than left for the reader to guess.
+optengine backtest --config config/example_multi_asset.yaml --sample \
+    --commission-bps 8 --slippage-bps 4 --impact-eta 0.4 \
+    --sweep optimizer.name=min_variance,risk_parity,equal_weight \
+    --output backtest.xlsx
+
+# Withhold everything after a date, walk forward on the rest, then look at the
+# held-out segment once — and write that look down.
+optengine backtest --config config/example_multi_asset.yaml --sample \
+    --commission-bps 10 --holdout 2024-01-01
 ```
+
+`backtest` prints what the strategy earned out of sample, what the trading cost
+to get it, and how much of the remaining Sharpe survives being deflated for the
+size of the search. It ends with the caveats the run did *not* answer — costs
+not modelled, orders filled on a price nobody could have traded at, a Sharpe
+nobody deflated. A second visit to the same holdout comes back flagged
+`REPEATED`; the same strategy against a boundary that moved comes back
+`SHIFTED_HOLDOUT`.
 
 A benchmarked run prints the relative headline alongside the absolute one, and
 the workbook gains the benchmark, the active weights, and the full absolute
@@ -614,6 +709,35 @@ print(relative_run.performance(returns_override=relative_wf.returns).describe())
 # ...and how much of *that* is the forty configurations you tried first?
 from optimization_engine import deflated_sharpe_ratio
 print(deflated_sharpe_ratio(wf.returns, n_trials=40).describe())
+
+# The full simulation stack: a validated spec, real execution, real costs.
+from optimization_engine import BacktestSpec, CostSpec, SweepSpec
+
+spec = BacktestSpec(
+    frequency="monthly",
+    costs=CostSpec(commission_bps=8, slippage_bps=4, impact_coefficient=0.4),
+    execution_lag=1,
+)
+walk = run.walk_forward_run(spec=spec)
+print(walk.run.meta.result_hash)      # same spec + same data => same hash
+print(walk.run.trades.head())         # per-asset fills with the cost split
+print(walk.weight_stability())        # is the optimizer chasing noise?
+
+# Don't guess the trial count — run the grid and let it count itself.
+sweep = run.sweep(SweepSpec(params={
+    "optimizer.name": ["min_variance", "risk_parity", "equal_weight"],
+    "covariance_method": ["sample", "ledoit_wolf"],
+}))
+print(sweep.describe())               # every cell, failures included
+print(sweep.overfitting_report().describe())
+print(sweep.deflated_sharpe(0).describe())
+
+# One object with the numbers and the caveats attached to them.
+sheet = run.tearsheet(walk.run, n_trials=sweep.n_ok,
+                      trial_sharpes=sweep.trial_sharpes())
+print(sheet.describe())
+print(sheet.tca.to_frame())           # cost per notional, per trip, per year
+print(sheet.positions.to_frame())     # win rate and holding period by position
 
 # How many bets is this, once correlations are accounted for?
 print(run.diversification_comparison())
@@ -764,6 +888,18 @@ strategies while the probabilistic Sharpe accepts it; that the transfer
 coefficient is exactly 1 for the unconstrained optimum, −1 for its negative,
 and invariant to gearing; and that the minimum-torsion factors are uncorrelated
 to machine precision.
+
+The simulation stack is held to its own claims rather than to smoke: that a run
+is reproducible — same spec and same data, same result hash — and that a
+different cost model produces a different one; that an execution lag actually
+leaves the book in cash until the order fills, and that an order which cannot
+fill inside the sample never fills at all; that square-root impact charges
+three times the rate for nine times the trade, and degrades *loudly* when the
+volatility behind it is missing; that a cost ratio which cannot be computed
+comes back as `None` with a reason rather than a zero; that a grid keeps its
+failed cells as rows, so its trial count stays honest; and that a second visit
+to the same holdout is flagged `REPEATED` while a boundary that moved is
+flagged `SHIFTED_HOLDOUT`.
 
 ## Where the methods come from
 

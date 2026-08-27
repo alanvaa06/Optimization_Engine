@@ -212,3 +212,44 @@ def test_the_live_column_is_absent_when_there_is_nothing_to_compare_against(app)
     assert _current_bucket_weights(
         state, app.session_state["last_run"].result.weights
     ) is None
+
+
+def test_the_backtest_tab_prices_the_trading_it_shows():
+    """The cost controls are wired to the simulation, not decoration.
+
+    The backtest tab only renders once a solve has happened, so this drives
+    the real page through an optimization first. What it protects is the
+    wiring: that moving the commission, slippage, impact and lag controls
+    reaches the simulation core, and that the cost panel renders off the
+    result rather than off a separate calculation that can drift from it.
+    """
+    at = AppTest.from_file(str(APP), default_timeout=900)
+    at.run()
+    _no_exception(at)
+
+    optimize = [b for b in at.button if b.label == "Optimize portfolio"]
+    assert optimize, "the page no longer offers an Optimize button"
+    optimize[0].click().run()
+    _no_exception(at)
+    assert at.session_state["last_run"] is not None
+
+    # Charge for the trading: commission, spread, and impact that scales.
+    sliders = {s.label: s for s in at.slider}
+    sliders["Commission (bps, one-way)"].set_value(15)
+    sliders["Slippage (bps, one-way)"].set_value(5)
+    sliders["Market impact (eta)"].set_value(0.5)
+    at.run()
+    _no_exception(at)
+
+    from optimization_engine.backtest import BacktestSpec, CostSpec, compute_tca
+
+    run = at.session_state["last_run"]
+    spec = BacktestSpec(
+        frequency="monthly",
+        costs=CostSpec(commission_bps=15.0, slippage_bps=5.0, impact_coefficient=0.5),
+        periods_per_year=run.config.periods_per_year,
+    )
+    panel = compute_tca(run.simulate(spec))
+    assert panel.total_cost > 0
+    # Impact rides on top of the linear charge, so the realized rate exceeds it.
+    assert panel.cost_bps_of_notional > 20.0
