@@ -47,8 +47,11 @@ def rescale_to_adjusted(
     Returns:
         A new mapping with open, high, low and VWAP multiplied by each date's
         ``CLOSE / CLOSE_RAW``. Where the raw close is missing or non-positive
-        the ratio is unknowable and that date is left untouched — an unscaled
-        bar is a smaller error than one scaled by a number that was guessed.
+        the ratio is unknowable, and that bar's range is dropped rather than
+        left on the other scale: an unscaled bar beside an adjusted close is
+        not a smaller error, it is a low above its own close, and it takes
+        the whole panel down with it. A gap is something the panel is built
+        to carry; a contradiction is not.
     """
     adjusted = series_by_field.get(F.CLOSE)
     raw = series_by_field.get(F.CLOSE_RAW)
@@ -57,7 +60,7 @@ def rescale_to_adjusted(
 
     usable = raw.where(raw > 0.0)
     ratio = pd.to_numeric(adjusted / usable, errors="coerce")
-    ratio = ratio.replace([np.inf, -np.inf], np.nan).fillna(1.0)
+    ratio = ratio.replace([np.inf, -np.inf], np.nan)
 
     out = dict(series_by_field)
     for field in _SCALED_FIELDS:
@@ -72,7 +75,8 @@ def rescale_frames_to_adjusted(
     """:func:`rescale_to_adjusted`, for whole per-field frames.
 
     Applied column-wise, so a panel where one identifier pays dividends and
-    another does not is scaled correctly for both.
+    another does not is scaled correctly for both. As above, a cell with no
+    usable ratio has its range dropped rather than left on the wrong scale.
     """
     adjusted = frames.get(F.CLOSE)
     raw = frames.get(F.CLOSE_RAW)
@@ -81,7 +85,7 @@ def rescale_frames_to_adjusted(
 
     aligned = raw.reindex(index=adjusted.index, columns=adjusted.columns)
     usable = aligned.where(aligned > 0.0)
-    ratio = (adjusted / usable).replace([np.inf, -np.inf], np.nan).fillna(1.0)
+    ratio = (adjusted / usable).replace([np.inf, -np.inf], np.nan)
 
     out = dict(frames)
     for field in _SCALED_FIELDS:

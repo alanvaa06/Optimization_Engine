@@ -73,6 +73,7 @@ from optimization_engine.analytics.risk import drawdown_table  # noqa: E402
 from optimization_engine.backtest import (  # noqa: E402
     BacktestSpec,
     CostSpec,
+    SpecValidationError,
     compute_tca,
     cost_by_asset,
 )
@@ -2143,19 +2144,25 @@ with tab_backtest:
             liquidity, initial_capital = {"impact_participation_source": "fixed"}, 1.0
 
         cost_bps = float(commission_bps) + float(slippage_bps)
-        backtest_spec = BacktestSpec(
-            frequency=frequency,
-            costs=CostSpec(
-                commission_bps=float(commission_bps),
-                slippage_bps=float(slippage_bps),
-                impact_coefficient=float(impact_eta),
-                impact_participation=float(participation) / 100.0,
-                **liquidity,
-            ),
-            execution_lag=int(execution_lag),
-            periods_per_year=int(periods_per_year),
-            initial_capital=float(initial_capital),
-        )
+        try:
+            backtest_spec = BacktestSpec(
+                frequency=frequency,
+                costs=CostSpec(
+                    commission_bps=float(commission_bps),
+                    slippage_bps=float(slippage_bps),
+                    impact_coefficient=float(impact_eta),
+                    impact_participation=float(participation) / 100.0,
+                    **liquidity,
+                ),
+                execution_lag=int(execution_lag),
+                periods_per_year=int(periods_per_year),
+                initial_capital=float(initial_capital),
+            )
+        except SpecValidationError as exc:
+            # A cost model the numbers cannot express is something to say, not
+            # something to fall over on.
+            st.error(str(exc))
+            st.stop()
         bt = run.simulate(
             backtest_spec,
             prices=prices.reindex(returns.index) if backtest_volumes is not None else None,

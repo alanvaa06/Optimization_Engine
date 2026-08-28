@@ -203,10 +203,12 @@ def _from_long(
         )
 
     frames: dict[str, pd.DataFrame] = {F.CLOSE: pivot(by_lower[close_candidates[0]])}
-    if len(close_candidates) > 1:
-        # The unadjusted print is still worth keeping — it is what turns
-        # weights into share counts — just not as the total-return series.
-        frames[F.CLOSE_RAW] = pivot(by_lower[close_candidates[-1]])
+    if close_candidates[0] != "close" and "close" in by_lower:
+        # The unadjusted print is worth keeping — it is what turns weights into
+        # share counts — but only the genuinely raw column qualifies. Two
+        # spellings of the *adjusted* close (``adj_close`` and ``adjclose``)
+        # would otherwise produce a "raw" series that is itself adjusted.
+        frames[F.CLOSE_RAW] = pivot(by_lower["close"])
 
     for lower, column in by_lower.items():
         target = _LONG_COLUMNS.get(lower)
@@ -220,7 +222,22 @@ def _from_long(
     # A terminal export is almost always a raw OHLCV row with an adj_close
     # column bolted on the end, so the range needs the same reconciliation a
     # provider's does.
+    if F.CLOSE_RAW not in frames and _has_adjusted_close(by_lower):
+        has_range = any(f in frames for f in (F.OPEN, F.HIGH, F.LOW))
+        if has_range:
+            raise ProviderResponseError(
+                f"{source.name} has an adjusted close but no raw `close` "
+                "column, so its open/high/low cannot be put on the same scale "
+                "— a dividend-adjusted close does not sit inside an "
+                "unadjusted day's range. Add the raw `close` column, or drop "
+                "the open/high/low columns and load closes alone."
+            )
     return rescale_frames_to_adjusted(frames)
+
+
+def _has_adjusted_close(by_lower: dict[str, object]) -> bool:
+    """Whether the file's close column is an adjusted one."""
+    return any(name in by_lower for name in ("adj_close", "adjclose", "adjusted_close"))
 
 
 def _slice_window(

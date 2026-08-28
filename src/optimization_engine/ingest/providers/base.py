@@ -73,6 +73,11 @@ _RETRYABLE_STATUS = frozenset({408, 425, 429, 500, 502, 503, 504})
 _MAX_RESPONSE_BYTES = 64 * 1024 * 1024
 
 
+#: Headers that authenticate the caller to one specific host, and must not
+#: travel to another. Compared lower-cased.
+_CREDENTIAL_HEADERS = frozenset({"authorization", "proxy-authorization", "cookie"})
+
+
 class _SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
     """A redirect handler that will not hand credentials to a new host.
 
@@ -101,9 +106,12 @@ class _SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
 
         if parsed.netloc.lower() != urllib.parse.urlsplit(req.full_url).netloc.lower():
             # Cross-host: the new host is not the one the credential was
-            # issued for, so it does not get to see it.
-            for header in ("Authorization", "Proxy-Authorization", "Cookie"):
-                redirected.remove_header(header)
+            # issued for, so it does not get to see it. Matched case-
+            # insensitively — urllib stores header names capitalized, so
+            # removing them by the spelling the caller used silently misses.
+            for name in list(redirected.headers):
+                if name.lower() in _CREDENTIAL_HEADERS:
+                    redirected.headers.pop(name, None)
         return redirected
 
 

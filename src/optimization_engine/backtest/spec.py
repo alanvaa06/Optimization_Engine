@@ -47,9 +47,11 @@ REBALANCE_DESCRIPTIONS: dict[str, str] = {
 }
 
 
-#: Below this NAV an ADV-based impact charge is numerically meaningless — a
-#: book of a few currency units cannot move any real market — so a run
-#: configured that way is a mistake rather than a scenario.
+#: The smallest NAV at which an ADV-based impact charge means anything. Below
+#: it a book of a few currency units cannot move any real market, so a run
+#: configured that way is a mistake rather than a scenario. Inclusive: this
+#: exact value is allowed, so a control offering it as its minimum cannot
+#: produce a spec the validator rejects.
 MIN_ADV_CAPITAL = 1_000.0
 
 #: Where the impact model's participation rate comes from. ``"fixed"`` needs
@@ -291,7 +293,7 @@ class BacktestSpec:
             )
         if not isinstance(self.costs, CostSpec):
             object.__setattr__(self, "costs", CostSpec.from_dict(dict(self.costs)))
-        if self.costs.uses_volume and self.initial_capital <= MIN_ADV_CAPITAL:
+        if self.costs.uses_volume and self.initial_capital < MIN_ADV_CAPITAL:
             # Silently allowing this is the worst outcome available: the run
             # completes, reports a cost near zero, and looks like evidence
             # that the strategy has no capacity problem. It has no capacity

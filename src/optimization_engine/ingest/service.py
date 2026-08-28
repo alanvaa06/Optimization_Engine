@@ -201,6 +201,12 @@ def ingest(
     )
     warnings: list[str] = []
 
+    # Resolved before the cache branch, because a warm run must describe the
+    # same universe a cold one does — a collision the cold path names would
+    # otherwise come back as "the provider returned nothing" on every re-run.
+    duplicates = _duplicate_symbols(request.identifiers, symbol_by_identifier, unsupported)
+    unsupported = tuple([*unsupported, *duplicates])
+
     cache = (
         PanelCache(request.cache_dir, request.cache_ttl_seconds)
         if (use_cache and request.cache_dir)
@@ -216,9 +222,12 @@ def ingest(
             # therefore has to be re-applied to the cached panel, or a strict
             # request would pass simply because a lax one ran first.
             cache_warnings = [f"Served from cache, written {entry.age_label}."]
+            cache_warnings.extend(
+                _translation_notes(source.name, unsupported, duplicates)
+            )
             cache_warnings.extend(_volume_notes(panel, request))
             outcomes = _outcomes_from_panel(
-                panel, request, symbol_by_identifier, unsupported
+                panel, request, symbol_by_identifier, unsupported, None, duplicates
             )
             return IngestResult(
                 panel=panel,
@@ -230,23 +239,8 @@ def ingest(
                 cache_entry=entry,
             )
 
-    duplicates = _duplicate_symbols(request.identifiers, symbol_by_identifier, unsupported)
-    unsupported = tuple([*unsupported, *duplicates])
-
     fetchable = tuple(i for i in request.identifiers if i not in unsupported)
-    if duplicates:
-        warnings.append(
-            f"{', '.join(duplicates)} resolve to a symbol another identifier "
-            f"already claims on {source.name}, so they name the same "
-            "instrument twice. Only the first was fetched."
-        )
-    no_symbol = tuple(i for i in unsupported if i not in duplicates)
-    if no_symbol:
-        warnings.append(
-            f"{source.name} has no symbol for {', '.join(no_symbol)}; "
-            "they were skipped. Try another provider, or pass the ticker "
-            "your provider uses directly."
-        )
+    warnings.extend(_translation_notes(source.name, unsupported, duplicates))
     if not fetchable:
         raise ProviderConfigurationError(
             f"None of the requested identifiers can be served by {source.name}: "
@@ -287,6 +281,31 @@ def ingest(
         warnings=tuple(warnings),
         elapsed_seconds=time.perf_counter() - started,
     )
+
+
+def _translation_notes(
+    provider: str, unsupported: tuple[str, ...], duplicates: tuple[str, ...]
+) -> list[str]:
+    """Run-level notes about identifiers that never reached the provider.
+
+    Shared by the cold and warm paths so a cached run reports the same
+    universe as the fetch that filled it.
+    """
+    notes: list[str] = []
+    if duplicates:
+        notes.append(
+            f"{', '.join(duplicates)} resolve to a symbol another identifier "
+            f"already claims on {provider}, so they name the same instrument "
+            "twice. Only the first was fetched."
+        )
+    no_symbol = tuple(i for i in unsupported if i not in duplicates)
+    if no_symbol:
+        notes.append(
+            f"{provider} has no symbol for {', '.join(no_symbol)}; "
+            "they were skipped. Try another provider, or pass the ticker "
+            "your provider uses directly."
+        )
+    return notes
 
 
 def _duplicate_symbols(
@@ -388,6 +407,21 @@ def _fetch_batched(
             # other chunks may well succeed.
             for identifier in chunk:
                 failures[identifier] = str(exc)
+            continue
+        except Exception as exc:
+            # The same rule as the per-identifier path: an unclassified
+            # exception's text has been vetted by nobody, and this string
+            # travels to a log, the CLI's stderr and the browser.
+            _LOG.exception(
+                "Unexpected failure fetching %s from %s",
+                ", ".join(chunk), source.name,
+            )
+            message = (
+                f"{type(exc).__name__} in the {source.name} adapter "
+                "(see the log for the full traceback)"
+            )
+            for identifier in chunk:
+                failures[identifier] = message
             continue
         panels.append(_rename_to_identifiers(panel, chunk, symbol_by_identifier))
 

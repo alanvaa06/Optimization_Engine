@@ -46,7 +46,7 @@ from optimization_engine.backtest.results import (
     empty_costs,
     empty_trades,
 )
-from optimization_engine.backtest.spec import BacktestSpec
+from optimization_engine.backtest.spec import MIN_ADV_CAPITAL, BacktestSpec
 
 #: Traded fractions below this are float residue, not orders.
 _TRADE_EPS = 1e-12
@@ -123,7 +123,10 @@ def run_backtest(
         The full result bundle. See :class:`~optimization_engine.backtest.results.RunResult`.
 
     Raises:
-        ValueError: If ``returns`` is empty or the weight schedule is.
+        ValueError: If ``returns`` is empty, the weight schedule is, or the
+            cost model prices impact from volume while ``spec.initial_capital``
+            is too small for that to mean anything.
+
     """
     if returns is None or returns.empty:
         raise ValueError("Cannot backtest on empty returns.")
@@ -146,12 +149,27 @@ def run_backtest(
     # universe with no volume — the common case for indices — costs nothing
     # and behaves identically to one that was never offered any.
     adv_lookback = int(getattr(model, "participation_lookback", _no_lookback)())
+    if adv_lookback > 0 and float(spec.initial_capital) < MIN_ADV_CAPITAL:
+        # The spec validates this too, but a caller can hand in a cost model
+        # directly and bypass the spec entirely — and this is the one place
+        # every route converges on. Left through, an ADV charge against a
+        # one-currency-unit book rounds to zero and reads as proof the
+        # strategy has no capacity limit.
+        raise ValueError(
+            "This cost model prices impact from traded volume, which needs a "
+            f"real fund size: initial_capital is {spec.initial_capital:g}. "
+            "Set it to the capital being deployed."
+        )
     adv_notional = None
     if adv_lookback > 0 and volumes is not None and prices is not None:
         adv_notional = trailing_dollar_volume(
             prices, volumes, adv_lookback, spec.costs.min_adv_observations
         ).reindex(index=index, columns=assets)
-    adv_share = float(spec.costs.impact_adv_share)
+    # A model supplied directly owns its own share of volume; only fall back
+    # to the spec's for the models this library builds from it.
+    adv_share = float(
+        getattr(model, "adv_share", spec.costs.impact_adv_share)
+    )
 
     marks = rebalance_dates(index, spec.frequency)
     # A schedule date is always a decision: the walk-forward runner only emits

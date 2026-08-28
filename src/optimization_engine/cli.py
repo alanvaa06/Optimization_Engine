@@ -950,6 +950,8 @@ def _cmd_backtest(args: argparse.Namespace) -> int:
             rebalance_every=args.rebalance_every,
             spec=spec,
             expanding=args.expanding,
+            prices=prices,
+            volumes=volumes,
         )
         print(f"  {sweep_results.describe()}")
         n_trials = max(sweep_results.n_ok, 1)
@@ -982,7 +984,21 @@ def _cmd_backtest(args: argparse.Namespace) -> int:
         outcome = final_holdout_run(
             returns,
             args.holdout,
-            lambda segment: run_backtest(segment, locked, holdout_spec).returns,
+            # The held-out replay is a real run and must be priced the same
+            # way: without the volume panel it would silently fall back to the
+            # fixed participation rate, so the one segment that is supposed to
+            # be the honest answer would be the cheapest.
+            lambda segment: run_backtest(
+                segment,
+                locked,
+                holdout_spec,
+                prices=prices.reindex(segment.index) if volumes is not None else None,
+                volumes=(
+                    volumes.reindex(index=segment.index, columns=segment.columns)
+                    if volumes is not None
+                    else None
+                ),
+            ).returns,
             strategy={"config": args.config, "spec_hash": spec.spec_hash},
             audit_path=args.audit_log,
             periods_per_year=config.periods_per_year,

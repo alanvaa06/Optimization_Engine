@@ -453,21 +453,23 @@ def test_adv_pricing_accepts_a_real_book():
     assert spec.costs.uses_volume
 
 
-def test_the_guard_names_the_threshold_it_applied():
+def test_the_threshold_is_inclusive_so_a_control_can_offer_it():
     from optimization_engine.backtest.spec import MIN_ADV_CAPITAL
 
-    # Just under passes nothing; just over is the caller's judgement to make.
+    # The app's fund-size input uses MIN_ADV_CAPITAL as its own minimum, so a
+    # user dialling it all the way down must not produce a spec the validator
+    # rejects.
+    BacktestSpec(
+        initial_capital=MIN_ADV_CAPITAL,
+        costs=CostSpec(impact_coefficient=0.5, impact_participation_source="adv"),
+    )
     with pytest.raises(SpecValidationError):
         BacktestSpec(
-            initial_capital=MIN_ADV_CAPITAL,
+            initial_capital=MIN_ADV_CAPITAL * 0.99,
             costs=CostSpec(
                 impact_coefficient=0.5, impact_participation_source="adv"
             ),
         )
-    BacktestSpec(
-        initial_capital=MIN_ADV_CAPITAL * 1.01,
-        costs=CostSpec(impact_coefficient=0.5, impact_participation_source="adv"),
-    )
 
 
 def test_adv_impact_is_material_at_a_realistic_book_size():
@@ -486,3 +488,48 @@ def test_adv_impact_is_material_at_a_realistic_book_size():
     fixed_cost = float(fixed.costs["total"].sum())
     adv_cost = float(adv.costs["total"].sum())
     assert adv_cost > fixed_cost / 100.0
+
+
+def test_a_cost_model_passed_directly_cannot_dodge_the_fund_size_guard():
+    # The spec guard reads spec.costs; a model handed in through cost_model=
+    # never touches it. The runner is the one place every route converges on.
+    returns = _returns()
+    weights = pd.Series(0.5, index=returns.columns)
+    model = SquareRootImpactCost(
+        eta=1.0, participation=0.05, participation_source="adv"
+    )
+    with pytest.raises(ValueError, match="real fund size"):
+        run_backtest(
+            returns,
+            weights,
+            BacktestSpec(frequency="monthly"),  # the default NAV of 1.0
+            cost_model=model,
+            prices=_prices(returns),
+            volumes=_volumes(returns),
+        )
+
+
+def test_a_directly_passed_model_uses_its_own_share_of_volume():
+    # An injected model owns its parameters; reading the share off a spec it
+    # never came from would silently apply someone else's number.
+    returns = _returns()
+    prices, volumes = _prices(returns), _volumes(returns)
+    weights = pd.Series(0.5, index=returns.columns)
+    spec = BacktestSpec(frequency="monthly", initial_capital=CAPITAL)
+
+    class _Greedy(SquareRootImpactCost):
+        adv_share = 0.5
+
+    class _Timid(SquareRootImpactCost):
+        adv_share = 0.01
+
+    def cost(cls):
+        model = cls(eta=1.0, participation=0.05, participation_source="adv")
+        run = run_backtest(
+            returns, weights, spec, cost_model=model, prices=prices, volumes=volumes
+        )
+        return float(run.costs["total"].sum())
+
+    # Taking a larger share of the day's volume means more capacity, so less
+    # impact for the same trade.
+    assert cost(_Greedy) < cost(_Timid)

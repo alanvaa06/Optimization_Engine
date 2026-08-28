@@ -596,3 +596,67 @@ def test_a_series_with_a_declared_matching_currency_needs_no_note():
     converted, note = _convert_currency(_panel_with_currency("AAA", "USD"), "USD")
     assert note == ""
     assert converted.meta["AAA"].currency == "USD"
+
+
+def test_a_cache_hit_reports_a_symbol_collision_the_same_way_a_cold_run_does(tmp_path):
+    # The warm path used to return before the collision was even detected, so
+    # a re-run described the loser as "the provider returned no series" —
+    # exactly the misreport the check exists to prevent.
+    class YahooLike(StubProvider):
+        name = "yahoo"
+
+        @property
+        def capabilities(self):
+            return ProviderCapabilities(
+                fields=frozenset({F.CLOSE}), intervals=frozenset({"1d"})
+            )
+
+    request = _request(("SP500", "^GSPC"), provider="yahoo", cache_dir=str(tmp_path))
+    cold = ingest(request, provider=YahooLike())
+    warm = ingest(request, provider=YahooLike())
+
+    assert warm.from_cache
+    cold_gspc = next(o for o in cold.outcomes if o.identifier == "^GSPC")
+    warm_gspc = next(o for o in warm.outcomes if o.identifier == "^GSPC")
+    assert warm_gspc.status == cold_gspc.status == STATUS_UNSUPPORTED
+    assert "already claims" in warm_gspc.message
+    assert any("same instrument twice" in note for note in warm.warnings)
+
+
+def test_a_cache_hit_reports_an_unsupported_instrument_too(tmp_path):
+    class NoIndexProvider(StubProvider):
+        name = "fred"
+
+        @property
+        def capabilities(self):
+            return ProviderCapabilities(
+                fields=frozenset({F.CLOSE}), intervals=frozenset({"1d"})
+            )
+
+    request = _request(("SP500", "IPC"), provider="fred", cache_dir=str(tmp_path))
+    ingest(request, provider=NoIndexProvider())
+    warm = ingest(request, provider=NoIndexProvider())
+    assert warm.from_cache
+    assert any("no symbol for IPC" in note for note in warm.warnings)
+
+
+def test_a_batched_provider_bug_does_not_relay_its_message_either():
+    # `_fetch_single` got the catch-all first; `_fetch_batched` needed the
+    # same rule, and reaches the browser through the same render path.
+    class LeakyBatch(StubProvider):
+        name = "leaky_batch"
+
+        @property
+        def capabilities(self):
+            return ProviderCapabilities(
+                fields=frozenset({F.CLOSE}), intervals=frozenset({"1d"}),
+                supports_batch=True, max_batch_size=4, accepts_any_symbol=True,
+            )
+
+        def fetch_batch(self, identifiers, request):
+            raise ValueError("boom carrying sk-live-SECRET")
+
+    with pytest.raises(ProviderConfigurationError) as caught:
+        ingest(_request(("AAA", "BBB"), provider="leaky_batch"), provider=LeakyBatch())
+    assert "sk-live-SECRET" not in str(caught.value)
+    assert "ValueError" in str(caught.value)

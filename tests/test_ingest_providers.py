@@ -568,7 +568,7 @@ def test_fmp_asks_for_the_full_payload_even_for_a_close_only_request(monkeypatch
     assert float(panel.prices().loc["2020-01-03", "KO"]) == pytest.approx(97.0)
 
 
-def test_fmp_leaves_the_range_alone_when_the_raw_close_is_missing(monkeypatch):
+def test_fmp_drops_a_bar_whose_adjustment_ratio_is_unknowable(monkeypatch):
     payload = {
         "symbol": "X",
         "historical": [
@@ -584,7 +584,14 @@ def test_fmp_leaves_the_range_alone_when_the_raw_close_is_missing(monkeypatch):
     provider = FinancialModelingPrep(api_key="k")
     monkeypatch.setattr(provider, "_get_json", lambda *a, **k: payload)
     panel = provider.fetch_one("X", _request(("X",), fields=F.OHLC))
-    assert float(panel.frame(F.HIGH).loc["2020-01-02", "X"]) == pytest.approx(10.5)
+
+    # Leaving that bar on the raw scale beside an adjusted close is not a
+    # smaller error — it is a low above its own close, and it would take the
+    # whole panel down. An unknown range is a gap, which the panel carries.
+    assert pd.isna(panel.frame(F.HIGH).loc["2020-01-02", "X"])
+    assert float(panel.frame(F.HIGH).loc["2020-01-03", "X"]) == pytest.approx(10.5)
+    # The close itself is untouched: only the range depended on the ratio.
+    assert panel.prices().loc["2020-01-02", "X"] == pytest.approx(10.0)
 
 
 def test_a_zero_price_print_still_fails_the_panel(monkeypatch):
@@ -673,4 +680,52 @@ def test_a_long_file_with_only_a_plain_close_still_works(tmp_path):
         ("AAA",), _request(("AAA",), start="2024-01-01", end="2024-01-31")
     )
     assert panel.prices()["AAA"].tolist() == [10.0, 11.0, 12.0, 13.0]
+    assert panel.frame(F.CLOSE_RAW) is None
+
+
+def test_a_long_file_with_an_adjusted_close_and_a_range_but_no_raw_close_says_why(tmp_path):
+    # There is no way to put the range on the close's scale without the raw
+    # print, and silently loading a contradictory panel is the worst option.
+    rows = [
+        {"date": day, "ticker": "AAA", "open": 100.0, "high": 101.0,
+         "low": 99.0, "adj_close": adj}
+        for day, adj in zip(pd.bdate_range("2024-01-01", periods=4), [97, 98, 99, 100])
+    ]
+    path = tmp_path / "adjusted_only.csv"
+    pd.DataFrame(rows).to_csv(path, index=False)
+
+    with pytest.raises(ProviderResponseError, match="no raw `close` column"):
+        LocalFile(path=path).fetch_batch(
+            ("AAA",),
+            _request(("AAA",), start="2024-01-01", end="2024-01-31", fields=F.OHLC),
+        )
+
+
+def test_a_long_file_with_an_adjusted_close_and_no_range_loads_fine(tmp_path):
+    rows = [
+        {"date": day, "ticker": "AAA", "adj_close": adj}
+        for day, adj in zip(pd.bdate_range("2024-01-01", periods=4), [97, 98, 99, 100])
+    ]
+    path = tmp_path / "closes_only.csv"
+    pd.DataFrame(rows).to_csv(path, index=False)
+
+    panel = LocalFile(path=path).fetch_batch(
+        ("AAA",), _request(("AAA",), start="2024-01-01", end="2024-01-31")
+    )
+    assert panel.prices()["AAA"].tolist() == [97.0, 98.0, 99.0, 100.0]
+
+
+def test_two_spellings_of_the_adjusted_close_do_not_invent_a_raw_one(tmp_path):
+    rows = [
+        {"date": day, "ticker": "AAA", "adj_close": adj, "adjclose": adj}
+        for day, adj in zip(pd.bdate_range("2024-01-01", periods=4), [97, 98, 99, 100])
+    ]
+    path = tmp_path / "two_adjusted.csv"
+    pd.DataFrame(rows).to_csv(path, index=False)
+
+    panel = LocalFile(path=path).fetch_batch(
+        ("AAA",), _request(("AAA",), start="2024-01-01", end="2024-01-31")
+    )
+    # Both columns are adjusted; calling one of them "raw" would be a lie that
+    # later turns into the wrong share count.
     assert panel.frame(F.CLOSE_RAW) is None

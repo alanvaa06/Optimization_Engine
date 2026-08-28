@@ -468,6 +468,8 @@ class EngineRun:
         spec: BacktestSpec | None = None,
         expanding: bool = False,
         progress: Callable[[int, int], None] | None = None,
+        prices: pd.DataFrame | None = None,
+        volumes: pd.DataFrame | None = None,
     ) -> SweepResults:
         """Walk-forward every cell of a grid, and count the trials.
 
@@ -475,6 +477,14 @@ class EngineRun:
         measures how well each configuration memorized the history rather than
         how well it would have done. The results carry the trial count that
         the deflated Sharpe and the overfitting probability both need.
+
+        Args:
+            prices: Close prices, needed only to turn share volume into traded
+                notional.
+            volumes: Traded volume per asset. Every cell is priced the same
+                way, so a grid run with a capacity-aware cost model must be
+                handed the same panel the single run was — otherwise the grid
+                is cheaper than the run it is supposed to contextualize.
         """
         ppy = self.config.periods_per_year
         run_spec = spec or BacktestSpec(periods_per_year=ppy)
@@ -499,6 +509,8 @@ class EngineRun:
                 rebalance_every=step,
                 spec=run_spec,
                 expanding=expanding,
+                prices=prices,
+                volumes=volumes,
             ).returns
 
         return run_sweep(
