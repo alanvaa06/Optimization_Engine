@@ -210,6 +210,13 @@ def ingest(
         cached = cache.load(request.fingerprint())
         if cached is not None:
             panel, entry = cached
+            # The fingerprint covers what was fetched, not what the caller
+            # will accept — ``require_volume`` is deliberately outside it, so
+            # a permissive run and a strict one share an entry. The policy
+            # therefore has to be re-applied to the cached panel, or a strict
+            # request would pass simply because a lax one ran first.
+            cache_warnings = [f"Served from cache, written {entry.age_label}."]
+            cache_warnings.extend(_volume_notes(panel, request))
             outcomes = _outcomes_from_panel(
                 panel, request, symbol_by_identifier, unsupported
             )
@@ -217,16 +224,26 @@ def ingest(
                 panel=panel,
                 request=request,
                 outcomes=outcomes,
-                warnings=(f"Served from cache, written {entry.age_label}.",),
+                warnings=tuple(cache_warnings),
                 elapsed_seconds=time.perf_counter() - started,
                 from_cache=True,
                 cache_entry=entry,
             )
 
+    duplicates = _duplicate_symbols(request.identifiers, symbol_by_identifier, unsupported)
+    unsupported = tuple([*unsupported, *duplicates])
+
     fetchable = tuple(i for i in request.identifiers if i not in unsupported)
-    if unsupported:
+    if duplicates:
         warnings.append(
-            f"{source.name} has no symbol for {', '.join(unsupported)}; "
+            f"{', '.join(duplicates)} resolve to a symbol another identifier "
+            f"already claims on {source.name}, so they name the same "
+            "instrument twice. Only the first was fetched."
+        )
+    no_symbol = tuple(i for i in unsupported if i not in duplicates)
+    if no_symbol:
+        warnings.append(
+            f"{source.name} has no symbol for {', '.join(no_symbol)}; "
             "they were skipped. Try another provider, or pass the ticker "
             "your provider uses directly."
         )
@@ -257,7 +274,7 @@ def ingest(
 
     warnings.extend(_volume_notes(panel, request))
     outcomes = _outcomes_from_panel(
-        panel, request, symbol_by_identifier, unsupported, failures
+        panel, request, symbol_by_identifier, unsupported, failures, duplicates
     )
 
     if cache is not None:
@@ -270,6 +287,31 @@ def ingest(
         warnings=tuple(warnings),
         elapsed_seconds=time.perf_counter() - started,
     )
+
+
+def _duplicate_symbols(
+    identifiers: tuple[str, ...],
+    symbol_by_identifier: Mapping[str, str],
+    unsupported: tuple[str, ...],
+) -> tuple[str, ...]:
+    """Identifiers whose provider symbol another identifier already claims.
+
+    ``SP500`` and ``^GSPC`` are the same Yahoo series. Fetching both makes one
+    column that two identifiers want, and the loser is reported as though the
+    provider had returned nothing for it — which is not what happened. Naming
+    the collision is the honest answer.
+    """
+    seen: dict[str, str] = {}
+    duplicates: list[str] = []
+    for identifier in identifiers:
+        if identifier in unsupported:
+            continue
+        symbol = symbol_by_identifier.get(identifier, identifier)
+        if symbol in seen:
+            duplicates.append(identifier)
+        else:
+            seen[symbol] = identifier
+    return tuple(duplicates)
 
 
 def _fetch(
@@ -374,7 +416,14 @@ def _fetch_single(
         return None, str(exc)
     except Exception as exc:  # a provider bug must not take down the run
         _LOG.exception("Unexpected failure fetching %s from %s", identifier, source.name)
-        return None, f"{type(exc).__name__}: {exc}"
+        # Only the type is reported. An unclassified exception is by
+        # definition one whose message nobody has vetted, and the messages
+        # that reach here travel to a log, the CLI's stderr and the browser.
+        # A provider puts its API key in a request header.
+        return None, (
+            f"{type(exc).__name__} in the {source.name} adapter "
+            "(see the log for the full traceback)"
+        )
     return _rename_to_identifiers(panel, (identifier,), symbol_by_identifier), ""
 
 
@@ -457,11 +506,21 @@ def _convert_currency(panel: PricePanel, base: str) -> tuple[PricePanel, str]:
     warning rather than failing the run: a panel in mixed currencies that says
     so is more useful than no panel at all.
     """
-    asset_currency = {
-        identifier: (record.currency or base)
+    known = {
+        identifier: record.currency
         for identifier, record in panel.meta.items()
+        if record.currency
     }
+    unknown = [i for i in panel.identifiers if i not in known]
+    asset_currency = {**known, **{i: base for i in unknown}}
     if set(asset_currency.values()) <= {base}:
+        if unknown:
+            return panel, (
+                f"{', '.join(unknown)} do not say what currency they are quoted "
+                f"in, so they were left as they arrived rather than converted "
+                f"to {base}. If any of them is not already in {base}, its "
+                "returns are not comparable with the rest."
+            )
         return panel, ""
 
     converted: dict[str, pd.DataFrame] = {}
@@ -477,20 +536,28 @@ def _convert_currency(panel: PricePanel, base: str) -> tuple[PricePanel, str]:
             "native currencies."
         )
 
+    # Only series whose currency was actually known get stamped with the base.
+    # One with no declared currency was *assumed* to be in the base already;
+    # labelling it as converted would turn that assumption into a claim.
     updated = {
         identifier: SeriesMeta(
             identifier=record.identifier,
             provider_symbol=record.provider_symbol,
             provider=record.provider,
             kind=record.kind,
-            currency=base,
+            currency=base if identifier in known else None,
             name=record.name,
             exchange=record.exchange,
         )
         for identifier, record in panel.meta.items()
     }
-    foreign = sorted({c for c in asset_currency.values() if c != base})
+    foreign = sorted({c for i, c in asset_currency.items() if c != base and i in known})
     note = f"Converted {', '.join(foreign)} into {base} using FRED daily rates."
+    if unknown:
+        note += (
+            f" {', '.join(unknown)} declare no currency and were left as they "
+            f"arrived — they are only comparable if they were already in {base}."
+        )
     return PricePanel.from_frames(converted, updated), note
 
 
@@ -548,6 +615,7 @@ def _outcomes_from_panel(
     symbol_by_identifier: Mapping[str, str],
     unsupported: tuple[str, ...],
     failures: Mapping[str, str] | None = None,
+    duplicates: tuple[str, ...] = (),
 ) -> tuple[IdentifierOutcome, ...]:
     """Build the per-identifier log, in the order the universe was requested."""
     failures = failures or {}
@@ -557,12 +625,18 @@ def _outcomes_from_panel(
     for identifier in request.identifiers:
         symbol = symbol_by_identifier.get(identifier, identifier)
         if identifier in unsupported:
+            claimed = duplicates and identifier in duplicates
             outcomes.append(
                 IdentifierOutcome(
                     identifier=identifier,
-                    symbol="—",
+                    symbol=symbol if claimed else "—",
                     status=STATUS_UNSUPPORTED,
-                    message=f"{request.provider} publishes no symbol for this instrument.",
+                    message=(
+                        f"Resolves to {symbol!r}, which another identifier in "
+                        "this universe already claims."
+                        if claimed
+                        else f"{request.provider} publishes no symbol for this instrument."
+                    ),
                 )
             )
             continue

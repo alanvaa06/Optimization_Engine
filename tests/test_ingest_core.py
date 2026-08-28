@@ -345,3 +345,76 @@ def test_round_trip_through_dict():
 def test_from_dict_rejects_an_unknown_option():
     with pytest.raises(ProviderConfigurationError, match="Unknown ingest option"):
         IngestRequest.from_dict({"identifiers": ["A"], "tickers": ["B"]})
+
+
+# ---------------------------------------------------------------------------
+# Adjustment scales — the session-range check must not compare two of them
+# ---------------------------------------------------------------------------
+
+
+def test_a_raw_close_outside_an_adjusted_range_is_not_an_error():
+    # After a few percent of accumulated dividends the unadjusted print sits
+    # legitimately outside the adjusted day's high and low. Rejecting that
+    # would make an ordinary OHLCV request for any dividend payer impossible.
+    close = _close(("AAA",))
+    panel = PricePanel.from_frames(
+        {
+            F.CLOSE: close,
+            F.HIGH: close * 1.005,
+            F.LOW: close * 0.995,
+            F.CLOSE_RAW: close * 1.04,
+        }
+    )
+    assert panel.frame(F.CLOSE_RAW) is not None
+
+
+def test_an_adjusted_close_outside_its_own_range_is_still_an_error():
+    # The check still has teeth for fields that do share a scale.
+    close = _close(("AAA",))
+    high = close * 1.005
+    low = close * 0.995
+    high.iloc[3, 0] = float(close.iloc[3, 0]) * 0.90
+    low.iloc[3, 0] = float(close.iloc[3, 0]) * 0.80
+    with pytest.raises(PanelValidationError, match="exceeds the session high"):
+        PricePanel.from_frames({F.CLOSE: close, F.HIGH: high, F.LOW: low})
+
+
+def test_a_crossed_high_and_low_is_always_an_error():
+    close = _close(("AAA",))
+    high = close * 1.005
+    low = close * 1.05
+    with pytest.raises(PanelValidationError, match="exceeds the session high"):
+        PricePanel.from_frames({F.CLOSE: close, F.HIGH: high, F.LOW: low})
+
+
+# ---------------------------------------------------------------------------
+# Merge must not splice two providers' price levels together
+# ---------------------------------------------------------------------------
+
+
+def test_merge_replaces_a_colliding_column_rather_than_filling_its_gaps():
+    index = _dates(5)
+    left = PricePanel.from_frames(
+        {F.CLOSE: pd.DataFrame({"SPY": [10.0, 11.0, 12.0, 13.0, 14.0]}, index=index)},
+        {"SPY": SeriesMeta("SPY", "SPY", "providerA")},
+    )
+    right = PricePanel.from_frames(
+        {F.CLOSE: pd.DataFrame({"SPY": [100.0, 101.0, np.nan, 103.0, 104.0]}, index=index)},
+        {"SPY": SeriesMeta("SPY", "SPY", "providerB")},
+    )
+    merged = left.merge(right)
+
+    # Filling the gap from the left panel would splice a 12 into a series
+    # around 100 — a fabricated -88% / +758% round trip, under a provenance
+    # record naming one provider.
+    assert merged.prices()["SPY"].isna().sum() == 1
+    assert merged.prices()["SPY"].dropna().between(99.0, 105.0).all()
+    assert merged.meta["SPY"].provider == "providerB"
+
+
+def test_merge_still_keeps_columns_only_one_side_has():
+    left = PricePanel.from_frames({F.CLOSE: _close(("AAA",))})
+    right = PricePanel.from_frames({F.CLOSE: _close(("BBB",))})
+    merged = left.merge(right)
+    assert set(merged.identifiers) == {"AAA", "BBB"}
+    assert merged.prices()["AAA"].notna().all()

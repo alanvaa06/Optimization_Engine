@@ -25,6 +25,7 @@ from typing import Any
 import pandas as pd
 import streamlit as st
 
+from optimization_engine.backtest.spec import MIN_ADV_CAPITAL
 from optimization_engine.data.loader import SAMPLE_UNIVERSE
 from optimization_engine.ingest import (
     IngestError,
@@ -36,6 +37,11 @@ from optimization_engine.ingest import (
 )
 from optimization_engine.ingest import fields as F
 from optimization_engine.ui_state import ingest_result_for_rerun
+
+#: A plausible institutional book, offered as the starting fund size when
+#: impact is priced from volume. Large enough that a liquid ETF universe shows
+#: real capacity cost, small enough not to look like a claim about anyone.
+DEFAULT_CAPITAL = 1e8
 
 #: Field presets, in the order the selector shows them. Each is a
 #: ``(label, fields, help)`` triple; the label is what the analyst reads and
@@ -125,15 +131,21 @@ def render_source_picker(state: Any) -> tuple[pd.DataFrame | None, Any]:
     _render_capability_chips(row)
 
     api_key = _render_key_input(row) if row["requires_key"] else None
-    file_path = (
-        st.text_input(
-            "File path",
-            help="CSV, Excel or Parquet, in wide (date × asset) or long "
-                 "(date, identifier, OHLCV) layout.",
+
+    if provider == "file":
+        # The file provider reads a path on the machine running the server.
+        # That is exactly right on the command line, where the operator is the
+        # caller — and exactly wrong in a browser, where it would turn a text
+        # box into a read of any file the server can see. The app routes local
+        # data through the uploader instead, which never names a server path.
+        st.info(
+            "Switch **Source** to **Upload file** to use a panel you already "
+            "have — drag the file in and it never leaves your browser's "
+            "control. `optengine ingest --provider file --file-path …` is the "
+            "command-line equivalent.",
+            icon="📄",
         )
-        if provider == "file"
-        else None
-    )
+        return None, None
 
     identifiers = _render_universe_input(provider)
     start, end, period = _render_window()
@@ -169,20 +181,18 @@ def render_source_picker(state: Any) -> tuple[pd.DataFrame | None, Any]:
     fetch_clicked = st.button("Fetch data", type="primary", width="stretch")
 
     options: dict[str, Any] = {}
-    if file_path:
-        options["path"] = file_path
 
     # An offline provider costs nothing to run: no request leaves the machine,
     # no quota is spent, no key is needed. Making the user press a button for
     # that only produces an empty first screen, so it loads on its own and the
     # button stays available for a re-run.
-    if row["offline"] and (provider != "file" or file_path):
+    if row["offline"]:
         fetch_clicked = True
 
     try:
         result = ingest_result_for_rerun(
             fetch_clicked=fetch_clicked,
-            cache_key=f"{request.fingerprint()}:{bool(api_key)}:{file_path or ''}",
+            cache_key=f"{request.fingerprint()}:{bool(api_key)}",
             state=state,
             fetch=lambda: ingest(request, api_key=api_key or None, **options),
         )
@@ -442,13 +452,20 @@ def render_ingest_panel(result: Any) -> None:
     )
 
 
-def render_liquidity_selector(volumes: pd.DataFrame | None) -> dict[str, Any]:
+def render_liquidity_selector(
+    volumes: pd.DataFrame | None,
+) -> tuple[dict[str, Any], float]:
     """Choose how market impact is priced, and say what that choice rests on.
 
     Two honest options and no hidden third. The fixed rate is an assumption
     and is labelled as one; ADV is a measurement and needs data that not every
     universe has. When it is chosen without that data, the fallback is stated
     here rather than discovered in the run log afterwards.
+
+    Returns:
+        The cost-spec fields the choice implies, and the fund size to run at.
+        The size only differs from the default when ADV pricing is on, where
+        it is what makes the answer mean anything.
     """
     has_volume = volumes is not None and not volumes.dropna(how="all").empty
     options = ["Fixed participation rate", "From traded volume (ADV)"]
@@ -468,6 +485,7 @@ def render_liquidity_selector(volumes: pd.DataFrame | None) -> dict[str, Any]:
     settings: dict[str, Any] = {
         "impact_participation_source": "adv" if use_adv else "fixed",
     }
+    capital = DEFAULT_CAPITAL
     if use_adv:
         if has_volume:
             st.success(
@@ -482,6 +500,22 @@ def render_liquidity_selector(volumes: pd.DataFrame | None) -> dict[str, Any]:
                 "log records that it did.",
                 icon="ℹ️",
             )
+        # Capacity is a currency amount, so the answer is meaningless without
+        # a book size: at a notional NAV of 1 every market on earth is
+        # infinitely deep and the impact charge rounds to zero.
+        capital = st.number_input(
+            "Fund size (NAV)",
+            min_value=float(MIN_ADV_CAPITAL),
+            value=DEFAULT_CAPITAL,
+            step=1e7,
+            format="%.0f",
+            help=(
+                "How much capital is being deployed, in the currency the "
+                "prices are quoted in. The same strategy costs more to run at "
+                "a larger size — that is the question this model exists to "
+                "answer."
+            ),
+        )
         settings["impact_adv_share"] = (
             st.slider(
                 "Share of daily volume we are willing to be",
@@ -495,7 +529,7 @@ def render_liquidity_selector(volumes: pd.DataFrame | None) -> dict[str, Any]:
         settings["impact_adv_lookback"] = st.number_input(
             "ADV lookback (periods)", min_value=2, max_value=252, value=21,
         )
-    return settings
+    return settings, float(capital)
 
 
 def render_empty_state(awaiting_upload: bool = False) -> None:
@@ -544,6 +578,7 @@ def render_empty_state(awaiting_upload: bool = False) -> None:
 
 
 __all__ = [
+    "DEFAULT_CAPITAL",
     "FIELD_PRESETS",
     "PRESET_UNIVERSES",
     "render_empty_state",

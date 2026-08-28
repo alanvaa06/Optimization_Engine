@@ -26,6 +26,7 @@ import logging
 import os
 import shutil
 import time
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -136,7 +137,10 @@ class PanelCache:
         disk should slow the next run down, not fail this one.
         """
         folder = self.path_for(key)
-        staging = folder.with_name(f".{folder.name}.tmp-{os.getpid()}")
+        # Unique per writer, not just per process: two threads fetching the
+        # same request would otherwise share one staging directory, and the
+        # first to finish would delete the other's half-written parquet.
+        staging = folder.with_name(f".{folder.name}.tmp-{os.getpid()}-{uuid.uuid4().hex[:8]}")
         try:
             if staging.exists():
                 shutil.rmtree(staging, ignore_errors=True)

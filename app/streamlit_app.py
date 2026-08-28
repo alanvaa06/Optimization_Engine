@@ -2138,9 +2138,9 @@ with tab_backtest:
             ingest_result.volumes if ingest_result is not None else None
         )
         if float(impact_eta) > 0.0:
-            liquidity = render_liquidity_selector(backtest_volumes)
+            liquidity, initial_capital = render_liquidity_selector(backtest_volumes)
         else:
-            liquidity = {"impact_participation_source": "fixed"}
+            liquidity, initial_capital = {"impact_participation_source": "fixed"}, 1.0
 
         cost_bps = float(commission_bps) + float(slippage_bps)
         backtest_spec = BacktestSpec(
@@ -2154,6 +2154,7 @@ with tab_backtest:
             ),
             execution_lag=int(execution_lag),
             periods_per_year=int(periods_per_year),
+            initial_capital=float(initial_capital),
         )
         bt = run.simulate(
             backtest_spec,

@@ -71,6 +71,7 @@ from optimization_engine.backtest.positions import (
 from optimization_engine.backtest.results import RunMeta, RunResult, compute_result_hash
 from optimization_engine.backtest.runner import run_backtest
 from optimization_engine.backtest.spec import (
+    MIN_ADV_CAPITAL,
     PARTICIPATION_SOURCES,
     REBALANCE_DESCRIPTIONS,
     BacktestSpec,
@@ -101,6 +102,7 @@ __all__ = [
     "BacktestSpec",
     "CostModel",
     "CostQuote",
+    "MIN_ADV_CAPITAL",
     "PARTICIPATION_SOURCES",
     "CostSpec",
     "GridCell",

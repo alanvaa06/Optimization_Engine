@@ -270,10 +270,14 @@ def test_one_missing_identifier_does_not_lose_the_others():
 
 
 def test_a_provider_bug_is_contained_to_its_identifier():
-    stub = StubProvider(failures={"BBB": RuntimeError("boom")})
+    stub = StubProvider(failures={"BBB": RuntimeError("boom with a secret in it")})
     result = ingest(_request(("AAA", "BBB")), provider=stub)
     assert result.loaded == ("AAA",)
-    assert "boom" in result.failed[0].message
+    # The type is reported; the message is not. An unclassified exception's
+    # text has been vetted by nobody, and this string reaches a log, the CLI's
+    # stderr and the browser.
+    assert "RuntimeError" in result.failed[0].message
+    assert "boom with a secret" not in result.failed[0].message
 
 
 def test_a_credentials_failure_aborts_the_whole_run():
@@ -490,3 +494,105 @@ def test_summary_and_report_describe_the_run():
     report = result.report()
     assert list(report.index) == ["AAA", "BBB"]
     assert report.loc["BBB", "status"] == STATUS_FAILED
+
+
+# ---------------------------------------------------------------------------
+# The volume policy has to survive the cache
+# ---------------------------------------------------------------------------
+
+
+class _NoVolumeProvider(StubProvider):
+    def fetch_one(self, identifier, request):
+        self.calls.append((identifier,))
+        return _panel_for(identifier, volume=False, kind=F.InstrumentKind.EQUITY)
+
+
+def test_require_volume_is_enforced_on_a_cache_hit_too(tmp_path):
+    # The fingerprint covers what was fetched, not what the caller will
+    # accept, so a permissive run and a strict one share an entry. Without
+    # re-applying the policy, running the lax one first would make the strict
+    # one pass.
+    lax = _request(("AAA",), fields=(F.CLOSE, F.VOLUME), cache_dir=str(tmp_path))
+    ingest(lax, provider=_NoVolumeProvider(volume=True))
+
+    strict = _request(
+        ("AAA",), fields=(F.CLOSE, F.VOLUME), cache_dir=str(tmp_path),
+        require_volume=True,
+    )
+    assert strict.fingerprint() == lax.fingerprint()
+    with pytest.raises(ProviderConfigurationError, match="require_volume is set"):
+        ingest(strict, provider=_NoVolumeProvider(volume=True))
+
+
+def test_a_cache_hit_still_reports_its_volume_warnings(tmp_path):
+    request = _request(("AAA",), fields=(F.CLOSE, F.VOLUME), cache_dir=str(tmp_path))
+    ingest(request, provider=_NoVolumeProvider(volume=True))
+    second = ingest(request, provider=_NoVolumeProvider(volume=True))
+
+    assert second.from_cache
+    assert any("No volume for AAA" in note for note in second.warnings)
+
+
+# ---------------------------------------------------------------------------
+# Two identifiers naming one instrument
+# ---------------------------------------------------------------------------
+
+
+def test_two_identifiers_resolving_to_one_symbol_are_named_as_such():
+    # SP500 and ^GSPC are the same Yahoo series. Reporting the loser as "the
+    # provider returned nothing" describes something that did not happen.
+    class YahooLike(StubProvider):
+        name = "yahoo"
+
+        @property
+        def capabilities(self):
+            return ProviderCapabilities(
+                fields=frozenset({F.CLOSE}), intervals=frozenset({"1d"})
+            )
+
+    result = ingest(
+        _request(("SP500", "^GSPC"), provider="yahoo"), provider=YahooLike()
+    )
+    statuses = {o.identifier: o for o in result.outcomes}
+    assert statuses["SP500"].status == STATUS_OK
+    assert statuses["^GSPC"].status == STATUS_UNSUPPORTED
+    assert "already claims" in statuses["^GSPC"].message
+    assert any("same instrument twice" in note for note in result.warnings)
+
+
+def test_distinct_symbols_are_not_treated_as_duplicates():
+    result = ingest(_request(("AAA", "BBB", "CCC")), provider=StubProvider())
+    assert result.is_complete
+
+
+# ---------------------------------------------------------------------------
+# Currency conversion must not claim what it did not do
+# ---------------------------------------------------------------------------
+
+
+def _panel_with_currency(identifier: str, currency: str | None):
+    index = pd.bdate_range("2024-01-01", periods=8)
+    close = pd.DataFrame({identifier: np.linspace(100.0, 108.0, 8)}, index=index)
+    return PricePanel.from_frames(
+        {F.CLOSE: close},
+        {identifier: SeriesMeta(identifier, identifier, "stub", currency=currency)},
+    )
+
+
+def test_a_series_with_no_declared_currency_is_not_stamped_as_converted():
+    from optimization_engine.ingest.service import _convert_currency
+
+    panel = _panel_with_currency("AAA", None)
+    converted, note = _convert_currency(panel, "USD")
+    # It was assumed to be in USD, not converted to it. Labelling it USD turns
+    # an assumption into a claim.
+    assert converted.meta["AAA"].currency is None
+    assert "do not say what currency" in note
+
+
+def test_a_series_with_a_declared_matching_currency_needs_no_note():
+    from optimization_engine.ingest.service import _convert_currency
+
+    converted, note = _convert_currency(_panel_with_currency("AAA", "USD"), "USD")
+    assert note == ""
+    assert converted.meta["AAA"].currency == "USD"

@@ -47,6 +47,11 @@ REBALANCE_DESCRIPTIONS: dict[str, str] = {
 }
 
 
+#: Below this NAV an ADV-based impact charge is numerically meaningless — a
+#: book of a few currency units cannot move any real market — so a run
+#: configured that way is a mistake rather than a scenario.
+MIN_ADV_CAPITAL = 1_000.0
+
 #: Where the impact model's participation rate comes from. ``"fixed"`` needs
 #: no market data at all; ``"adv"`` needs a traded-volume panel and degrades
 #: gracefully to the fixed rate for any asset that has none.
@@ -239,8 +244,14 @@ class BacktestSpec:
             execution, which no desk gets. One period is the honest default
             for a daily panel where the decision is taken after the close.
         periods_per_year: Observations per year, for annualizing.
-        initial_capital: Starting NAV. Cosmetic for returns; it makes the
-            trade and cost frames read in currency rather than in fractions.
+        initial_capital: Starting NAV, in the currency the prices are quoted
+            in. Cosmetic for returns — they are fractions either way — but
+            **not** cosmetic once impact is priced from traded volume: capacity
+            is a currency amount, so the fund's size is what decides whether a
+            name's average daily volume is deep or thin for this book. A run
+            with ``impact_participation_source="adv"`` must therefore state a
+            real one; the default of 1.0 describes a one-unit fund, for which
+            every market on earth is infinitely deep.
         is_out_of_sample: Whether the weights were chosen without seeing the
             returns they are replayed on. The single most important caveat
             attached to any backtest number, so it travels with the spec and
@@ -280,6 +291,19 @@ class BacktestSpec:
             )
         if not isinstance(self.costs, CostSpec):
             object.__setattr__(self, "costs", CostSpec.from_dict(dict(self.costs)))
+        if self.costs.uses_volume and self.initial_capital <= MIN_ADV_CAPITAL:
+            # Silently allowing this is the worst outcome available: the run
+            # completes, reports a cost near zero, and looks like evidence
+            # that the strategy has no capacity problem. It has no capacity
+            # problem because it is a one-currency-unit fund.
+            raise SpecValidationError(
+                "Pricing impact from traded volume needs a real fund size: "
+                f"initial_capital is {self.initial_capital:g}, which describes "
+                "a book so small that every market is infinitely deep and the "
+                "impact charge rounds to zero. Set initial_capital to the "
+                "capital being deployed, or use "
+                'impact_participation_source="fixed".'
+            )
 
     def with_(self, **changes: Any) -> BacktestSpec:
         """A copy with fields replaced — the way a sweep builds its cells."""
@@ -341,6 +365,7 @@ class BacktestSpec:
 
 __all__ = [
     "FREQUENCY_ALIASES",
+    "MIN_ADV_CAPITAL",
     "PARTICIPATION_SOURCES",
     "REBALANCE_DESCRIPTIONS",
     "BacktestSpec",

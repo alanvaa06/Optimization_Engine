@@ -195,6 +195,15 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Trailing periods averaged when computing ADV.",
     )
     backtest.add_argument(
+        "--initial-capital", type=float, default=1.0, metavar="NAV",
+        help=(
+            "Starting NAV, in the currency the prices are quoted in. Cosmetic "
+            "for returns, but required by --impact-participation-source adv: "
+            "capacity is a currency amount, so the fund's size is what decides "
+            "whether a name's daily volume is deep or thin for this book."
+        ),
+    )
+    backtest.add_argument(
         "--impact-participation", type=float, default=0.05, metavar="Q",
         help="Fraction of the book tradable in one name, in one period, "
              "without impact. Smaller means a thinner market.",
@@ -857,6 +866,7 @@ def _cmd_backtest(args: argparse.Namespace) -> int:
         gate_returns,
         run_backtest,
     )
+    from optimization_engine.backtest.spec import SpecValidationError
 
     config = load_config(args.config)
     _apply_estimator_flags(config, args)
@@ -870,20 +880,25 @@ def _cmd_backtest(args: argparse.Namespace) -> int:
     if not config.expected_returns:
         config.expected_returns = {asset: 0.0 for asset in returns.columns}
 
-    spec = BacktestSpec(
-        costs=CostSpec(
-            commission_bps=args.commission_bps,
-            slippage_bps=args.slippage_bps,
-            impact_coefficient=args.impact_eta,
-            impact_participation=args.impact_participation,
-            impact_participation_source=args.impact_participation_source,
-            impact_adv_share=args.impact_adv_share,
-            impact_adv_lookback=args.impact_adv_lookback,
-        ),
-        execution_lag=args.execution_lag,
-        periods_per_year=config.periods_per_year,
-        name=Path(args.config).stem,
-    )
+    try:
+        spec = BacktestSpec(
+            costs=CostSpec(
+                commission_bps=args.commission_bps,
+                slippage_bps=args.slippage_bps,
+                impact_coefficient=args.impact_eta,
+                impact_participation=args.impact_participation,
+                impact_participation_source=args.impact_participation_source,
+                impact_adv_share=args.impact_adv_share,
+                impact_adv_lookback=args.impact_adv_lookback,
+            ),
+            execution_lag=args.execution_lag,
+            periods_per_year=config.periods_per_year,
+            initial_capital=args.initial_capital,
+            name=Path(args.config).stem,
+        )
+    except SpecValidationError as exc:
+        print(f"{exc} Pass --initial-capital.", file=sys.stderr)
+        return 2
     print(spec.describe())
     if spec.costs.uses_volume and volumes is None:
         print(

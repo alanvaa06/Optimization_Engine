@@ -22,6 +22,7 @@ from pathlib import Path
 import pandas as pd
 
 from optimization_engine.ingest import fields as F
+from optimization_engine.ingest.adjust import rescale_frames_to_adjusted
 from optimization_engine.ingest.errors import (
     IdentifierNotFoundError,
     ProviderConfigurationError,
@@ -39,10 +40,21 @@ _LONG_COLUMNS = {
     "close": F.CLOSE,
     "adj_close": F.CLOSE,
     "adjclose": F.CLOSE,
+    "adjusted_close": F.CLOSE,
     "close_raw": F.CLOSE_RAW,
     "volume": F.VOLUME,
     "vwap": F.VWAP,
 }
+
+#: Which source column wins when a file offers more than one candidate for the
+#: same field, most-preferred first. Without this the winner is whichever
+#: column the file happens to list first — so the conventional
+#: ``…,close,adj_close,…`` ordering would discard the adjusted series and hand
+#: the optimizer a price return labelled as a total return. When both are
+#: present the loser is kept as ``m_close_raw`` rather than thrown away.
+_CLOSE_PREFERENCE: tuple[str, ...] = (
+    "adj_close", "adjclose", "adjusted_close", "close",
+)
 
 _IDENTIFIER_COLUMNS = ("identifier", "ticker", "symbol", "asset", "id")
 _DATE_COLUMNS = ("date", "datetime", "timestamp", "fecha")
@@ -169,11 +181,9 @@ def _from_long(
     frame["__date__"] = index[index.notna()]
     frame["__id__"] = frame[identifier_column].astype(str).str.strip().str.upper()
 
-    frames: dict[str, pd.DataFrame] = {}
-    for column in raw.columns:
-        target = _LONG_COLUMNS.get(str(column).strip().lower())
-        if target is None or target in frames:
-            continue
+    by_lower = {str(c).strip().lower(): c for c in raw.columns}
+
+    def pivot(column: object) -> pd.DataFrame:
         values = pd.to_numeric(frame[column], errors="coerce")
         pivoted = (
             pd.DataFrame({"__date__": frame["__date__"], "__id__": frame["__id__"], "v": values})
@@ -182,16 +192,35 @@ def _from_long(
         )
         pivoted.columns.name = None
         pivoted.index.name = "date"
-        if target is F.VOLUME and not (pivoted.fillna(0.0) > 0).any().any():
-            continue
-        frames[target] = pivoted
+        return pivoted
 
-    if F.CLOSE not in frames:
+    # Resolve the close first, by preference rather than by file order.
+    close_candidates = [name for name in _CLOSE_PREFERENCE if name in by_lower]
+    if not close_candidates:
         raise ProviderResponseError(
             f"{source.name} is in long format but has no close column "
             f"(looked for: {', '.join(sorted(_LONG_COLUMNS))})."
         )
-    return frames
+
+    frames: dict[str, pd.DataFrame] = {F.CLOSE: pivot(by_lower[close_candidates[0]])}
+    if len(close_candidates) > 1:
+        # The unadjusted print is still worth keeping — it is what turns
+        # weights into share counts — just not as the total-return series.
+        frames[F.CLOSE_RAW] = pivot(by_lower[close_candidates[-1]])
+
+    for lower, column in by_lower.items():
+        target = _LONG_COLUMNS.get(lower)
+        if target is None or target in frames or lower in _CLOSE_PREFERENCE:
+            continue
+        pivoted = pivot(column)
+        if target is F.VOLUME and not (pivoted.fillna(0.0) > 0).any().any():
+            continue
+        frames[target] = pivoted
+
+    # A terminal export is almost always a raw OHLCV row with an adj_close
+    # column bolted on the end, so the range needs the same reconciliation a
+    # provider's does.
+    return rescale_frames_to_adjusted(frames)
 
 
 def _slice_window(

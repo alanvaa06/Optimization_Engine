@@ -632,9 +632,11 @@ surfaces what could make the next one wrong.
 5. **Backtest** — choose a rebalancing cadence, an execution lag, and a cost
    model split into commission, spread and square-root market impact, plus
    **where the impact model's participation rate comes from**: a fixed
-   assumption, or the traded volume the panel actually carries. Choosing
-   volume on a universe that has none — every index universe — falls back to
-   the fixed rate and says so on the page rather than in a log; see
+   assumption, or the traded volume the panel actually carries — with a fund
+   size, because capacity is a currency amount and the same strategy costs
+   more to run at ten times the size. Choosing volume on a universe that has
+   none — every index universe — falls back to the fixed rate and says so on
+   the page rather than in a log; see
    weight drift, cost drag, where the cost went by name, rolling performance,
    the return distribution with its VaR/CVaR cuts, and a walk-forward run that
    says in words how much of the result was hindsight.
@@ -719,18 +721,23 @@ optengine backtest --config config/example_multi_asset.yaml --sample \
     --commission-bps 10 --holdout 2024-01-01
 
 # Price capacity from real traded volume rather than an assumed participation
-# rate. Costs now rise as the fund grows and as a name's turnover dries up.
+# rate. Costs now rise as the fund grows and as a name's turnover dries up —
+# which is why --initial-capital becomes mandatory here: capacity is a
+# currency amount, so a run that does not state a fund size is refused rather
+# than reporting a cost of roughly zero.
 optengine backtest --config config/example_multi_asset.yaml \
     --provider yahoo --identifiers "SPY,EFA,EEM,AGG,GLD" \
     --ingest-period 10y --ingest-fields ohlcv \
-    --impact-eta 0.4 --impact-participation-source adv --impact-adv-share 0.10
+    --impact-eta 0.4 --impact-participation-source adv \
+    --impact-adv-share 0.10 --initial-capital 250000000
 
 # The same run on an index universe, which has no volume and never will. It
 # does not fail: impact falls back to the fixed participation rate, and every
 # trade that did so is named in the run's degradation notes.
 optengine backtest --config config/indices.yaml \
     --provider stooq --identifiers "SP500,DAX,NIKKEI225,FTSE100" \
-    --ingest-period 10y --impact-eta 0.4 --impact-participation-source adv
+    --ingest-period 10y --impact-eta 0.4 \
+    --impact-participation-source adv --initial-capital 250000000
 ```
 
 `backtest` prints what the strategy earned out of sample, what the trading cost

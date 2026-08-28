@@ -29,6 +29,12 @@ import pandas as pd
 from optimization_engine.ingest import fields as F
 from optimization_engine.ingest.errors import PanelValidationError
 
+#: Fields every adapter is required to return on one common adjustment scale,
+#: and therefore the only ones the session-range check may compare.
+#: ``m_close_raw`` is excluded by construction: it is the unadjusted print, so
+#: on a dividend-paying stock it sits outside an adjusted high/low by design.
+SCALE_CONSISTENT_FIELDS: tuple[str, ...] = (F.OPEN, F.CLOSE)
+
 
 @dataclass(frozen=True)
 class SeriesMeta:
@@ -271,12 +277,19 @@ class PricePanel:
         Used when a universe is served by more than one provider — equities
         from one, the index they are benchmarked against from another. Fields
         present in only one side are kept, with NaN for the identifiers the
-        other side supplied. On an identifier collision ``other`` wins, which
-        makes the merge order the precedence order.
+        other side supplied.
+
+        On an identifier collision ``other`` wins **outright**: its column
+        replaces the left one rather than filling the left one's gaps. Filling
+        gaps would splice two providers' price levels into a single series —
+        one vendor's 100 next to another's 10 — producing return spikes that
+        never happened, under a provenance record naming one source. A series
+        comes from one provider or the other.
         """
         names = [f for f in F.MARKET_FIELDS if f in self.frames or f in other.frames]
         index = self.index.union(other.index).sort_values()
         columns = list(dict.fromkeys([*self.identifiers, *other.identifiers]))
+        overridden = set(other.identifiers)
 
         merged: dict[str, pd.DataFrame] = {}
         for name in names:
@@ -284,9 +297,11 @@ class PricePanel:
             right = other.frames.get(name)
             frame = pd.DataFrame(index=index, columns=columns, dtype="float64")
             if left is not None:
-                frame.update(left.reindex(index=index))
+                kept = [c for c in left.columns if c not in overridden]
+                if kept:
+                    frame[kept] = left[kept].reindex(index=index)
             if right is not None:
-                frame.update(right.reindex(index=index))
+                frame[list(right.columns)] = right.reindex(index=index)
             frame.index.name = "date"
             merged[name] = frame
 
@@ -369,6 +384,17 @@ class PricePanel:
     def _validate_ohlc_ordering(self) -> None:
         """Check the intraday range brackets the prices inside it.
 
+        Only fields on the *same* adjustment scale may be compared, and that
+        is the whole subtlety here. :data:`~optimization_engine.ingest.fields.CLOSE`
+        is a total-return series while
+        :data:`~optimization_engine.ingest.fields.CLOSE_RAW` is the unadjusted
+        print, so on any stock that has paid a dividend the two are legitimately
+        several percent apart — and comparing the raw close against an adjusted
+        session range would reject a perfectly good panel. Adapters put open,
+        high, low and close on one scale (see
+        :data:`SCALE_CONSISTENT_FIELDS`); the raw close is deliberately
+        excluded.
+
         Vendors round each field independently, so an exact comparison flags
         harmless last-digit noise. The tolerance is relative to the price
         level: 10 bps of the high, which is far below any real crossing and
@@ -386,7 +412,7 @@ class PricePanel:
                 F.LOW, low, crossed.to_numpy(), "exceeds the session high"
             )
 
-        for name in (F.OPEN, F.CLOSE, F.CLOSE_RAW):
+        for name in SCALE_CONSISTENT_FIELDS:
             inner = self.frames.get(name)
             if inner is None:
                 continue
@@ -414,4 +440,4 @@ class PricePanel:
         )
 
 
-__all__ = ["PricePanel", "SeriesMeta"]
+__all__ = ["SCALE_CONSISTENT_FIELDS", "PricePanel", "SeriesMeta"]

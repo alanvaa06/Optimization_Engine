@@ -504,3 +504,173 @@ def test_sample_keeps_recycled_columns_from_being_collinear():
     returns = prices.pct_change().dropna()
     # The recycled column must not be a perfect copy of the one it reuses.
     assert abs(float(returns.iloc[:, 0].corr(returns.iloc[:, width]))) < 0.999
+
+
+# ---------------------------------------------------------------------------
+# Adjustment coherence — the panel must not mix two price scales
+# ---------------------------------------------------------------------------
+
+#: A payload with ~3% of accumulated dividends: entirely ordinary over a
+#: two-year window, and enough to put the adjusted close outside the
+#: unadjusted session range.
+_FMP_DIVIDEND_PAYLOAD = {
+    "symbol": "KO",
+    "currency": "USD",
+    "historical": [
+        {"date": "2020-01-03", "open": 100.0, "high": 100.5, "low": 99.5,
+         "close": 100.0, "adjClose": 97.0, "volume": 1_000_000, "vwap": 100.1},
+        {"date": "2020-01-02", "open": 99.0, "high": 99.8, "low": 98.5,
+         "close": 99.5, "adjClose": 96.5, "volume": 1_100_000, "vwap": 99.2},
+    ],
+}
+
+
+def test_fmp_ohlcv_survives_an_ordinary_dividend_adjustment(monkeypatch):
+    provider = FinancialModelingPrep(api_key="k")
+    monkeypatch.setattr(provider, "_get_json", lambda *a, **k: _FMP_DIVIDEND_PAYLOAD)
+    panel = provider.fetch_one("KO", _request(("KO",), fields=F.OHLCV))
+    assert panel.identifiers == ("KO",)
+
+
+def test_fmp_puts_the_session_range_on_the_adjusted_scale(monkeypatch):
+    provider = FinancialModelingPrep(api_key="k")
+    monkeypatch.setattr(provider, "_get_json", lambda *a, **k: _FMP_DIVIDEND_PAYLOAD)
+    panel = provider.fetch_one("KO", _request(("KO",), fields=F.OHLCV))
+
+    # FMP publishes no adjusted high, so it is reconstructed from the day's
+    # own adjClose/close ratio. Without that the adjusted close of 97 would
+    # sit below an unadjusted low of 99.5.
+    high = float(panel.frame(F.HIGH).loc["2020-01-03", "KO"])
+    low = float(panel.frame(F.LOW).loc["2020-01-03", "KO"])
+    close = float(panel.prices().loc["2020-01-03", "KO"])
+    assert low <= close <= high
+    assert high == pytest.approx(100.5 * (97.0 / 100.0))
+    # The raw print is preserved untouched alongside it.
+    assert float(panel.frame(F.CLOSE_RAW).loc["2020-01-03", "KO"]) == pytest.approx(100.0)
+
+
+def test_fmp_asks_for_the_full_payload_even_for_a_close_only_request(monkeypatch):
+    # ``serietype=line`` returns only the *unadjusted* close, which would then
+    # be labelled as a total-return series — the default request silently
+    # dropping every dividend.
+    provider = FinancialModelingPrep(api_key="k")
+    captured: dict = {}
+
+    def fake(url, **kwargs):
+        captured.update(kwargs)
+        return _FMP_DIVIDEND_PAYLOAD
+
+    monkeypatch.setattr(provider, "_get_json", fake)
+    panel = provider.fetch_one("KO", _request(("KO",)))
+
+    assert "serietype" not in captured.get("params", {})
+    # And the close that comes back is the adjusted one.
+    assert float(panel.prices().loc["2020-01-03", "KO"]) == pytest.approx(97.0)
+
+
+def test_fmp_leaves_the_range_alone_when_the_raw_close_is_missing(monkeypatch):
+    payload = {
+        "symbol": "X",
+        "historical": [
+            # No ``close`` on the first row: the ratio for that date is
+            # unknowable, and a wrong scale factor is worse than an unscaled
+            # bar.
+            {"date": "2020-01-02", "open": 10.0, "high": 10.5, "low": 9.5,
+             "adjClose": 10.0},
+            {"date": "2020-01-03", "open": 10.0, "high": 10.5, "low": 9.5,
+             "close": 10.0, "adjClose": 10.0},
+        ],
+    }
+    provider = FinancialModelingPrep(api_key="k")
+    monkeypatch.setattr(provider, "_get_json", lambda *a, **k: payload)
+    panel = provider.fetch_one("X", _request(("X",), fields=F.OHLC))
+    assert float(panel.frame(F.HIGH).loc["2020-01-02", "X"]) == pytest.approx(10.5)
+
+
+def test_a_zero_price_print_still_fails_the_panel(monkeypatch):
+    # A zero close is a bad tick, and the panel's job is to say so rather than
+    # let it through as a -100% return.
+    payload = {
+        "symbol": "X",
+        "historical": [
+            {"date": "2020-01-02", "close": 0.0, "adjClose": 10.0},
+            {"date": "2020-01-03", "close": 10.0, "adjClose": 10.0},
+        ],
+    }
+    provider = FinancialModelingPrep(api_key="k")
+    monkeypatch.setattr(provider, "_get_json", lambda *a, **k: payload)
+    from optimization_engine.ingest.errors import PanelValidationError
+
+    with pytest.raises(PanelValidationError, match="strictly positive"):
+        provider.fetch_one("X", _request(("X",), fields=(F.CLOSE, F.CLOSE_RAW)))
+
+
+def test_yahoos_raw_close_may_sit_outside_its_adjusted_range(monkeypatch):
+    from optimization_engine.data import yahoo as yahoo_module
+
+    adjusted = _yahoo_frame(["KO"], volume={"KO": 1e6})
+    unadjusted = adjusted.copy()
+    for field in ("Open", "High", "Low", "Close"):
+        unadjusted[(field, "KO")] = unadjusted[(field, "KO")] * 1.04
+
+    class _TwoShot:
+        def __init__(self):
+            self.calls = 0
+
+        def download(self, **kwargs):
+            self.calls += 1
+            return adjusted if kwargs.get("auto_adjust") else unadjusted
+
+    monkeypatch.setattr(yahoo_module, "_import_yfinance", lambda: _TwoShot())
+    panel = Yahoo().fetch_batch(
+        ("KO",), _request(("KO",), fields=(*F.OHLC, F.CLOSE_RAW))
+    )
+    assert float(panel.frame(F.CLOSE_RAW).iloc[0, 0]) > float(panel.frame(F.HIGH).iloc[0, 0])
+
+
+# ---------------------------------------------------------------------------
+# Local files: which close wins must not depend on column order
+# ---------------------------------------------------------------------------
+
+
+def _write_long(path, order):
+    rows = []
+    for day, raw, adj in zip(
+        pd.bdate_range("2024-01-01", periods=4), [100, 100, 100, 100], [97, 98, 99, 100]
+    ):
+        rows.append({"date": day, "ticker": "AAA", "open": raw, "high": raw,
+                     "low": raw, "close": raw, "adj_close": adj, "volume": 1000})
+    pd.DataFrame(rows)[order].to_csv(path, index=False)
+
+
+@pytest.mark.parametrize(
+    "order",
+    [
+        ["date", "ticker", "open", "high", "low", "close", "adj_close", "volume"],
+        ["date", "ticker", "open", "high", "low", "adj_close", "close", "volume"],
+    ],
+)
+def test_a_long_file_prefers_the_adjusted_close_whatever_the_column_order(tmp_path, order):
+    path = tmp_path / "long.csv"
+    _write_long(path, order)
+    panel = LocalFile(path=path).fetch_batch(
+        ("AAA",), _request(("AAA",), start="2024-01-01", end="2024-01-31", fields=F.OHLCV)
+    )
+    # The adjusted series rises 97 → 100; the raw one is flat. Taking the flat
+    # one would report a 0% return for an asset that returned 3%.
+    assert panel.prices()["AAA"].tolist() == [97.0, 98.0, 99.0, 100.0]
+    assert panel.frame(F.CLOSE_RAW)["AAA"].tolist() == [100.0] * 4
+
+
+def test_a_long_file_with_only_a_plain_close_still_works(tmp_path):
+    rows = [
+        {"date": day, "ticker": "AAA", "close": price}
+        for day, price in zip(pd.bdate_range("2024-01-01", periods=4), [10, 11, 12, 13])
+    ]
+    path = tmp_path / "plain.csv"
+    pd.DataFrame(rows).to_csv(path, index=False)
+    panel = LocalFile(path=path).fetch_batch(
+        ("AAA",), _request(("AAA",), start="2024-01-01", end="2024-01-31")
+    )
+    assert panel.prices()["AAA"].tolist() == [10.0, 11.0, 12.0, 13.0]
+    assert panel.frame(F.CLOSE_RAW) is None

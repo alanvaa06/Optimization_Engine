@@ -33,7 +33,9 @@ import abc
 import json
 import logging
 import random
+import threading
 import time
+import typing
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -42,6 +44,7 @@ from dataclasses import dataclass, field
 from optimization_engine.ingest import fields as F
 from optimization_engine.ingest.errors import (
     IdentifierNotFoundError,
+    IngestError,
     ProviderConfigurationError,
     ProviderCredentialsError,
     ProviderResponseError,
@@ -61,6 +64,47 @@ _USER_AGENT = (
 #: gateway blinked. Everything else in 4xx is the request's own fault and
 #: retrying it just burns the rate limit.
 _RETRYABLE_STATUS = frozenset({408, 425, 429, 500, 502, 503, 504})
+
+#: Hard ceiling on a single response body. A day of daily bars for one symbol
+#: is kilobytes; anything approaching this is a provider malfunction or a
+#: deliberate attempt to exhaust memory, and either way the run is better off
+#: failing than swallowing it. Eight identifiers fetch concurrently, so the
+#: real ceiling is eight times this.
+_MAX_RESPONSE_BYTES = 64 * 1024 * 1024
+
+
+class _SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """A redirect handler that will not hand credentials to a new host.
+
+    urllib's default carries every request header across a redirect, including
+    ``Authorization``. A provider that is compromised — or merely
+    misconfigured — can therefore bounce the client to a host of its choosing
+    and be handed the key. It can also redirect to ``http://``, putting the
+    key on the wire in clear.
+
+    Both are refused here. A redirect that stays on the same https host is
+    followed normally, because that is what a legitimate one looks like.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        parsed = urllib.parse.urlsplit(newurl)
+        if parsed.scheme != "https":
+            raise urllib.error.HTTPError(
+                req.full_url, code,
+                f"refused a redirect to a non-https scheme ({parsed.scheme!r})",
+                headers, fp,
+            )
+
+        redirected = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if redirected is None:
+            return None
+
+        if parsed.netloc.lower() != urllib.parse.urlsplit(req.full_url).netloc.lower():
+            # Cross-host: the new host is not the one the credential was
+            # issued for, so it does not get to see it.
+            for header in ("Authorization", "Proxy-Authorization", "Cookie"):
+                redirected.remove_header(header)
+        return redirected
 
 
 @dataclass(frozen=True)
@@ -127,6 +171,9 @@ class PriceProvider(abc.ABC):
     _MAX_ATTEMPTS = 4
     _BACKOFF_BASE_SECONDS = 0.4
     _TIMEOUT_SECONDS = 30.0
+    _MAX_BYTES = _MAX_RESPONSE_BYTES
+    _shared_opener: typing.ClassVar[urllib.request.OpenerDirector | None] = None
+    _opener_lock: typing.ClassVar[threading.Lock] = threading.Lock()
 
     def __init__(self, *, api_key: str | None = None, timeout: float | None = None) -> None:
         self._api_key = api_key
@@ -218,6 +265,22 @@ class PriceProvider(abc.ABC):
 
     # -- shared HTTP ------------------------------------------------------
 
+    @classmethod
+    def _opener(cls) -> urllib.request.OpenerDirector:
+        """The shared opener, built once, with the safe redirect handler.
+
+        Built lazily and cached on :class:`PriceProvider` itself so every
+        provider and every thread shares one — ``OpenerDirector`` is stateless
+        per request.
+        """
+        if PriceProvider._shared_opener is None:
+            with PriceProvider._opener_lock:
+                if PriceProvider._shared_opener is None:
+                    PriceProvider._shared_opener = urllib.request.build_opener(
+                        _SafeRedirectHandler()
+                    )
+        return PriceProvider._shared_opener
+
     def _get_text(
         self,
         url: str,
@@ -251,9 +314,22 @@ class PriceProvider(abc.ABC):
         for attempt in range(1, self._MAX_ATTEMPTS + 1):
             try:
                 req = urllib.request.Request(full_url, headers=request_headers)
-                with urllib.request.urlopen(req, timeout=self._timeout) as response:
-                    charset = response.headers.get_content_charset() or "utf-8"
-                    return response.read().decode(charset, errors="replace")
+                with self._opener().open(req, timeout=self._timeout) as response:
+                    # One byte past the cap is enough to know it was exceeded,
+                    # without materializing whatever else was coming.
+                    payload = response.read(self._MAX_BYTES + 1)
+                    if len(payload) > self._MAX_BYTES:
+                        raise ProviderResponseError(
+                            f"{self.name} returned more than "
+                            f"{self._MAX_BYTES // (1024 * 1024)} MB on {endpoint}; "
+                            "refusing to read further."
+                        )
+                    charset = _safe_charset(response.headers.get_content_charset())
+                    return payload.decode(charset, errors="replace")
+            except IngestError:
+                # Already sanitized and already classified — the cap above,
+                # or a nested call. Do not re-wrap it.
+                raise
             except urllib.error.HTTPError as exc:
                 status = int(exc.code)
                 if status in (401, 403):
@@ -285,6 +361,15 @@ class PriceProvider(abc.ABC):
                     f"{self.name} could not reach {endpoint} "
                     f"({type(exc).__name__})."
                 )
+            except Exception as exc:
+                # The backstop, and the reason it exists: anything raised in
+                # here that is not one of the cases above — a header the http
+                # client rejects, a codec that does not exist — stringifies
+                # with whatever it was handed, which can be the request's own
+                # headers. Those carry the API key. Only the type escapes.
+                raise ProviderResponseError(
+                    f"{self.name} failed on {endpoint} ({type(exc).__name__})."
+                ) from None
 
             if attempt < self._MAX_ATTEMPTS:
                 self._sleep_before_retry(attempt, endpoint)
@@ -318,6 +403,24 @@ class PriceProvider(abc.ABC):
             self.name, endpoint, attempt + 1, self._MAX_ATTEMPTS, delay,
         )
         time.sleep(delay)
+
+
+def _safe_charset(declared: str | None) -> str:
+    """Resolve a response's declared charset, falling back to UTF-8.
+
+    A provider controls this header, and an unknown codec name makes
+    ``bytes.decode`` raise ``LookupError`` from inside the request path. The
+    payload is worth more than the label, so an unusable label is ignored.
+    """
+    if not declared:
+        return "utf-8"
+    try:
+        import codecs
+
+        codecs.lookup(declared)
+    except (LookupError, TypeError):
+        return "utf-8"
+    return declared
 
 
 @dataclass(frozen=True)

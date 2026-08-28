@@ -9,6 +9,14 @@
 #       --provider stooq --identifiers "SP500,DAX,NIKKEI225,FTSE100" \
 #       --ingest-period 10y
 #
+# A capacity-aware backtest on this universe still runs — it just falls back
+# to the fixed participation rate on every trade, and names each one:
+#
+#   optengine backtest --config config/indices.yaml --provider stooq \
+#       --identifiers "SP500,DAX,NIKKEI225,FTSE100" --ingest-period 10y \
+#       --impact-eta 0.4 --impact-participation-source adv \
+#       --initial-capital 250000000
+#
 # The expected returns below are illustrative round numbers for a runnable
 # example. They are not a capital-market assumption from anyone.
 

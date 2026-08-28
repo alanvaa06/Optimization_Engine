@@ -24,6 +24,8 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
+from optimization_engine.ingest.errors import ProviderCredentialsError
+
 _ENV_PREFIX = "OPTENGINE_API_KEY_"
 
 #: A key that is obviously not a key. Vendors' placeholder strings show up in
@@ -37,6 +39,14 @@ _PLACEHOLDERS = frozenset(
 )
 
 _ENV_LINE = re.compile(r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*?)\s*$")
+
+#: Characters that cannot legally appear in a key and that break HTTP headers.
+_FORBIDDEN_IN_KEY = ("\r", "\n", "\t", "\0")
+
+#: Below this length a secret is masked completely. Revealing a fixed seven
+#: characters is a small fraction of a 40-character token and most of a short
+#: one, so the threshold scales with what is actually being protected.
+_MIN_LENGTH_TO_HINT = 16
 
 
 def env_var_for(provider: str) -> str:
@@ -94,6 +104,10 @@ def resolve_api_key(provider: str, explicit: str | None = None) -> str | None:
     Returns:
         The key, or ``None`` when none is configured or the configured value
         is a recognizable placeholder.
+
+    Raises:
+        ProviderCredentialsError: If the configured value contains a line
+            break or control character.
     """
     candidate = explicit if explicit is not None else os.environ.get(env_var_for(provider))
     if candidate is None:
@@ -101,19 +115,35 @@ def resolve_api_key(provider: str, explicit: str | None = None) -> str | None:
     candidate = candidate.strip()
     if candidate.lower() in _PLACEHOLDERS:
         return None
-    return candidate or None
+    if not candidate:
+        return None
+    if any(ch in candidate for ch in _FORBIDDEN_IN_KEY) or any(
+        ord(ch) < 0x20 or ord(ch) == 0x7F for ch in candidate
+    ):
+        # A newline inside a key is almost always a wrapped paste. It also
+        # makes the HTTP client raise on the header — and that exception
+        # stringifies with the header value, which is the key. Refusing here
+        # keeps it out of every downstream message, and says what to fix
+        # without echoing the value.
+        raise ProviderCredentialsError(
+            f"The {provider} API key contains a line break or control "
+            f"character. Re-paste it into {env_var_for(provider)} as a single "
+            "line, with no surrounding quotes."
+        )
+    return candidate
 
 
 def mask(secret: str | None) -> str:
     """Render a secret as something safe to print.
 
-    Short secrets are fully masked rather than partially revealed — showing
-    four of eight characters is not a summary, it is a leak.
+    Short secrets are fully masked rather than partially revealed: seven
+    characters is a fifth of a 40-character token and most of a nine-character
+    one, so anything under :data:`_MIN_LENGTH_TO_HINT` gets no hint at all.
     """
     if not secret:
         return "—"
-    if len(secret) <= 8:
-        return "•" * len(secret)
+    if len(secret) < _MIN_LENGTH_TO_HINT:
+        return "•" * min(len(secret), 12)
     return f"{secret[:3]}…{secret[-4:]}"
 
 
@@ -127,6 +157,8 @@ class KeyStatus:
         required: Whether the provider needs one at all.
         present: Whether a usable key was found.
         hint: The masked key, or a note about where to get one.
+        malformed: A value is configured but cannot be used — reported
+            separately from "missing", because the fix is different.
     """
 
     provider: str
@@ -134,6 +166,7 @@ class KeyStatus:
     required: bool
     present: bool
     hint: str
+    malformed: bool = False
 
     @property
     def ready(self) -> bool:
@@ -144,12 +177,29 @@ class KeyStatus:
     def label(self) -> str:
         if not self.required:
             return "No key needed"
+        if self.malformed:
+            return f"{self.env_var} is set but unusable — {self.hint}"
         return f"Key set ({self.hint})" if self.present else f"Key missing — set {self.env_var}"
 
 
 def key_status(provider: str, *, required: bool, signup_url: str | None = None) -> KeyStatus:
-    """Report a provider's key readiness without revealing the key."""
-    key = resolve_api_key(provider)
+    """Report a provider's key readiness without revealing the key.
+
+    Never raises: this runs on every Streamlit rerun and on every
+    ``optengine providers``, where a malformed key is something to report
+    rather than something to crash on.
+    """
+    try:
+        key = resolve_api_key(provider)
+    except ProviderCredentialsError:
+        return KeyStatus(
+            provider=provider,
+            env_var=env_var_for(provider),
+            required=required,
+            present=False,
+            malformed=True,
+            hint="it contains a line break or control character",
+        )
     return KeyStatus(
         provider=provider,
         env_var=env_var_for(provider),

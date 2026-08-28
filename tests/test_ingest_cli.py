@@ -192,9 +192,35 @@ def test_backtest_accepts_the_adv_liquidity_flags_without_volume(tmp_path, capsy
         "--ingest-period", "3y",
         "--impact-eta", "0.5",
         "--impact-participation-source", "adv",
+        # Capacity is a currency amount, so ADV pricing needs a fund size.
+        "--initial-capital", "100000000",
         "--lookback", "120", "--rebalance-every", "60",
     ])
     assert code == 0
     out = capsys.readouterr().out
     assert "no volume panel available" in out
     assert "fixed participation rate" in out
+
+
+def test_backtest_refuses_adv_pricing_without_a_fund_size(tmp_path, capsys):
+    # The default initial_capital of 1.0 makes every market infinitely deep,
+    # so the run would complete and report a cost of roughly nothing.
+    config = tmp_path / "config.yaml"
+    config.write_text(
+        "periods_per_year: 252\n"
+        "optimizer:\n"
+        "  name: equal_weight\n"
+        "expected_returns:\n"
+        "  AAA: 0.05\n"
+        "  BBB: 0.04\n"
+    )
+    code = main([
+        "backtest", "--config", str(config),
+        "--provider", "sample", "--identifiers", "AAA,BBB",
+        "--ingest-period", "1y",
+        "--impact-eta", "0.5", "--impact-participation-source", "adv",
+    ])
+    assert code == 2
+    err = capsys.readouterr().err
+    assert "real fund size" in err
+    assert "--initial-capital" in err

@@ -58,9 +58,16 @@ def _volumes(returns: pd.DataFrame, level: float = 2e6) -> pd.DataFrame:
     )
 
 
-def _spec(source: str = "fixed", **costs) -> BacktestSpec:
+#: A plausible institutional book. ADV pricing is meaningless without one:
+#: capacity is a currency amount, so the fund's size is what decides whether a
+#: given daily volume is deep or thin.
+CAPITAL = 1e8
+
+
+def _spec(source: str = "fixed", capital: float = CAPITAL, **costs) -> BacktestSpec:
     return BacktestSpec(
         frequency="monthly",
+        initial_capital=capital,
         costs=CostSpec(
             commission_bps=5.0,
             impact_coefficient=0.5,
@@ -404,6 +411,7 @@ def test_an_adv_run_states_what_its_impact_was_priced_against():
     caveats = _tearsheet_caveats(
         BacktestSpec(
             frequency="monthly",
+            initial_capital=CAPITAL,
             costs=CostSpec(
                 commission_bps=5.0, impact_coefficient=0.4,
                 impact_participation_source="adv",
@@ -412,3 +420,69 @@ def test_an_adv_run_states_what_its_impact_was_priced_against():
     )
     assert "priced against traded volume" in caveats
     assert "fixed participation rate" in caveats
+
+
+# ---------------------------------------------------------------------------
+# ADV pricing is meaningless without a fund size, and must say so
+# ---------------------------------------------------------------------------
+
+
+def test_adv_pricing_refuses_the_default_one_unit_book():
+    # The default initial_capital is 1.0 — a one-currency-unit fund, for which
+    # every market on earth is infinitely deep and the impact charge rounds to
+    # zero. Completing that run would look like evidence of unlimited
+    # capacity.
+    with pytest.raises(SpecValidationError, match="real fund size"):
+        BacktestSpec(
+            costs=CostSpec(
+                impact_coefficient=0.5, impact_participation_source="adv"
+            )
+        )
+
+
+def test_the_fixed_model_is_unaffected_by_the_fund_size():
+    spec = BacktestSpec(costs=CostSpec(impact_coefficient=0.5))
+    assert spec.initial_capital == 1.0
+
+
+def test_adv_pricing_accepts_a_real_book():
+    spec = BacktestSpec(
+        initial_capital=1e7,
+        costs=CostSpec(impact_coefficient=0.5, impact_participation_source="adv"),
+    )
+    assert spec.costs.uses_volume
+
+
+def test_the_guard_names_the_threshold_it_applied():
+    from optimization_engine.backtest.spec import MIN_ADV_CAPITAL
+
+    # Just under passes nothing; just over is the caller's judgement to make.
+    with pytest.raises(SpecValidationError):
+        BacktestSpec(
+            initial_capital=MIN_ADV_CAPITAL,
+            costs=CostSpec(
+                impact_coefficient=0.5, impact_participation_source="adv"
+            ),
+        )
+    BacktestSpec(
+        initial_capital=MIN_ADV_CAPITAL * 1.01,
+        costs=CostSpec(impact_coefficient=0.5, impact_participation_source="adv"),
+    )
+
+
+def test_adv_impact_is_material_at_a_realistic_book_size():
+    # The regression this whole guard exists for: at the old default the ADV
+    # charge was four orders of magnitude below the fixed one, which read as
+    # "this strategy has no capacity problem".
+    returns = _returns()
+    prices = _prices(returns)
+    volumes = _volumes(returns, level=2e5)
+    weights = pd.Series(0.5, index=returns.columns)
+
+    fixed = run_backtest(returns, weights, _spec("fixed"))
+    adv = run_backtest(
+        returns, weights, _spec("adv"), prices=prices, volumes=volumes
+    )
+    fixed_cost = float(fixed.costs["total"].sum())
+    adv_cost = float(adv.costs["total"].sum())
+    assert adv_cost > fixed_cost / 100.0

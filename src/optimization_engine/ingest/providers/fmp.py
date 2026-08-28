@@ -13,6 +13,11 @@ adjusted for splits and dividends, so ``adjClose`` becomes
 :data:`~optimization_engine.ingest.fields.CLOSE_RAW`. Getting that backwards
 is the single most common way to produce a backtest that quietly ignores
 dividends.
+
+It publishes no adjusted open, high or low, though — only the raw ones, which
+would leave an adjusted close beside an unadjusted session range. See
+:mod:`optimization_engine.ingest.adjust` for why that is worse than it sounds
+and how it is reconciled.
 """
 
 from __future__ import annotations
@@ -22,6 +27,7 @@ from collections.abc import Mapping, Sequence
 import pandas as pd
 
 from optimization_engine.ingest import fields as F
+from optimization_engine.ingest.adjust import rescale_to_adjusted
 from optimization_engine.ingest.errors import (
     IdentifierNotFoundError,
     ProviderResponseError,
@@ -85,7 +91,11 @@ class FinancialModelingPrep(PriceProvider):
             params={
                 "from": request.start.isoformat(),  # type: ignore[union-attr]
                 "to": request.end.isoformat(),  # type: ignore[union-attr]
-                "serietype": "line" if request.fields == F.PRICE_ONLY else "",
+                # The full payload, always. FMP's ``serietype=line`` response
+                # is smaller but carries only the *unadjusted* close, which
+                # would arrive labelled as a total-return series — the exact
+                # silent dividend loss this adapter exists to prevent. A few
+                # extra kilobytes is the right trade.
             },
             # The key goes here and nowhere else, so no error path can
             # interpolate it: the base class raises on status codes only.
@@ -183,27 +193,32 @@ def _rows_to_frames(
     frame = frame.loc[index.notna()]
     index = index[index.notna()]
 
-    frames: dict[str, pd.DataFrame] = {}
+    series_by_target: dict[str, pd.Series] = {}
     for source, target in _COLUMN_MAP.items():
         if source not in frame.columns:
             continue
         series = pd.to_numeric(frame[source], errors="coerce")
         series.index = index
-        series = series.sort_index()
-        if target is F.VOLUME and not (series.fillna(0.0) > 0).any():
-            # An index or a fund with no reported turnover: absent, not zero.
-            continue
-        frames[target] = series.to_frame(identifier)
+        series_by_target[target] = series.sort_index()
 
-    if F.CLOSE not in frames:
-        # ``serietype=line`` responses carry only ``close``. It is unadjusted,
-        # but it is the only price there is, so promote it and say so.
-        raw = frames.pop(F.CLOSE_RAW, None)
+    if F.CLOSE not in series_by_target:
+        # Older or reduced responses carry only ``close``. It is unadjusted,
+        # but it is the only price there is, so promote it rather than fail.
+        raw = series_by_target.pop(F.CLOSE_RAW, None)
         if raw is None:
             raise ProviderResponseError(
                 f"FMP rows for {symbol!r} contain neither adjClose nor close."
             )
-        frames[F.CLOSE] = raw
+        series_by_target[F.CLOSE] = raw
+    else:
+        series_by_target = rescale_to_adjusted(series_by_target)
+
+    frames: dict[str, pd.DataFrame] = {}
+    for target, series in series_by_target.items():
+        if target is F.VOLUME and not (series.fillna(0.0) > 0).any():
+            # An index or a fund with no reported turnover: absent, not zero.
+            continue
+        frames[target] = series.to_frame(identifier)
     return frames
 
 
