@@ -432,23 +432,48 @@ def test_changing_the_request_misses_the_cache(tmp_path):
     assert not result.from_cache
 
 
-def test_an_expired_entry_is_a_miss(tmp_path):
-    stub = StubProvider()
-    ingest(_request(cache_dir=str(tmp_path), cache_ttl_seconds=0), provider=stub)
-    # A zero TTL disables expiry rather than expiring instantly, so use a
-    # negative-age entry instead: re-read with a one-second TTL after ageing.
-    cache = PanelCache(tmp_path, ttl_seconds=1)
-    key = _request(cache_dir=str(tmp_path)).fingerprint()
-    entry = cache.load(key)
-    assert entry is not None
-
-    manifest = cache.path_for(key) / "manifest.json"
+def _age_entry(cache: PanelCache, key: str, seconds: float) -> None:
+    """Rewrite an entry's manifest so it looks ``seconds`` old."""
+    import io
     import json
+    import zipfile
 
-    payload = json.loads(manifest.read_text())
-    payload["written_at"] = 0.0
-    manifest.write_text(json.dumps(payload))
+    path = cache.path_for(key)
+    with zipfile.ZipFile(path) as archive:
+        members = {name: archive.read(name) for name in archive.namelist()}
+
+    manifest = json.loads(members["manifest.json"].decode("utf-8"))
+    manifest["written_at"] = manifest["written_at"] - seconds
+    members["manifest.json"] = json.dumps(manifest).encode("utf-8")
+
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_STORED) as archive:
+        for name, payload in members.items():
+            archive.writestr(name, payload)
+    path.write_bytes(buffer.getvalue())
+
+
+def test_an_entry_past_its_ttl_is_a_miss(tmp_path):
+    stub = StubProvider()
+    request = _request(cache_dir=str(tmp_path), cache_ttl_seconds=3600)
+    ingest(request, provider=stub)
+
+    cache = PanelCache(tmp_path, ttl_seconds=3600)
+    key = request.fingerprint()
+    assert cache.load(key) is not None
+
+    _age_entry(cache, key, seconds=7200)
     assert cache.load(key) is None
+
+
+def test_a_zero_ttl_disables_expiry_rather_than_expiring_instantly(tmp_path):
+    stub = StubProvider()
+    request = _request(cache_dir=str(tmp_path), cache_ttl_seconds=0)
+    ingest(request, provider=stub)
+
+    cache = PanelCache(tmp_path, ttl_seconds=0)
+    _age_entry(cache, request.fingerprint(), seconds=10 * 365 * 24 * 3600)
+    assert cache.load(request.fingerprint()) is not None
 
 
 def test_a_corrupt_cache_entry_is_a_miss_not_a_crash(tmp_path):
@@ -456,12 +481,26 @@ def test_a_corrupt_cache_entry_is_a_miss_not_a_crash(tmp_path):
     request = _request(cache_dir=str(tmp_path))
     ingest(request, provider=stub)
 
-    manifest = PanelCache(tmp_path).path_for(request.fingerprint()) / "manifest.json"
-    manifest.write_text("{ not json")
+    PanelCache(tmp_path).path_for(request.fingerprint()).write_bytes(b"not a zip")
 
     result = ingest(request, provider=stub)
     assert not result.from_cache
     assert result.is_complete
+
+
+def test_a_truncated_entry_is_a_miss_not_a_crash(tmp_path):
+    # What an interrupted write would have produced, if it could reach the
+    # entry's own name — which is exactly what the temporary name prevents.
+    stub = StubProvider()
+    request = _request(cache_dir=str(tmp_path))
+    ingest(request, provider=stub)
+
+    path = PanelCache(tmp_path).path_for(request.fingerprint())
+    payload = path.read_bytes()
+    path.write_bytes(payload[: len(payload) // 2])
+
+    assert PanelCache(tmp_path).load(request.fingerprint()) is None
+    assert ingest(request, provider=stub).is_complete
 
 
 def test_no_cache_directory_means_nothing_is_written(tmp_path):
@@ -660,3 +699,92 @@ def test_a_batched_provider_bug_does_not_relay_its_message_either():
         ingest(_request(("AAA", "BBB"), provider="leaky_batch"), provider=LeakyBatch())
     assert "sk-live-SECRET" not in str(caught.value)
     assert "ValueError" in str(caught.value)
+
+
+# ---------------------------------------------------------------------------
+# Publishing a cache entry has to be atomic
+# ---------------------------------------------------------------------------
+
+
+def test_concurrent_writers_of_one_key_all_succeed(tmp_path):
+    """The reason an entry is a single file.
+
+    With a directory per entry, publishing means removing the old one and then
+    renaming the new one into place. Two writers racing through that gap leave
+    one of them with ``Directory not empty`` — a lost cache write on every
+    collision — and readers with a window in which the entry does not exist.
+    ``os.replace`` on a file has neither problem.
+    """
+    import concurrent.futures
+
+    cache = PanelCache(tmp_path)
+    panel = _panel_for("AAA", volume=True)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=16) as pool:
+        results = list(pool.map(lambda _: cache.store("samekey", panel), range(16)))
+
+    assert all(results), f"{results.count(False)} of 16 concurrent writes failed"
+
+    loaded = cache.load("samekey")
+    assert loaded is not None
+    pd.testing.assert_frame_equal(loaded[0].prices(), panel.prices())
+
+
+def test_a_concurrent_writer_never_hides_the_entry_from_a_reader(tmp_path):
+    """A reader must see the old entry or the new one, never neither."""
+    import threading
+
+    cache = PanelCache(tmp_path)
+    panel = _panel_for("AAA", volume=True)
+    cache.store("samekey", panel)
+
+    stop = threading.Event()
+    misses: list[int] = []
+
+    def read_until_stopped() -> None:
+        while not stop.is_set():
+            if cache.load("samekey") is None:
+                misses.append(1)
+
+    reader = threading.Thread(target=read_until_stopped)
+    reader.start()
+    try:
+        for _ in range(40):
+            cache.store("samekey", panel)
+    finally:
+        stop.set()
+        reader.join(timeout=10)
+
+    assert not misses, f"the entry vanished {len(misses)} times mid-republish"
+
+
+def test_an_interrupted_write_leaves_nothing_a_later_run_would_trust(
+    tmp_path, monkeypatch
+):
+    cache = PanelCache(tmp_path)
+
+    def explode(stream, panel):
+        # Fail partway through serialization, once the temporary file exists.
+        stream.write(b"partial")
+        raise OSError("disk full")
+
+    monkeypatch.setattr(PanelCache, "_write_archive", staticmethod(explode))
+    assert cache.store("samekey", _panel_for("AAA", volume=True)) is False
+
+    monkeypatch.undo()
+    assert cache.load("samekey") is None
+    assert not cache.path_for("samekey").exists()
+    # And no temporary file was left lying around.
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_clear_removes_entries_and_the_directories_version_one_wrote(tmp_path):
+    cache = PanelCache(tmp_path)
+    cache.store("k1", _panel_for("AAA", volume=True))
+    cache.store("k2", _panel_for("BBB", volume=True))
+    # A version-1 entry, which is now a miss but still takes up space.
+    (tmp_path / "legacy_key").mkdir()
+    (tmp_path / "legacy_key" / "manifest.json").write_text("{}")
+
+    assert cache.clear() == 3
+    assert list(tmp_path.iterdir()) == []

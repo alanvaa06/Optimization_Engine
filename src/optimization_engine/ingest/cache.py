@@ -14,19 +14,35 @@ Three properties the design is built around:
   deliberately excludes worker count and cache settings, which change how the
   fetch runs rather than what it returns.
 * **Never poisonous.** A corrupt, unreadable or half-written entry is a cache
-  miss, not an exception. Writes go to a temporary file and are moved into
-  place atomically, so an interrupted run cannot leave a truncated entry that
-  a later run trusts.
+  miss, not an exception. An interrupted run cannot leave a truncated entry
+  that a later run trusts.
+
+One entry is one file, and that is load-bearing rather than incidental. The
+obvious layout — a directory per entry holding a Parquet per field — cannot be
+published atomically: ``rename`` onto a directory that already exists fails,
+so publishing means removing the old one first, and two writers racing through
+that gap leave one of them with ``Directory not empty`` and readers with a
+window where the entry does not exist at all. ``os.replace`` on a *file* has
+neither problem. So an entry is a Zip holding exactly what the directory would
+have held, written to a temporary name beside it and moved into place in one
+step: a reader sees the old entry or the new one, a second writer simply wins,
+and a reader already mid-read keeps the file it opened.
+
+The Zip is stored uncompressed — Parquet has already done that work, and
+deflating it again costs time to save almost nothing.
 """
 
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import logging
 import os
 import shutil
+import tempfile
 import time
-import uuid
+import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -38,7 +54,15 @@ from optimization_engine.ingest.panel import PricePanel, SeriesMeta
 _LOG = logging.getLogger(__name__)
 
 _MANIFEST = "manifest.json"
-_FORMAT_VERSION = 1
+
+#: Bumped when the on-disk layout changes. An entry written by a different
+#: version is a miss, never a parse attempt — version 1 was a directory per
+#: entry, which is why version 2 exists.
+_FORMAT_VERSION = 2
+
+#: Suffix that marks a complete entry. A file only carries it at the instant
+#: it is whole, so a half-written one can never be mistaken for a hit.
+_SUFFIX = ".panel"
 
 
 @dataclass(frozen=True)
@@ -66,9 +90,10 @@ class CacheEntry:
 class PanelCache:
     """Reads and writes :class:`PricePanel` objects under a directory.
 
-    Each entry is a folder named by the request fingerprint: one Parquet file
-    per field plus a JSON manifest holding the provenance and the timestamp.
-    Parquet keeps the dtypes and the DatetimeIndex intact, which CSV does not.
+    Each entry is one Zip file named by the request fingerprint, holding a
+    Parquet per field plus a JSON manifest with the provenance and the write
+    time. Parquet keeps the dtypes and the ``DatetimeIndex`` intact, which CSV
+    does not; the single file is what makes publishing atomic.
     """
 
     def __init__(self, directory: str | Path, ttl_seconds: int = 24 * 60 * 60) -> None:
@@ -76,35 +101,34 @@ class PanelCache:
         self.ttl_seconds = int(ttl_seconds)
 
     def path_for(self, key: str) -> Path:
-        return self.directory / key
+        return self.directory / f"{key}{_SUFFIX}"
 
     def load(self, key: str) -> tuple[PricePanel, CacheEntry] | None:
         """Return a cached panel, or ``None`` on any miss.
 
-        A miss includes: no entry, an entry older than the TTL, a manifest
-        written by a different format version, and any read failure at all.
-        Nothing here raises — a broken cache must degrade to a fetch.
+        A miss includes: no entry, an entry older than the TTL, one written by
+        a different format version, and any read failure at all. Nothing here
+        raises — a broken cache must degrade to a fetch, never to a stack
+        trace, because the fetch is always available and always correct.
         """
-        folder = self.path_for(key)
-        manifest_path = folder / _MANIFEST
-        if not manifest_path.is_file():
+        path = self.path_for(key)
+        if not path.is_file():
             return None
 
         try:
-            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-            if int(manifest.get("format_version", 0)) != _FORMAT_VERSION:
-                return None
-
-            age = time.time() - float(manifest["written_at"])
-            if self.ttl_seconds and age > self.ttl_seconds:
-                return None
-
-            frames: dict[str, pd.DataFrame] = {}
-            for name in manifest["fields"]:
-                frame_path = folder / f"{name}.parquet"
-                if not frame_path.is_file():
+            with zipfile.ZipFile(path) as archive:
+                manifest = json.loads(archive.read(_MANIFEST).decode("utf-8"))
+                if int(manifest.get("format_version", 0)) != _FORMAT_VERSION:
                     return None
-                frames[name] = pd.read_parquet(frame_path)
+
+                age = time.time() - float(manifest["written_at"])
+                if self.ttl_seconds and age > self.ttl_seconds:
+                    return None
+
+                frames = {
+                    name: pd.read_parquet(io.BytesIO(archive.read(f"{name}.parquet")))
+                    for name in manifest["fields"]
+                }
 
             meta = {
                 identifier: SeriesMeta(
@@ -125,7 +149,7 @@ class PanelCache:
 
         return panel, CacheEntry(
             key=key,
-            path=folder,
+            path=path,
             age_seconds=age,
             fields=tuple(manifest["fields"]),
         )
@@ -133,56 +157,74 @@ class PanelCache:
     def store(self, key: str, panel: PricePanel) -> bool:
         """Write a panel to the cache. Returns whether the write succeeded.
 
+        The entry is built under a temporary name in the same directory — so
+        the move below stays on one filesystem — and then moved into place
+        with a single :func:`os.replace`. That call is atomic, which is what
+        lets two runs fetch the same request concurrently without either of
+        them failing and without a reader ever seeing a partial entry.
+
         Failures are logged and swallowed: a read-only directory or a full
         disk should slow the next run down, not fail this one.
         """
-        folder = self.path_for(key)
-        # Unique per writer, not just per process: two threads fetching the
-        # same request would otherwise share one staging directory, and the
-        # first to finish would delete the other's half-written parquet.
-        staging = folder.with_name(f".{folder.name}.tmp-{os.getpid()}-{uuid.uuid4().hex[:8]}")
+        target = self.path_for(key)
+        handle, staging = -1, ""
         try:
-            if staging.exists():
-                shutil.rmtree(staging, ignore_errors=True)
-            staging.mkdir(parents=True, exist_ok=True)
-
-            for name, frame in panel.frames.items():
-                frame.to_parquet(staging / f"{name}.parquet")
-
-            manifest = {
-                "format_version": _FORMAT_VERSION,
-                "written_at": time.time(),
-                "fields": list(panel.frames),
-                "identifiers": list(panel.identifiers),
-                "meta": {
-                    identifier: {
-                        "provider_symbol": record.provider_symbol,
-                        "provider": record.provider,
-                        "kind": record.kind.value,
-                        "currency": record.currency,
-                        "name": record.name,
-                        "exchange": record.exchange,
-                    }
-                    for identifier, record in panel.meta.items()
-                },
-            }
-            (staging / _MANIFEST).write_text(
-                json.dumps(manifest, indent=2), encoding="utf-8"
+            self.directory.mkdir(parents=True, exist_ok=True)
+            handle, staging = tempfile.mkstemp(
+                dir=self.directory, prefix=f".{key}.", suffix=".tmp"
             )
+            with os.fdopen(handle, "wb") as raw:
+                handle = -1  # now owned by the file object
+                self._write_archive(raw, panel)
 
-            # Replace atomically: a reader either sees the old entry or the
-            # new one, never a directory being written into.
-            if folder.exists():
-                shutil.rmtree(folder, ignore_errors=True)
-            staging.replace(folder)
+            # One atomic step. A concurrent writer of the same key simply
+            # wins; a reader holding the old file keeps reading it.
+            os.replace(staging, target)
             return True
         except Exception as exc:
             _LOG.warning("Could not cache panel %s: %s", key, exc)
-            shutil.rmtree(staging, ignore_errors=True)
+            if handle != -1:
+                os.close(handle)
+            if staging:
+                # The temporary name never carried the entry suffix, so even
+                # if this cleanup fails the leftover cannot be read as a hit.
+                with contextlib.suppress(OSError):
+                    os.unlink(staging)
             return False
 
+    @staticmethod
+    def _write_archive(stream, panel: PricePanel) -> None:
+        """Serialize a panel into an open binary stream as a Zip."""
+        manifest = {
+            "format_version": _FORMAT_VERSION,
+            "written_at": time.time(),
+            "fields": list(panel.frames),
+            "identifiers": list(panel.identifiers),
+            "meta": {
+                identifier: {
+                    "provider_symbol": record.provider_symbol,
+                    "provider": record.provider,
+                    "kind": record.kind.value,
+                    "currency": record.currency,
+                    "name": record.name,
+                    "exchange": record.exchange,
+                }
+                for identifier, record in panel.meta.items()
+            },
+        }
+        with zipfile.ZipFile(stream, "w", compression=zipfile.ZIP_STORED) as archive:
+            archive.writestr(_MANIFEST, json.dumps(manifest, indent=2))
+            for name, frame in panel.frames.items():
+                buffer = io.BytesIO()
+                frame.to_parquet(buffer)
+                archive.writestr(f"{name}.parquet", buffer.getvalue())
+
     def clear(self) -> int:
-        """Delete every entry. Returns how many were removed."""
+        """Delete every entry. Returns how many were removed.
+
+        Sweeps up three things: current entries, the directories version 1
+        wrote, and any temporary file an interrupted run left behind.
+        """
         if not self.directory.is_dir():
             return 0
         removed = 0
@@ -190,6 +232,10 @@ class PanelCache:
             if child.is_dir():
                 shutil.rmtree(child, ignore_errors=True)
                 removed += 1
+            elif child.suffix == _SUFFIX or child.name.endswith(".tmp"):
+                with contextlib.suppress(OSError):
+                    child.unlink()
+                    removed += 1
         return removed
 
 
