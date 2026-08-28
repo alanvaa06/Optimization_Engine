@@ -35,6 +35,7 @@ from optimization_engine.backtest.costs import (
     CostModel,
     MarketContext,
     build_cost_model,
+    trailing_dollar_volume,
     trailing_volatilities,
 )
 from optimization_engine.backtest.results import (
@@ -49,6 +50,11 @@ from optimization_engine.backtest.spec import BacktestSpec
 
 #: Traded fractions below this are float residue, not orders.
 _TRADE_EPS = 1e-12
+
+def _no_lookback() -> int:
+    """Default for cost models written before ADV pricing existed."""
+    return 0
+
 
 #: Cap on distinct degradation reasons carried on the meta. The reasons are a
 #: diagnostic, not a log file; a run that degrades on every trade needs to say
@@ -80,6 +86,8 @@ def run_backtest(
     cost_model: CostModel | None = None,
     notes: dict[str, Any] | None = None,
     context_returns: pd.DataFrame | None = None,
+    prices: pd.DataFrame | None = None,
+    volumes: pd.DataFrame | None = None,
 ) -> RunResult:
     """Replay a weight schedule over a return history.
 
@@ -101,6 +109,15 @@ def run_backtest(
             just outside the slice. Only rows strictly before each decision
             date are ever read, so this widens what can be estimated without
             widening what can be seen.
+        prices: Close prices for the same assets, needed only to turn share
+            volume into traded notional. Ignored unless the cost model prices
+            capacity from ADV.
+        volumes: Traded volume per asset and period. Optional throughout: with
+            no volume panel — an index universe, a fund NAV series, any
+            provider that does not publish it — the impact model prices from
+            its fixed participation rate and records that it did so. Supplying
+            one only matters when
+            ``spec.costs.impact_participation_source == "adv"``.
 
     Returns:
         The full result bundle. See :class:`~optimization_engine.backtest.results.RunResult`.
@@ -124,6 +141,17 @@ def run_backtest(
         volatility = trailing_volatilities(
             history, lookback, spec.costs.min_impact_observations
         ).reindex(index=index, columns=assets)
+
+    # Traded notional is computed only when a model actually asks for it, so a
+    # universe with no volume — the common case for indices — costs nothing
+    # and behaves identically to one that was never offered any.
+    adv_lookback = int(getattr(model, "participation_lookback", _no_lookback)())
+    adv_notional = None
+    if adv_lookback > 0 and volumes is not None and prices is not None:
+        adv_notional = trailing_dollar_volume(
+            prices, volumes, adv_lookback, spec.costs.min_adv_observations
+        ).reindex(index=index, columns=assets)
+    adv_share = float(spec.costs.impact_adv_share)
 
     marks = rebalance_dates(index, spec.frequency)
     # A schedule date is always a decision: the walk-forward runner only emits
@@ -183,10 +211,20 @@ def run_backtest(
                     if volatility is not None:
                         raw = volatility.iat[position, asset_position]
                         sigma = None if pd.isna(raw) else float(raw)
+                    participation = None
+                    if adv_notional is not None and nav > 0.0:
+                        capacity = adv_notional.iat[position, asset_position]
+                        if not pd.isna(capacity):
+                            # Capacity is a currency amount; what the impact law
+                            # needs is its share of *this* book, so a fund that
+                            # has grown sees the same name as less liquid.
+                            participation = float(capacity) * adv_share / nav
                     quote = model.charge(
                         asset=asset,
                         traded_weight=delta,
-                        context=MarketContext(volatility=sigma),
+                        context=MarketContext(
+                            volatility=sigma, participation=participation
+                        ),
                     )
                     if quote.degraded_reason and quote.degraded_reason not in seen_degradations:
                         seen_degradations.add(quote.degraded_reason)

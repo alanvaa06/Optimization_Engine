@@ -111,6 +111,41 @@ so what the README shows is what the library draws.*
 `optengine describe <name>` prints what a method needs, what it supports, and
 what it assumes — the same text the UI shows next to the method picker.
 
+**Data sources**
+
+One request goes in, one validated panel comes out, and the provider is a
+string in between. Every adapter translates its vendor's schema into the same
+column vocabulary, so switching providers changes a config field and nothing
+else — a scenario, a benchmark reference and a constraint written against
+`SP500` keep working when the bytes start arriving from somewhere new.
+
+| Provider | Key | Serves | Notes |
+| --- | --- | --- | --- |
+| `sample` | — | OHLCV | Deterministic synthetic panel. No network. The default. |
+| `yahoo` | — | OHLCV + raw close | Total-return prices for equities, ETFs, indices, FX and crypto. One request covers the whole universe. |
+| `stooq` | — | OHLCV | Keyless CSV history. The most dependable free source for world index levels. |
+| `fred` | — | close only | St. Louis Fed index levels. Never carries volume, and says so. |
+| `fmp` | free | OHLCV + VWAP | Adjusted closes for global equities, ETFs and indices. |
+| `tiingo` | free | OHLCV | Carefully maintained adjusted end-of-day prices. Token travels in a header, never a URL. |
+| `file` | — | anything in the file | CSV, Excel or Parquet, wide or long. |
+
+```bash
+optengine providers                       # what each can serve, and whether its key is set
+optengine ingest --provider stooq \
+  --identifiers "SP500, DAX, NIKKEI225" \
+  --ingest-period 10y --output prices.csv
+```
+
+Keys follow one convention — `OPTENGINE_API_KEY_<PROVIDER>`, read from the
+environment or a `.env` file — and are never logged, never raised in an
+exception, and never rendered. `optengine providers` reports whether a key is
+present, masked.
+
+Every run returns a per-identifier log alongside the data: what loaded, from
+which symbol, over what span, and why anything is missing. Eleven of twelve
+assets arriving is not a success, and finding that out should not require
+counting columns.
+
 **Constraints**
 
 * Per-asset weight bounds.
@@ -478,7 +513,10 @@ On top of the core:
 
 ```mermaid
 flowchart TD
-    A[Prices] --> B{Data quality}
+    A0[Provider<br/>yahoo · stooq · fred · fmp · tiingo · file] --> A1{Preflight}
+    A1 -->|asks for a field<br/>the provider lacks| A2[Refused before<br/>the network call]
+    A1 --> A[Panel + per-identifier log<br/>homogenized column names]
+    A --> B{Data quality}
     B -->|gaps, stale feeds,<br/>splits, thin samples| B1[Reported before<br/>anything is estimated]
     B --> C[Align panel<br/>explicitly, with a log]
     C --> D[Covariance<br/>+ conditioning diagnostics]
@@ -507,6 +545,12 @@ src/optimization_engine/
 │                     # walkforward · tca · positions · sweep · holdout
 │                     # tearsheet
 ├── data/             # loaders · covariance · denoising · data-quality
+├── ingest/           # multi-provider spine: one request in, one validated
+│                     # panel out, with per-identifier provenance
+│   ├── spec · fields · panel · errors      (what a request and a panel are)
+│   ├── providers/    # yahoo · stooq · fred · fmp · tiingo · file · sample
+│   ├── registry · credentials · catalog    (name → provider → symbol)
+│   └── cache · service                     (disk cache, concurrency, run log)
 ├── optimizers/       # one file per technique + diagnostics + feasibility
 ├── reporting/        # Excel exporter + Plotly figures
 ├── benchmark.py      # what the portfolio is measured — and optimized — against
@@ -517,6 +561,7 @@ src/optimization_engine/
 └── cli.py            # `optengine` entrypoint
 app/
 ├── streamlit_app.py  # interactive UI
+├── data_sources.py   # provider picker, ingest log, liquidity selector
 └── components.py     # reusable render blocks
 config/               # example configs
 docs/RESEARCH.md      # the literature behind the methods, and what was left out
@@ -548,11 +593,17 @@ The sidebar walks a numbered path — **Data → Currency → Method →
 Assumptions → Objective → Benchmark → Exposure → Frontier** — and each step
 surfaces what could make the next one wrong.
 
-1. **Data** — data-quality report before anything is estimated: interior
-   gaps, stale feeds that read to an optimizer as low volatility, unadjusted
-   splits, and how many periods actually have every asset present. The
-   missing-data policy is an explicit choice, and the app logs exactly what it
-   did to the panel.
+1. **Data** — pick a provider, name a universe, fetch. The picker states each
+   provider's capabilities up front and greys out what it cannot serve, so
+   asking FRED for volume is unavailable rather than an error after the fact;
+   a provider needing a key says which variable it reads and lets you paste
+   one for the session. What comes back is shown as a **provenance block** —
+   which symbol, which provider, which instrument kind, which currency, how
+   many observations, and whether the series carries volume — beside the
+   data-quality report: interior gaps, stale feeds that read to an optimizer
+   as low volatility, unadjusted splits, and how many periods actually have
+   every asset present. The missing-data policy is an explicit choice, and the
+   app logs exactly what it did to the panel.
 
    ![The Data tab, leading with a data-quality verdict and per-asset coverage](docs/images/app-data.png)
 2. **Assets** — per-asset statistics (extended metrics on a toggle) plus a
@@ -579,7 +630,11 @@ surfaces what could make the next one wrong.
    actually sits — plus an opt-in panel that redraws the frontier as a
    confidence band and names the positions the sample cannot pin down.
 5. **Backtest** — choose a rebalancing cadence, an execution lag, and a cost
-   model split into commission, spread and square-root market impact; see
+   model split into commission, spread and square-root market impact, plus
+   **where the impact model's participation rate comes from**: a fixed
+   assumption, or the traded volume the panel actually carries. Choosing
+   volume on a universe that has none — every index universe — falls back to
+   the fixed rate and says so on the page rather than in a log; see
    weight drift, cost drag, where the cost went by name, rolling performance,
    the return distribution with its VaR/CVaR cuts, and a walk-forward run that
    says in words how much of the result was hindsight.
@@ -611,7 +666,25 @@ and downloads/uploads named profiles (YAML).
 ```bash
 optengine list-optimizers                    # each method with a one-line summary
 optengine describe hrp                       # what it needs, supports, assumes
+optengine providers                          # data sources, capabilities, key status
 optengine sample-data --output data/sample/sample_prices.csv
+
+# Fetch a panel. Prices and volume are written separately, because a universe
+# can perfectly well have the first and not the second.
+optengine ingest --provider yahoo --identifiers "SPY,EFA,EEM,AGG,GLD" \
+    --ingest-period 10y --ingest-fields ohlcv \
+    --output prices.parquet --volume-output volume.parquet
+
+# The same universe from a different provider. Nothing else changes: catalog
+# names resolve to each provider's own symbol and the columns keep their names.
+optengine ingest --provider stooq --identifiers "SP500,DAX,IPC" \
+    --ingest-period 10y --output indices.csv
+
+# Optimize straight off a provider, with a disk cache so a re-run does not
+# re-download.
+optengine optimize --config config/example_multi_asset.yaml \
+    --provider yahoo --identifiers "SPY,EFA,EEM,AGG,TLT,GLD,DBC,VNQ" \
+    --ingest-period 10y --ingest-currency USD --cache-dir .cache/panels
 
 # Pre-flight the inputs and constraints without solving.
 optengine check --config config/example_multi_asset.yaml --sample
@@ -644,6 +717,20 @@ optengine backtest --config config/example_multi_asset.yaml --sample \
 # held-out segment once — and write that look down.
 optengine backtest --config config/example_multi_asset.yaml --sample \
     --commission-bps 10 --holdout 2024-01-01
+
+# Price capacity from real traded volume rather than an assumed participation
+# rate. Costs now rise as the fund grows and as a name's turnover dries up.
+optengine backtest --config config/example_multi_asset.yaml \
+    --provider yahoo --identifiers "SPY,EFA,EEM,AGG,GLD" \
+    --ingest-period 10y --ingest-fields ohlcv \
+    --impact-eta 0.4 --impact-participation-source adv --impact-adv-share 0.10
+
+# The same run on an index universe, which has no volume and never will. It
+# does not fail: impact falls back to the fixed participation rate, and every
+# trade that did so is named in the run's degradation notes.
+optengine backtest --config config/indices.yaml \
+    --provider stooq --identifiers "SP500,DAX,NIKKEI225,FTSE100" \
+    --ingest-period 10y --impact-eta 0.4 --impact-participation-source adv
 ```
 
 `backtest` prints what the strategy earned out of sample, what the trading cost

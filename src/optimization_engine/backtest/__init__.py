@@ -46,6 +46,7 @@ from optimization_engine.backtest.costs import (
     SquareRootImpactCost,
     ZeroCost,
     build_cost_model,
+    trailing_dollar_volume,
     trailing_volatilities,
 )
 from optimization_engine.backtest.holdout import (
@@ -70,6 +71,7 @@ from optimization_engine.backtest.positions import (
 from optimization_engine.backtest.results import RunMeta, RunResult, compute_result_hash
 from optimization_engine.backtest.runner import run_backtest
 from optimization_engine.backtest.spec import (
+    PARTICIPATION_SOURCES,
     REBALANCE_DESCRIPTIONS,
     BacktestSpec,
     CostSpec,
@@ -99,6 +101,7 @@ __all__ = [
     "BacktestSpec",
     "CostModel",
     "CostQuote",
+    "PARTICIPATION_SOURCES",
     "CostSpec",
     "GridCell",
     "HoldoutOutcome",
@@ -138,6 +141,7 @@ __all__ = [
     "run_backtest",
     "run_sweep",
     "sweep_from_optimizers",
+    "trailing_dollar_volume",
     "trailing_volatilities",
     "walk_forward_run",
 ]

@@ -75,6 +75,8 @@ def walk_forward_run(
     spec: BacktestSpec | None = None,
     min_lookback: int | None = None,
     expanding: bool = False,
+    prices: pd.DataFrame | None = None,
+    volumes: pd.DataFrame | None = None,
 ) -> WalkForwardRun:
     """Roll an estimation window forward, re-solving as it goes.
 
@@ -89,6 +91,11 @@ def walk_forward_run(
         min_lookback: Minimum window before the first solve. Defaults to
             ``lookback``.
         expanding: Grow the window from the start instead of rolling it.
+        prices: Close prices, needed only when the cost model prices capacity
+            from traded volume.
+        volumes: Traded volume per asset and period. Optional: without one the
+            impact model uses its fixed participation rate, which is the only
+            thing it can do for an index universe.
 
     Raises:
         ValueError: If the parameters are degenerate, the history is too
@@ -160,7 +167,13 @@ def walk_forward_run(
     # a decision made at the first evaluated date has years of returns behind
     # it, and pricing its impact off the slice alone would throw them away.
     run = run_backtest(
-        evaluation, weights_history, spec, notes=notes, context_returns=returns
+        evaluation,
+        weights_history,
+        spec,
+        notes=notes,
+        context_returns=returns,
+        prices=prices,
+        volumes=volumes,
     )
 
     return WalkForwardRun(

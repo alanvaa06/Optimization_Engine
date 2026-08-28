@@ -1,0 +1,44 @@
+# An index universe: the case that has no volume and never will.
+#
+# Nothing here asks for volume, and nothing needs to. Index levels are the
+# only thing FRED and Stooq publish for these instruments, and the backtest
+# prices market impact from a fixed participation rate rather than an ADV that
+# does not exist. Pair it with a keyless provider:
+#
+#   optengine optimize --config config/indices.yaml \
+#       --provider stooq --identifiers "SP500,DAX,NIKKEI225,FTSE100" \
+#       --ingest-period 10y
+#
+# The expected returns below are illustrative round numbers for a runnable
+# example. They are not a capital-market assumption from anyone.
+
+periods_per_year: 252
+covariance_method: ledoit_wolf
+
+optimizer:
+  name: risk_parity      # No expected returns needed, which suits a universe
+                         # assembled to study index behaviour rather than to
+                         # express a view on it.
+  risk_free_rate: 0.03
+
+expected_returns:
+  SP500: 0.075
+  DAX: 0.065
+  NIKKEI225: 0.060
+  FTSE100: 0.055
+
+bounds:
+  SP500: [0.05, 0.60]
+  DAX: [0.05, 0.40]
+  NIKKEI225: [0.05, 0.40]
+  FTSE100: [0.05, 0.40]
+
+# Index levels are quoted in their home currency. Convert at the price level
+# so the optimizer sees one homogeneous universe rather than four currencies
+# pretending to be comparable.
+base_currency: USD
+asset_currency:
+  SP500: USD
+  DAX: EUR
+  NIKKEI225: JPY
+  FTSE100: GBP

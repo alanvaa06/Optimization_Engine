@@ -15,6 +15,14 @@ from optimization_engine.data.fx import FXError
 from optimization_engine.data.loader import load_prices, prices_to_returns, sample_dataset
 from optimization_engine.data.yahoo import YahooFinanceError, load_prices_yahoo
 from optimization_engine.engine import apply_fx_conversion, run_engine
+from optimization_engine.ingest import (
+    IngestError,
+    IngestRequest,
+    describe_providers,
+    ingest,
+    load_dotenv,
+)
+from optimization_engine.ingest import fields as ingest_fields
 from optimization_engine.optimizers._cvxpy_helpers import SolverFailure
 from optimization_engine.optimizers.factory import available_optimizers
 from optimization_engine.optimizers.requirements import requirements_for
@@ -48,6 +56,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "--base-currency",
         help="Override config.base_currency. Conversion uses FRED FX rates.",
     )
+    _add_ingest_arguments(optimize)
     optimize.add_argument("--output", default="outputs.xlsx", help="Output Excel path.")
     optimize.add_argument("--frontier", action="store_true", help="Also compute the frontier.")
     optimize.add_argument("--frontier-points", type=int, default=25)
@@ -167,6 +176,25 @@ def _build_parser() -> argparse.ArgumentParser:
              "capacity shows up in a backtest.",
     )
     backtest.add_argument(
+        "--impact-participation-source", default="fixed", choices=["fixed", "adv"],
+        help=(
+            "Where the impact model's participation rate comes from. 'fixed' "
+            "(default) uses --impact-participation and needs no volume data "
+            "at all, which is what lets an index universe be backtested. "
+            "'adv' derives it from traded volume, falling back to the fixed "
+            "rate — and saying so — for any asset that has none."
+        ),
+    )
+    backtest.add_argument(
+        "--impact-adv-share", type=float, default=0.10, metavar="S",
+        help="Share of an asset's average daily traded notional this book is "
+             "willing to be, under --impact-participation-source adv.",
+    )
+    backtest.add_argument(
+        "--impact-adv-lookback", type=int, default=21, metavar="N",
+        help="Trailing periods averaged when computing ADV.",
+    )
+    backtest.add_argument(
         "--impact-participation", type=float, default=0.05, metavar="Q",
         help="Fraction of the book tradable in one name, in one period, "
              "without impact. Smaller means a thinner market.",
@@ -198,6 +226,8 @@ def _build_parser() -> argparse.ArgumentParser:
         "--output", help="Optional Excel path for the tearsheet frames."
     )
 
+    _add_ingest_arguments(backtest)
+
     check = sub.add_parser(
         "check",
         help="Validate data and constraints without solving. Reports data "
@@ -216,12 +246,42 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Remove K leading eigenvectors after denoising.",
     )
 
+    _add_ingest_arguments(check)
+
     describe = sub.add_parser(
         "describe", help="Explain one optimizer: what it needs and what it assumes."
     )
     describe.add_argument("name", help="Optimizer name (see list-optimizers).")
 
     sub.add_parser("list-optimizers", help="List available optimizer names.")
+
+    providers = sub.add_parser(
+        "providers",
+        help="List data providers, what each can serve, and whether its key is set.",
+    )
+    providers.add_argument(
+        "--json", action="store_true", help="Emit machine-readable JSON."
+    )
+    providers.add_argument(
+        "--env-file", help="Load API keys from this .env file before reporting."
+    )
+
+    ingest_cmd = sub.add_parser(
+        "ingest",
+        help="Fetch a price panel from a provider and write it to disk.",
+    )
+    _add_ingest_arguments(ingest_cmd)
+    ingest_cmd.add_argument(
+        "--output", default="prices.csv",
+        help="Where to write the close panel (.csv, .xlsx or .parquet).",
+    )
+    ingest_cmd.add_argument(
+        "--volume-output",
+        help=(
+            "Also write the volume panel here. Skipped with a note when the "
+            "universe carries no volume, which is the norm for indices."
+        ),
+    )
 
     fred = sub.add_parser("fred", help="Fetch one or more FRED series and write to disk.")
     fred.add_argument("series", help="Comma- or space-separated series ids (e.g. 'DGS10,VIXCLS').")
@@ -606,8 +666,135 @@ def _apply_estimator_flags(config, args: argparse.Namespace) -> None:
         config.detone = int(detone)
 
 
+
+
+#: Field presets exposed on the command line. ``close`` is the default because
+#: it is all the optimizer needs; ``ohlcv`` is what a capacity-aware backtest
+#: needs, and asking for it from a provider that has no volume fails loudly at
+#: preflight instead of quietly returning a short panel.
+_FIELD_PRESETS = {
+    "close": ingest_fields.PRICE_ONLY,
+    "ohlc": ingest_fields.OHLC,
+    "ohlcv": ingest_fields.OHLCV,
+}
+
+
+def _add_ingest_arguments(parser: argparse.ArgumentParser) -> None:
+    """Attach the multi-provider ingest flags to a subcommand.
+
+    Added to every command that needs a price panel, so switching a run from a
+    spreadsheet to a live provider is one flag rather than a different
+    workflow.
+    """
+    group = parser.add_argument_group("data ingest (multi-provider)")
+    group.add_argument(
+        "--provider",
+        help=(
+            "Data provider to fetch from: "
+            f"{', '.join(_provider_names())}. Requires --identifiers."
+        ),
+    )
+    group.add_argument(
+        "--identifiers",
+        help="Comma- or space-separated universe, e.g. 'SPY,AGG,GLD' or 'SP500,IPC'.",
+    )
+    group.add_argument("--ingest-start", help="Inclusive start date (YYYY-MM-DD).")
+    group.add_argument("--ingest-end", help="Inclusive end date (YYYY-MM-DD).")
+    group.add_argument(
+        "--ingest-period", default="5y",
+        help="Window when no start date is given (1y, 2y, 3y, 5y, 10y, 20y).",
+    )
+    group.add_argument(
+        "--ingest-interval", default="1d", choices=["1d", "1wk", "1mo"],
+        help="Bar size.",
+    )
+    group.add_argument(
+        "--ingest-fields", default="close", choices=sorted(_FIELD_PRESETS),
+        help=(
+            "Which fields to fetch. 'close' is enough to optimize and "
+            "backtest; 'ohlcv' adds the volume a capacity-aware cost model "
+            "needs, where the provider publishes it."
+        ),
+    )
+    group.add_argument(
+        "--ingest-currency",
+        help="Convert every series into this ISO currency (e.g. USD, MXN).",
+    )
+    group.add_argument(
+        "--require-volume", action="store_true",
+        help=(
+            "Fail when an instrument that should report volume does not. Off "
+            "by default: indices have no volume and are backtested from a "
+            "fixed participation rate instead."
+        ),
+    )
+    group.add_argument(
+        "--cache-dir",
+        help="Directory for the on-disk panel cache. Omit to disable caching.",
+    )
+    group.add_argument(
+        "--file-path",
+        help="Path read by the 'file' provider (CSV, Excel or Parquet).",
+    )
+    group.add_argument(
+        "--env-file", help="Load API keys from this .env file before fetching."
+    )
+
+
+def _provider_names() -> tuple[str, ...]:
+    from optimization_engine.ingest import available_providers
+
+    return available_providers()
+
+
+def _ingest_request_from(args: argparse.Namespace) -> IngestRequest:
+    """Build an :class:`IngestRequest` from the shared ingest flags."""
+    return IngestRequest(
+        identifiers=getattr(args, "identifiers", "") or "",
+        provider=args.provider,
+        start=getattr(args, "ingest_start", None),
+        end=getattr(args, "ingest_end", None),
+        period=None if getattr(args, "ingest_start", None) else args.ingest_period,
+        interval=args.ingest_interval,
+        fields=_FIELD_PRESETS[args.ingest_fields],
+        currency=getattr(args, "ingest_currency", None),
+        require_volume=bool(getattr(args, "require_volume", False)),
+        cache_dir=getattr(args, "cache_dir", None),
+    )
+
+
+def _run_ingest(args: argparse.Namespace):
+    """Fetch a panel and print the per-identifier outcome.
+
+    Returns the :class:`~optimization_engine.ingest.IngestResult` so callers
+    can take both the prices and the volume, which is what makes a
+    capacity-aware backtest possible from the command line.
+    """
+    if getattr(args, "env_file", None):
+        loaded = load_dotenv(args.env_file)
+        print(f"Loaded {loaded} variable(s) from {args.env_file}")
+
+    options = {}
+    if getattr(args, "file_path", None):
+        options["path"] = args.file_path
+
+    result = ingest(_ingest_request_from(args), **options)
+    print(f"Ingest: {result.summary()}")
+    for outcome in result.failed:
+        print(f"  ! {outcome.identifier}: {outcome.status} — {outcome.message}")
+    for note in result.warnings:
+        print(f"  · {note}")
+    return result
+
+
 def _load_prices_for(args: argparse.Namespace, config):
-    """Resolve the price panel from whichever source the flags name."""
+    """Resolve the price panel from whichever source the flags name.
+
+    ``--provider`` takes precedence over every legacy flag: it is the newer,
+    explicit path, and a run that names a provider means it.
+    """
+    if getattr(args, "provider", None):
+        return _run_ingest(args).prices
     if getattr(args, "yahoo", None):
         if args.yahoo_start:
             return load_prices_yahoo(
@@ -673,7 +860,12 @@ def _cmd_backtest(args: argparse.Namespace) -> int:
 
     config = load_config(args.config)
     _apply_estimator_flags(config, args)
-    prices = _load_prices_for(args, config)
+    # Fetching once keeps the prices and the volume from the same request, so
+    # a capacity-aware run cannot end up pricing impact off a different panel
+    # than the one it traded.
+    ingested = _run_ingest(args) if getattr(args, "provider", None) else None
+    prices = ingested.prices if ingested is not None else _load_prices_for(args, config)
+    volumes = ingested.volumes if ingested is not None else None
     returns = prices_to_returns(prices)
     if not config.expected_returns:
         config.expected_returns = {asset: 0.0 for asset in returns.columns}
@@ -684,12 +876,22 @@ def _cmd_backtest(args: argparse.Namespace) -> int:
             slippage_bps=args.slippage_bps,
             impact_coefficient=args.impact_eta,
             impact_participation=args.impact_participation,
+            impact_participation_source=args.impact_participation_source,
+            impact_adv_share=args.impact_adv_share,
+            impact_adv_lookback=args.impact_adv_lookback,
         ),
         execution_lag=args.execution_lag,
         periods_per_year=config.periods_per_year,
         name=Path(args.config).stem,
     )
     print(spec.describe())
+    if spec.costs.uses_volume and volumes is None:
+        print(
+            "  Liquidity: no volume panel available, so ADV-based impact "
+            "falls back to the fixed participation rate of "
+            f"{spec.costs.impact_participation:.1%}. Every affected trade is "
+            "listed in the run's degradation notes."
+        )
 
     evaluation = returns
     if args.holdout:
@@ -706,6 +908,8 @@ def _cmd_backtest(args: argparse.Namespace) -> int:
             rebalance_every=args.rebalance_every,
             spec=spec,
             expanding=args.expanding,
+            prices=prices,
+            volumes=volumes,
         )
     except ValueError as exc:
         print(f"Walk-forward failed: {exc}", file=sys.stderr)
@@ -858,6 +1062,99 @@ def _cmd_check(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_providers(args: argparse.Namespace) -> int:
+    """Show every provider, what it serves, and whether it is usable now.
+
+    The single most common failure in a multi-provider setup is asking a
+    provider for something it does not publish, or forgetting a key. Both are
+    visible here in one screen, before any run.
+    """
+    if getattr(args, "env_file", None):
+        load_dotenv(args.env_file)
+
+    rows = describe_providers()
+    if args.json:
+        import json
+
+        print(json.dumps(list(rows), indent=2, default=str))
+        return 0
+
+    print(f"{len(rows)} data providers\n")
+    for row in rows:
+        mark = "ready" if row["ready"] else "needs key"
+        print(f"  {row['provider']:<8} [{mark}]  {row['description']}")
+        print(
+            f"    fields:    {', '.join(f.removeprefix('m_') for f in row['fields'])}"
+        )
+        print(f"    intervals: {', '.join(row['intervals'])}")
+        print(
+            f"    volume:    {'yes' if row['serves_volume'] else 'no — index-style levels only'}"
+        )
+        print(f"    key:       {row['key_label']}")
+        if row["signup_url"]:
+            print(f"    sign up:   {row['signup_url']}")
+        if row["notes"]:
+            print(f"    note:      {row['notes']}")
+        print()
+    print(
+        "Set a key with the provider's environment variable, or put it in a "
+        ".env file and pass --env-file."
+    )
+    return 0
+
+
+def _cmd_ingest(args: argparse.Namespace) -> int:
+    """Fetch a panel and write it out, prices and volume separately."""
+    if not args.provider:
+        print("--provider is required for `ingest`.", file=sys.stderr)
+        return 2
+    if not args.identifiers:
+        print("--identifiers is required for `ingest`.", file=sys.stderr)
+        return 2
+
+    try:
+        result = _run_ingest(args)
+    except IngestError as exc:
+        print(f"Ingest error: {exc}", file=sys.stderr)
+        return 2
+
+    written = _write_panel(Path(args.output), result.prices)
+    if written is None:
+        return 2
+    print(f"Wrote {args.output} ({result.prices.shape[0]} rows × "
+          f"{result.prices.shape[1]} series)")
+
+    if args.volume_output:
+        volumes = result.volumes
+        if volumes is None:
+            print(
+                "No volume to write: this universe carries none. The backtest "
+                "will price impact from a fixed participation rate."
+            )
+        elif _write_panel(Path(args.volume_output), volumes) is not None:
+            print(f"Wrote {args.volume_output} ({volumes.shape[1]} series)")
+
+    print()
+    print(result.panel.coverage().to_string())
+    return 0 if result.is_complete else 1
+
+
+def _write_panel(path: Path, frame: pd.DataFrame) -> Path | None:
+    """Write a frame in the format its extension names."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    suffix = path.suffix.lower()
+    if suffix == ".csv":
+        frame.to_csv(path)
+    elif suffix in {".xlsx", ".xls"}:
+        frame.to_excel(path, sheet_name="Precios")
+    elif suffix == ".parquet":
+        frame.to_parquet(path)
+    else:
+        print(f"Unsupported output extension: {suffix}", file=sys.stderr)
+        return None
+    return path
+
+
 def _cmd_sample_data(args: argparse.Namespace) -> int:
     prices = sample_dataset(n_periods=args.periods)
     out = Path(args.output)
@@ -913,6 +1210,10 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_backtest(args)
     if args.command == "describe":
         return _cmd_describe(args)
+    if args.command == "providers":
+        return _cmd_providers(args)
+    if args.command == "ingest":
+        return _cmd_ingest(args)
     parser.print_help()
     return 1
 

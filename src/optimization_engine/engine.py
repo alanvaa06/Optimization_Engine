@@ -367,6 +367,8 @@ class EngineRun:
         spec: BacktestSpec | None = None,
         *,
         weights: pd.Series | None = None,
+        prices: pd.DataFrame | None = None,
+        volumes: pd.DataFrame | None = None,
     ) -> RunResult:
         """Replay the solved weights and return the full result bundle.
 
@@ -378,10 +380,21 @@ class EngineRun:
 
         Still in-sample unless the spec says otherwise — the optimizer saw
         this history.
+
+        Args:
+            spec: The run description.
+            weights: Targets to replay. Defaults to this run's solution.
+            prices: Close prices, needed only to convert share volume into
+                traded notional.
+            volumes: Traded volume per asset. Optional: without it the impact
+                model prices from a fixed participation rate, which is the
+                only thing available for an index universe.
         """
         spec = spec or BacktestSpec(periods_per_year=self.config.periods_per_year)
         target = self.result.weights if weights is None else weights
-        return run_backtest(self.returns, target, spec)
+        return run_backtest(
+            self.returns, target, spec, prices=prices, volumes=volumes
+        )
 
     def walk_forward_run(
         self,
@@ -391,12 +404,21 @@ class EngineRun:
         expanding: bool = False,
         solve: Callable[[pd.DataFrame], pd.Series] | None = None,
         reestimate_expected_returns: bool = True,
+        prices: pd.DataFrame | None = None,
+        volumes: pd.DataFrame | None = None,
     ) -> WalkForwardRun:
         """:meth:`walk_forward`, returning the full bundle instead of the digest.
 
         Same evaluation, same defaults; what differs is that the result
         carries the trade and cost frames and the provenance hashes, which is
         what :meth:`tearsheet` and the sweep need.
+
+        Args:
+            prices: Close prices, needed only to convert share volume into
+                traded notional.
+            volumes: Traded volume per asset. Optional everywhere: without it
+                the impact model prices from a fixed participation rate, which
+                is the only thing available for an index universe.
         """
         ppy = self.config.periods_per_year
         spec = spec or BacktestSpec(periods_per_year=ppy)
@@ -407,6 +429,8 @@ class EngineRun:
             rebalance_every=rebalance_every or max(ppy // 4, 1),
             spec=spec,
             expanding=expanding,
+            prices=prices,
+            volumes=volumes,
         )
 
     def tearsheet(

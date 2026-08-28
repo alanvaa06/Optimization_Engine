@@ -156,6 +156,18 @@ def load_prices_yahoo(
     return df
 
 
+def extract_field(raw: pd.DataFrame, field: str, tickers: list[str]) -> pd.DataFrame:
+    """Public entry point to yfinance's column normalization.
+
+    ``yf.download`` returns three different column layouts depending on how
+    many tickers were asked for and how they were grouped, and getting that
+    wrong silently transposes a panel. The ingest layer needs the same
+    normalization for every field of a single multi-field download, so the
+    logic is exposed here rather than reimplemented there.
+    """
+    return _extract_field(raw, field, tickers)
+
+
 def _extract_field(raw: pd.DataFrame, field: str, tickers: list[str]) -> pd.DataFrame:
     """Normalize yfinance's multi-shape output into a flat per-ticker frame."""
     if isinstance(raw.columns, pd.MultiIndex):
