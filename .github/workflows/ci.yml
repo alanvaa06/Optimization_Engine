@@ -77,8 +77,12 @@ jobs:
       # Drives the real page through Streamlit's AppTest harness. Without this
       # job the app tests would skip silently everywhere, since the matrix
       # above installs no UI extra.
+      #
+      # Globbed rather than listed: an enumerated list silently stops covering
+      # the file somebody adds next, and a test nothing runs is worse than no
+      # test, because it looks like coverage.
       - name: Test
-        run: pytest -q tests/test_app_layers.py tests/test_ui_state.py
+        run: pytest -q tests/test_app_*.py tests/test_ui_state.py
 
   smoke:
     name: CLI smoke test

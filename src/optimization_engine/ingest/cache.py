@@ -28,8 +28,13 @@ have held, written to a temporary name beside it and moved into place in one
 step: a reader sees the old entry or the new one, a second writer simply wins,
 and a reader already mid-read keeps the file it opened.
 
-The Zip is stored uncompressed — Parquet has already done that work, and
-deflating it again costs time to save almost nothing.
+Inside the Zip the frames are plain NumPy arrays rather than Parquet, and that
+is a dependency decision rather than a taste one. A cache is core behaviour —
+it turns on the moment a directory is named — so it must not require a package
+the project does not depend on. Parquet needs ``pyarrow``; NumPy is already a
+hard dependency, and a panel is always float64 values on a ``DatetimeIndex``,
+which ``.npy`` round-trips bit for bit. The index and the column names travel
+in the manifest beside them.
 """
 
 from __future__ import annotations
@@ -46,6 +51,7 @@ import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 from optimization_engine.ingest import fields as F
@@ -63,6 +69,9 @@ _FORMAT_VERSION = 2
 #: Suffix that marks a complete entry. A file only carries it at the instant
 #: it is whole, so a half-written one can never be mistaken for a hit.
 _SUFFIX = ".panel"
+
+#: Bare arrays do not self-compress the way Parquet does, so the Zip does it.
+_COMPRESSION = zipfile.ZIP_DEFLATED
 
 
 @dataclass(frozen=True)
@@ -91,9 +100,10 @@ class PanelCache:
     """Reads and writes :class:`PricePanel` objects under a directory.
 
     Each entry is one Zip file named by the request fingerprint, holding a
-    Parquet per field plus a JSON manifest with the provenance and the write
-    time. Parquet keeps the dtypes and the ``DatetimeIndex`` intact, which CSV
-    does not; the single file is what makes publishing atomic.
+    NumPy array per field plus a JSON manifest with the index, the column
+    names, the provenance and the write time. The single file is what makes
+    publishing atomic; NumPy is what keeps the entry free of any dependency
+    the project does not already have.
     """
 
     def __init__(self, directory: str | Path, ttl_seconds: int = 24 * 60 * 60) -> None:
@@ -125,8 +135,19 @@ class PanelCache:
                 if self.ttl_seconds and age > self.ttl_seconds:
                     return None
 
+                index = pd.DatetimeIndex(
+                    np.asarray(manifest["index"], dtype="int64").astype(
+                        manifest.get("index_dtype", "datetime64[ns]")
+                    ),
+                    name="date",
+                )
+                columns = list(manifest["identifiers"])
                 frames = {
-                    name: pd.read_parquet(io.BytesIO(archive.read(f"{name}.parquet")))
+                    name: pd.DataFrame(
+                        np.load(io.BytesIO(archive.read(f"{name}.npy"))),
+                        index=index,
+                        columns=columns,
+                    )
                     for name in manifest["fields"]
                 }
 
@@ -194,12 +215,24 @@ class PanelCache:
 
     @staticmethod
     def _write_archive(stream, panel: PricePanel) -> None:
-        """Serialize a panel into an open binary stream as a Zip."""
+        """Serialize a panel into an open binary stream as a Zip.
+
+        The index is stored once, as nanoseconds since the epoch, because every
+        field frame shares it — :meth:`PricePanel.from_frames` guarantees that,
+        and :meth:`PricePanel.validate` enforces it.
+        """
+        index = panel.index
         manifest = {
             "format_version": _FORMAT_VERSION,
             "written_at": time.time(),
             "fields": list(panel.frames),
             "identifiers": list(panel.identifiers),
+            # The unit travels with the values: pandas builds an index at
+            # microsecond or nanosecond resolution depending on how it was
+            # constructed, and a panel that comes back at a different one is
+            # not the panel that went in.
+            "index": index.view("int64").tolist(),
+            "index_dtype": str(index.dtype),
             "meta": {
                 identifier: {
                     "provider_symbol": record.provider_symbol,
@@ -212,12 +245,12 @@ class PanelCache:
                 for identifier, record in panel.meta.items()
             },
         }
-        with zipfile.ZipFile(stream, "w", compression=zipfile.ZIP_STORED) as archive:
-            archive.writestr(_MANIFEST, json.dumps(manifest, indent=2))
+        with zipfile.ZipFile(stream, "w", compression=_COMPRESSION) as archive:
+            archive.writestr(_MANIFEST, json.dumps(manifest))
             for name, frame in panel.frames.items():
                 buffer = io.BytesIO()
-                frame.to_parquet(buffer)
-                archive.writestr(f"{name}.parquet", buffer.getvalue())
+                np.save(buffer, frame.to_numpy(dtype="float64"))
+                archive.writestr(f"{name}.npy", buffer.getvalue())
 
     def clear(self) -> int:
         """Delete every entry. Returns how many were removed.

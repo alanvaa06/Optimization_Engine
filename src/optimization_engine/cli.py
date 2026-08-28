@@ -1186,7 +1186,12 @@ def _cmd_ingest(args: argparse.Namespace) -> int:
 
 
 def _write_panel(path: Path, frame: pd.DataFrame) -> Path | None:
-    """Write a frame in the format its extension names."""
+    """Write a frame in the format its extension names.
+
+    Parquet is the one format that needs a package the project does not depend
+    on, so a missing engine is reported as the install it needs rather than as
+    pandas' own two-paragraph ImportError.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     suffix = path.suffix.lower()
     if suffix == ".csv":
@@ -1194,7 +1199,16 @@ def _write_panel(path: Path, frame: pd.DataFrame) -> Path | None:
     elif suffix in {".xlsx", ".xls"}:
         frame.to_excel(path, sheet_name="Precios")
     elif suffix == ".parquet":
-        frame.to_parquet(path)
+        try:
+            frame.to_parquet(path)
+        except ImportError:
+            print(
+                "Writing Parquet needs pyarrow, which is not installed. "
+                'Install it with: pip install -e ".[data]" — or write .csv '
+                "or .xlsx instead.",
+                file=sys.stderr,
+            )
+            return None
     else:
         print(f"Unsupported output extension: {suffix}", file=sys.stderr)
         return None

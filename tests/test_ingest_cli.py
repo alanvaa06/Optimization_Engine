@@ -67,8 +67,8 @@ def test_ingest_writes_a_panel_and_prints_its_coverage(tmp_path, capsys):
 
 
 def test_ingest_writes_volume_when_the_universe_has_it(tmp_path):
-    prices = tmp_path / "p.parquet"
-    volume = tmp_path / "v.parquet"
+    prices = tmp_path / "p.csv"
+    volume = tmp_path / "v.csv"
     code = main([
         "ingest", "--provider", "sample", "--identifiers", "AAA,BBB",
         "--ingest-period", "1y", "--ingest-fields", "ohlcv",
@@ -76,7 +76,26 @@ def test_ingest_writes_volume_when_the_universe_has_it(tmp_path):
     ])
     assert code == 0
     assert volume.is_file()
-    assert pd.read_parquet(volume).notna().any().any()
+    written = pd.read_csv(volume, index_col=0, parse_dates=True)
+    assert list(written.columns) == ["AAA", "BBB"]
+    assert written.notna().any().any()
+
+
+def test_parquet_output_without_an_engine_names_the_install(tmp_path, capsys, monkeypatch):
+    # pandas raises a two-paragraph ImportError listing two packages it tried.
+    # What the caller needs is the one command that fixes it.
+    def no_engine(*_args, **_kwargs):
+        raise ImportError("Unable to find a usable engine")
+
+    monkeypatch.setattr(pd.DataFrame, "to_parquet", no_engine)
+    code = main([
+        "ingest", "--provider", "sample", "--identifiers", "AAA",
+        "--ingest-period", "1y", "--output", str(tmp_path / "p.parquet"),
+    ])
+    assert code == 2
+    err = capsys.readouterr().err
+    assert "pyarrow" in err
+    assert '.[data]' in err
 
 
 def test_ingest_says_so_rather_than_writing_an_empty_volume_file(tmp_path, capsys):
