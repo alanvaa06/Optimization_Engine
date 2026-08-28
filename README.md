@@ -424,6 +424,29 @@ skipping the period would delete a real cost from the track record.
 `compare_in_and_out_of_sample()` puts the two track records side by side with
 the degradation between them.
 
+**The two cadences are separate arguments**, because they are separate
+decisions. `rebalance_every` is how often the optimizer *re-solves* — how stale
+the desk is willing to let its view get. `rebalance_frequency` is how often the
+book is *traded back* to whichever target is current — how far it is willing to
+let the weights drift from that view. A quarterly investment committee running
+a monthly rebalancing discipline re-solves four times a year and trades twelve,
+and tying the two together understates that policy's turnover:
+
+```python
+walk = run.walk_forward_run(
+    rebalance_every=63,            # re-optimize quarterly (daily panel)
+    rebalance_frequency="monthly", # but pull the book back monthly
+)
+print(walk.n_resolves)      # 4 a year: how often the view was refreshed
+print(walk.n_trade_dates)   # 12 a year: how often it was actually traded
+```
+
+`rebalance_frequency` defaults to `"none"` — hold each solution untouched until
+the next one — so a run only pays for the extra trading when it asks for it.
+Passing nothing leaves the trading calendar to the spec's own `frequency`, and
+an explicit argument overrides the spec; nothing is silently discarded either
+way. On the command line the pair is `--rebalance-every N --rebalance CADENCE`.
+
 On top of the core:
 
 * `compute_tca()` — the cost panel. A total is uninformative on its own, so it
@@ -726,11 +749,12 @@ print(deflated_sharpe_ratio(wf.returns, n_trials=40).describe())
 from optimization_engine import BacktestSpec, CostSpec, SweepSpec
 
 spec = BacktestSpec(
-    frequency="monthly",
+    frequency="monthly",              # the trading calendar, honoured as written
     costs=CostSpec(commission_bps=8, slippage_bps=4, impact_coefficient=0.4),
     execution_lag=1,
 )
-walk = run.walk_forward_run(spec=spec)
+walk = run.walk_forward_run(spec=spec, rebalance_every=63)
+print(walk.describe())                # re-solves vs. trade dates, side by side
 print(walk.run.meta.result_hash)      # same spec + same data => same hash
 print(walk.run.trades.head())         # per-asset fills with the cost split
 print(walk.weight_stability())        # is the optimizer chasing noise?

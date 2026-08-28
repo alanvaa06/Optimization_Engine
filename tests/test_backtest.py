@@ -169,6 +169,48 @@ def test_walk_forward_carries_weights_forward_when_a_solve_fails(returns):
     assert wf.n_rebalances == len(wf.windows)
 
 
+def test_walk_forward_reports_the_dates_it_actually_traded(returns):
+    """It used to report a single date, making every walk-forward look like one purchase."""
+    wf = walk_forward_backtest(
+        returns, _solver(), lookback=504, rebalance_every=126,
+        rebalance_frequency="monthly",
+    )
+    assert wf.n_trade_dates > wf.n_resolves
+    assert len(wf.backtest.rebalance_dates) == wf.n_trade_dates
+    assert wf.backtest.rebalance_dates[0] == wf.backtest.returns.index[0]
+
+
+def test_the_scalar_form_still_trades_only_when_it_re_solves(returns):
+    """The four-positional-argument form has never rebalanced in between."""
+    wf = walk_forward_backtest(
+        returns, _solver(), lookback=504, rebalance_every=126,
+        transaction_cost_bps=10,
+    )
+    assert wf.backtest.metadata["rebalance_frequency"] == "none"
+    assert wf.n_trade_dates == wf.n_resolves
+
+
+def test_engine_walk_forward_separates_the_two_cadences(returns):
+    config = EngineConfig(optimizer=OptimizerSpec(name="min_variance"))
+    run = run_engine(returns, config, check_feasibility=False)
+
+    drifting = run.walk_forward(
+        lookback=504, rebalance_every=126, transaction_cost_bps=10
+    )
+    disciplined = run.walk_forward(
+        lookback=504, rebalance_every=126, transaction_cost_bps=10,
+        rebalance_frequency="monthly",
+    )
+
+    assert disciplined.n_resolves == drifting.n_resolves
+    assert disciplined.n_trade_dates > drifting.n_trade_dates
+    assert (
+        disciplined.backtest.annualized_turnover
+        > drifting.backtest.annualized_turnover
+    )
+    assert disciplined.backtest.total_cost > drifting.backtest.total_cost
+
+
 def test_walk_forward_requires_enough_history(returns):
     with pytest.raises(ValueError, match="out of sample"):
         walk_forward_backtest(
