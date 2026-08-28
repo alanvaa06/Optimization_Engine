@@ -176,6 +176,20 @@ class CostSpec:
                 "min_adv_observations must be at least 1; "
                 f"got {self.min_adv_observations}."
             )
+        if self.min_impact_observations > self.impact_volatility_lookback:
+            raise SpecValidationError(
+                "min_impact_observations "
+                f"({self.min_impact_observations}) exceeds "
+                f"impact_volatility_lookback ({self.impact_volatility_lookback}), "
+                "so the volatility estimate can never be computed and every "
+                "trade would degrade to zero impact."
+            )
+        if self.min_adv_observations > self.impact_adv_lookback:
+            raise SpecValidationError(
+                f"min_adv_observations ({self.min_adv_observations}) exceeds "
+                f"impact_adv_lookback ({self.impact_adv_lookback}), so the ADV "
+                "estimate can never be computed."
+            )
         if not 0.0 < self.impact_adv_share <= 1.0:
             raise SpecValidationError(
                 "impact_adv_share is the share of daily volume this book is "

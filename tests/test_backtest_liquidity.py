@@ -515,16 +515,19 @@ def test_a_directly_passed_model_uses_its_own_share_of_volume():
     returns = _returns()
     prices, volumes = _prices(returns), _volumes(returns)
     weights = pd.Series(0.5, index=returns.columns)
-    spec = BacktestSpec(frequency="monthly", initial_capital=CAPITAL)
+    # A spec whose own share is nothing like either model's, to prove neither
+    # run is quietly reading it.
+    spec = BacktestSpec(
+        frequency="monthly",
+        initial_capital=CAPITAL,
+        costs=CostSpec(impact_adv_share=0.02),
+    )
 
-    class _Greedy(SquareRootImpactCost):
-        adv_share = 0.5
-
-    class _Timid(SquareRootImpactCost):
-        adv_share = 0.01
-
-    def cost(cls):
-        model = cls(eta=1.0, participation=0.05, participation_source="adv")
+    def cost(share: float) -> float:
+        model = SquareRootImpactCost(
+            eta=1.0, participation=0.05, participation_source="adv",
+            adv_share=share,
+        )
         run = run_backtest(
             returns, weights, spec, cost_model=model, prices=prices, volumes=volumes
         )
@@ -532,4 +535,116 @@ def test_a_directly_passed_model_uses_its_own_share_of_volume():
 
     # Taking a larger share of the day's volume means more capacity, so less
     # impact for the same trade.
-    assert cost(_Greedy) < cost(_Timid)
+    assert cost(0.5) < cost(0.01)
+
+
+# ---------------------------------------------------------------------------
+# Every parameter of the charge belongs to the model, not to the run
+# ---------------------------------------------------------------------------
+
+
+def test_the_spec_hands_every_cost_parameter_to_the_model_it_builds():
+    from optimization_engine.backtest import build_cost_model, context_request
+
+    wanted = context_request(
+        build_cost_model(
+            CostSpec(
+                impact_coefficient=0.5,
+                impact_participation_source="adv",
+                impact_volatility_lookback=40,
+                min_impact_observations=9,
+                impact_adv_lookback=17,
+                min_adv_observations=4,
+                impact_adv_share=0.33,
+            )
+        )
+    )
+    assert wanted.volatility_lookback == 40
+    assert wanted.volatility_min_observations == 9
+    assert wanted.participation_lookback == 17
+    assert wanted.participation_min_observations == 4
+    assert wanted.adv_share == pytest.approx(0.33)
+
+
+def test_an_injected_models_observation_minimums_are_not_overridden_by_the_spec():
+    """The asymmetry this whole arrangement exists to remove.
+
+    The runner used to take the lookbacks from the model and the observation
+    minimums from the spec, so a model asking for a two-observation floor got
+    the spec's twenty-one — and quietly priced nothing for the first three
+    weeks of every run.
+    """
+    from optimization_engine.backtest import context_request
+
+    model = SquareRootImpactCost(
+        eta=1.0, participation=0.05, participation_source="adv",
+        lookback=5, min_observations=2, adv_lookback=3, min_adv_observations=2,
+    )
+    wanted = context_request(model)
+    assert wanted.volatility_min_observations == 2
+    assert wanted.participation_min_observations == 2
+
+
+def test_an_injected_models_observation_floor_changes_what_gets_charged():
+    # The observable consequence. Two models identical but for the floor: the
+    # permissive one can price trades the strict one degrades to zero impact.
+    # Before the fix both ran on the spec's floor and were indistinguishable.
+    returns = _returns(120)
+    prices, volumes = _prices(returns), _volumes(returns)
+    weights = pd.Series(0.5, index=returns.columns)
+    spec = BacktestSpec(frequency="weekly", initial_capital=CAPITAL, costs=CostSpec())
+
+    def cost(min_observations: int) -> float:
+        model = SquareRootImpactCost(
+            eta=1.0, participation=0.05, participation_source="adv",
+            lookback=20, min_observations=min_observations,
+            adv_lookback=5, min_adv_observations=2,
+        )
+        run = run_backtest(
+            returns, weights, spec, cost_model=model, prices=prices, volumes=volumes
+        )
+        return float(run.costs["total"].sum())
+
+    assert cost(2) > cost(19)
+
+
+def test_a_cost_model_predating_these_fields_gets_documented_defaults():
+    # ``cost_model=`` is public, so a model written against the older protocol
+    # — two lookback methods and charge() — must keep working.
+    from optimization_engine.backtest import ContextRequest, context_request
+
+    class Legacy:
+        def volatility_lookback(self) -> int:
+            return 10
+
+        def charge(self, *, asset, traded_weight, context):  # pragma: no cover
+            raise NotImplementedError
+
+    wanted = context_request(Legacy())
+    assert wanted.volatility_lookback == 10
+    assert wanted.participation_lookback == 0
+    assert wanted.volatility_min_observations == ContextRequest.volatility_min_observations
+    assert wanted.adv_share == ContextRequest.adv_share
+
+
+def test_a_floor_a_window_can_never_reach_is_refused_by_the_spec():
+    with pytest.raises(SpecValidationError, match="min_impact_observations"):
+        CostSpec(impact_volatility_lookback=20, min_impact_observations=60)
+    with pytest.raises(SpecValidationError, match="min_adv_observations"):
+        CostSpec(impact_adv_lookback=5, min_adv_observations=10)
+
+
+def test_a_floor_a_window_can_never_reach_is_refused_for_an_injected_model():
+    # pandas reports this from three frames down as "min_periods 60 must be <=
+    # window 20", naming neither the model nor which of its two windows.
+    from optimization_engine.backtest import context_request
+
+    model = SquareRootImpactCost(lookback=20, min_observations=60)
+    with pytest.raises(ValueError, match="volatility window is 20"):
+        context_request(model)
+
+    model = SquareRootImpactCost(
+        participation_source="adv", adv_lookback=5, min_adv_observations=10
+    )
+    with pytest.raises(ValueError, match="traded-volume window is 5"):
+        context_request(model)

@@ -84,6 +84,97 @@ class MarketContext:
 
 
 @dataclass(frozen=True)
+class ContextRequest:
+    """The windows a cost model needs computed before it can price a trade.
+
+    Every number here parameterizes the charge, so every one belongs to the
+    *model* rather than to the run. That distinction is not pedantic: a model
+    handed to :func:`~optimization_engine.backtest.runner.run_backtest`
+    through ``cost_model=`` never passes through
+    :func:`build_cost_model`, so anything the runner reads off the spec
+    instead is silently somebody else's number — the caller sets a
+    five-observation minimum and gets twenty-one.
+
+    Attributes:
+        volatility_lookback: Trailing periods for the volatility estimate, or
+            ``0`` when the model does not use one.
+        volatility_min_observations: Below this the estimate is not used.
+        participation_lookback: Trailing periods of traded volume, or ``0``.
+        participation_min_observations: Below this the ADV is not used.
+        adv_share: The fraction of average daily traded notional this book is
+            willing to be.
+    """
+
+    volatility_lookback: int = 0
+    volatility_min_observations: int = 2
+    participation_lookback: int = 0
+    participation_min_observations: int = 1
+    adv_share: float = 1.0
+
+
+def context_request(model: CostModel) -> ContextRequest:
+    """Ask a cost model what it needs computed for it.
+
+    Read through :func:`getattr` rather than as protocol methods, so a cost
+    model written before any of these existed — the whole point of
+    ``cost_model=`` being public — keeps working and simply gets the
+    defaults. The two lookbacks are the exception: those have always been
+    part of the protocol, so they are called directly where present.
+    """
+    volatility_lookback = int(_call(model, "volatility_lookback", 0))
+    participation_lookback = int(_call(model, "participation_lookback", 0))
+    request = ContextRequest(
+        volatility_lookback=volatility_lookback,
+        volatility_min_observations=int(
+            getattr(model, "min_observations", ContextRequest.volatility_min_observations)
+        ),
+        participation_lookback=participation_lookback,
+        participation_min_observations=int(
+            getattr(
+                model,
+                "min_adv_observations",
+                ContextRequest.participation_min_observations,
+            )
+        ),
+        adv_share=float(getattr(model, "adv_share", ContextRequest.adv_share)),
+    )
+    _reject_impossible_windows(model, request)
+    return request
+
+
+def _reject_impossible_windows(model: object, request: ContextRequest) -> None:
+    """Fail on a floor a window can never reach, before pandas does.
+
+    A minimum above its own lookback describes an estimate that can never be
+    computed. Left alone it surfaces from three frames inside pandas as
+    ``min_periods 60 must be <= window 20``, which says nothing about which
+    cost model was misconfigured or which of its two windows.
+    """
+    name = type(model).__name__
+    for window, floor, label in (
+        (request.volatility_lookback, request.volatility_min_observations, "volatility"),
+        (
+            request.participation_lookback,
+            request.participation_min_observations,
+            "traded-volume",
+        ),
+    ):
+        if window > 0 and floor > window:
+            raise ValueError(
+                f"{name}'s {label} window is {window} periods but it will not "
+                f"use an estimate with fewer than {floor} observations, so the "
+                "estimate can never be computed. Lower the minimum or lengthen "
+                "the window."
+            )
+
+
+def _call(model: object, name: str, default: int) -> int:
+    """Call a zero-argument model method, or return ``default`` if absent."""
+    method = getattr(model, name, None)
+    return default if method is None else method()
+
+
+@dataclass(frozen=True)
 class CostQuote:
     """What one trade costs, split into its economically distinct pieces.
 
@@ -192,6 +283,11 @@ class SquareRootImpactCost:
     #: :attr:`participation` when there is none.
     participation_source: str = "fixed"
     adv_lookback: int = 21
+    #: The share of an asset's average daily traded notional this book is
+    #: willing to be. Lives here, not on the spec, because it parameterizes
+    #: the charge this model computes — see :func:`context_request`.
+    adv_share: float = 0.10
+    min_adv_observations: int = 5
 
     def volatility_lookback(self) -> int:
         return int(self.lookback)
@@ -285,6 +381,8 @@ def build_cost_model(costs: CostSpec) -> CostModel:
         min_observations=int(costs.min_impact_observations),
         participation_source=str(costs.impact_participation_source),
         adv_lookback=int(costs.impact_adv_lookback),
+        adv_share=float(costs.impact_adv_share),
+        min_adv_observations=int(costs.min_adv_observations),
     )
 
 
@@ -352,6 +450,7 @@ def trailing_dollar_volume(
 
 
 __all__ = [
+    "ContextRequest",
     "CostModel",
     "CostQuote",
     "LinearCost",
@@ -359,6 +458,7 @@ __all__ = [
     "SquareRootImpactCost",
     "ZeroCost",
     "build_cost_model",
+    "context_request",
     "trailing_dollar_volume",
     "trailing_volatilities",
 ]

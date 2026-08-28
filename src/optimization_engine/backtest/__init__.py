@@ -39,6 +39,7 @@ Everything else is arranged around it:
 
 from optimization_engine.backtest.calendar import execution_positions, rebalance_dates
 from optimization_engine.backtest.costs import (
+    ContextRequest,
     CostModel,
     CostQuote,
     LinearCost,
@@ -46,6 +47,7 @@ from optimization_engine.backtest.costs import (
     SquareRootImpactCost,
     ZeroCost,
     build_cost_model,
+    context_request,
     trailing_dollar_volume,
     trailing_volatilities,
 )
@@ -100,6 +102,7 @@ __all__ = [
     "REPEATED",
     "SHIFTED_HOLDOUT",
     "BacktestSpec",
+    "ContextRequest",
     "CostModel",
     "CostQuote",
     "MIN_ADV_CAPITAL",
@@ -126,6 +129,7 @@ __all__ = [
     "ZeroCost",
     "assert_within_holdout",
     "build_cost_model",
+    "context_request",
     "build_tearsheet",
     "compute_position_stats",
     "compute_result_hash",

@@ -35,6 +35,7 @@ from optimization_engine.backtest.costs import (
     CostModel,
     MarketContext,
     build_cost_model,
+    context_request,
     trailing_dollar_volume,
     trailing_volatilities,
 )
@@ -50,11 +51,6 @@ from optimization_engine.backtest.spec import MIN_ADV_CAPITAL, BacktestSpec
 
 #: Traded fractions below this are float residue, not orders.
 _TRADE_EPS = 1e-12
-
-def _no_lookback() -> int:
-    """Default for cost models written before ADV pricing existed."""
-    return 0
-
 
 #: Cap on distinct degradation reasons carried on the meta. The reasons are a
 #: diagnostic, not a log file; a run that degrades on every trade needs to say
@@ -137,39 +133,43 @@ def run_backtest(
     schedule = _as_schedule(weights, assets, index[0])
     model = cost_model if cost_model is not None else build_cost_model(spec.costs)
 
-    lookback = int(model.volatility_lookback())
+    # Every number that parameterizes the charge comes from the model, never
+    # from the spec. The spec's cost fields have already done their job by
+    # building the model; reading them again here would mean a model handed in
+    # through ``cost_model=`` — which never passes through
+    # ``build_cost_model`` — quietly ran on somebody else's numbers.
+    wanted = context_request(model)
+
     volatility = None
-    if lookback > 0:
+    if wanted.volatility_lookback > 0:
         history = returns if context_returns is None else context_returns
         volatility = trailing_volatilities(
-            history, lookback, spec.costs.min_impact_observations
+            history, wanted.volatility_lookback, wanted.volatility_min_observations
         ).reindex(index=index, columns=assets)
 
-    # Traded notional is computed only when a model actually asks for it, so a
-    # universe with no volume — the common case for indices — costs nothing
-    # and behaves identically to one that was never offered any.
-    adv_lookback = int(getattr(model, "participation_lookback", _no_lookback)())
-    if adv_lookback > 0 and float(spec.initial_capital) < MIN_ADV_CAPITAL:
-        # The spec validates this too, but a caller can hand in a cost model
-        # directly and bypass the spec entirely — and this is the one place
-        # every route converges on. Left through, an ADV charge against a
-        # one-currency-unit book rounds to zero and reads as proof the
-        # strategy has no capacity limit.
+    if wanted.participation_lookback > 0 and float(spec.initial_capital) < MIN_ADV_CAPITAL:
+        # Fund size is genuinely the run's, not the model's, so it does stay on
+        # the spec — and this is the one place every route converges on. Left
+        # through, an ADV charge against a one-currency-unit book rounds to
+        # zero and reads as proof the strategy has no capacity limit.
         raise ValueError(
             "This cost model prices impact from traded volume, which needs a "
             f"real fund size: initial_capital is {spec.initial_capital:g}. "
             "Set it to the capital being deployed."
         )
+
+    # Traded notional is computed only when a model actually asks for it, so a
+    # universe with no volume — the common case for indices — costs nothing
+    # and behaves identically to one that was never offered any.
     adv_notional = None
-    if adv_lookback > 0 and volumes is not None and prices is not None:
+    if wanted.participation_lookback > 0 and volumes is not None and prices is not None:
         adv_notional = trailing_dollar_volume(
-            prices, volumes, adv_lookback, spec.costs.min_adv_observations
+            prices,
+            volumes,
+            wanted.participation_lookback,
+            wanted.participation_min_observations,
         ).reindex(index=index, columns=assets)
-    # A model supplied directly owns its own share of volume; only fall back
-    # to the spec's for the models this library builds from it.
-    adv_share = float(
-        getattr(model, "adv_share", spec.costs.impact_adv_share)
-    )
+    adv_share = wanted.adv_share
 
     marks = rebalance_dates(index, spec.frequency)
     # A schedule date is always a decision: the walk-forward runner only emits
