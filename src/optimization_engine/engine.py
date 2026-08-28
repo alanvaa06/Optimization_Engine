@@ -309,16 +309,18 @@ class EngineRun:
         expanding: bool = False,
         solve: Callable[[pd.DataFrame], pd.Series] | None = None,
         reestimate_expected_returns: bool = True,
+        rebalance_frequency: RebalanceFrequency | None = None,
     ) -> WalkForwardResult:
         """Out-of-sample evaluation: re-estimate and re-solve on a rolling window.
 
-        Defaults to a two-year lookback rebalanced quarterly, scaled by
+        Defaults to a two-year lookback re-solved quarterly, scaled by
         ``periods_per_year`` so the same call works for daily, weekly or
         monthly data.
 
         Args:
             lookback: Estimation window in periods. Defaults to two years.
-            rebalance_every: Periods between re-solves. Defaults to one quarter.
+            rebalance_every: Periods between **re-solves** — how often the
+                optimizer sees new data. Defaults to one quarter.
             transaction_cost_bps: One-way cost on traded notional.
             expanding: Grow the window from the start instead of rolling it.
             solve: Override the solver. Defaults to re-running this run's own
@@ -338,6 +340,13 @@ class EngineRun:
                 forward-looking capital-market assumptions rather than
                 estimates from this history; then holding them fixed is right,
                 and the engine cannot tell the two cases apart on its own.
+            rebalance_frequency: How often the book is **traded back** to the
+                current target *between* re-solves — the rebalancing cadence,
+                which is a different decision from ``rebalance_every``. A
+                committee that re-solves quarterly but rebalances monthly
+                passes ``rebalance_every=63, rebalance_frequency="monthly"``
+                on a daily panel. Defaults to ``"none"``: hold each solution
+                untouched until the next one, letting the weights drift.
         """
         ppy = self.config.periods_per_year
         lookback = lookback or max(2 * ppy, 24)
@@ -354,6 +363,7 @@ class EngineRun:
             transaction_cost_bps=transaction_cost_bps,
             periods_per_year=ppy,
             expanding=expanding,
+            rebalance_frequency=rebalance_frequency,
         )
         result.backtest.metadata["reestimated_expected_returns"] = bool(
             reestimate_expected_returns
@@ -391,15 +401,23 @@ class EngineRun:
         expanding: bool = False,
         solve: Callable[[pd.DataFrame], pd.Series] | None = None,
         reestimate_expected_returns: bool = True,
+        rebalance_frequency: RebalanceFrequency | None = None,
     ) -> WalkForwardRun:
         """:meth:`walk_forward`, returning the full bundle instead of the digest.
 
         Same evaluation, same defaults; what differs is that the result
         carries the trade and cost frames and the provenance hashes, which is
         what :meth:`tearsheet` and the sweep need.
+
+        ``rebalance_every`` is the re-optimization cadence and
+        ``rebalance_frequency`` — or, if that is not given, the spec's own
+        ``frequency`` — is the trading cadence. With no spec and no argument
+        the book trades only when it re-solves.
         """
         ppy = self.config.periods_per_year
-        spec = spec or BacktestSpec(periods_per_year=ppy)
+        # An explicit "none" rather than the spec default: a caller who never
+        # mentioned a trading cadence has not asked to pay for one.
+        spec = spec or BacktestSpec(periods_per_year=ppy, frequency="none")
         return walk_forward_run(
             self.returns,
             solve or self._window_solver(reestimate_expected_returns),
@@ -407,6 +425,7 @@ class EngineRun:
             rebalance_every=rebalance_every or max(ppy // 4, 1),
             spec=spec,
             expanding=expanding,
+            rebalance_frequency=rebalance_frequency,
         )
 
     def tearsheet(
@@ -444,6 +463,7 @@ class EngineRun:
         spec: BacktestSpec | None = None,
         expanding: bool = False,
         progress: Callable[[int, int], None] | None = None,
+        rebalance_frequency: RebalanceFrequency | None = None,
     ) -> SweepResults:
         """Walk-forward every cell of a grid, and count the trials.
 
@@ -453,7 +473,7 @@ class EngineRun:
         the deflated Sharpe and the overfitting probability both need.
         """
         ppy = self.config.periods_per_year
-        run_spec = spec or BacktestSpec(periods_per_year=ppy)
+        run_spec = spec or BacktestSpec(periods_per_year=ppy, frequency="none")
         window = lookback or max(2 * ppy, 24)
         step = rebalance_every or max(ppy // 4, 1)
 
@@ -475,6 +495,7 @@ class EngineRun:
                 rebalance_every=step,
                 spec=run_spec,
                 expanding=expanding,
+                rebalance_frequency=rebalance_frequency,
             ).returns
 
         return run_sweep(

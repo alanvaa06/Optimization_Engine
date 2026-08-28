@@ -289,6 +289,116 @@ def test_walk_forward_records_failures_as_rows(returns):
     assert "solver gave up" in walk.failures[0]
 
 
+# -- the two cadences -------------------------------------------------------
+
+
+def _inverse_vol(window: pd.DataFrame) -> pd.Series:
+    """A cheap, always-feasible solver, so these tests measure the calendar."""
+    inverse = 1.0 / window.std()
+    return inverse / inverse.sum()
+
+
+def test_the_trading_cadence_is_separate_from_the_resolve_cadence(returns):
+    """Rebalancing more often than you re-optimize must be expressible.
+
+    A quarterly investment committee running a monthly rebalancing discipline
+    re-solves four times a year and trades twelve. Tying the two together
+    understates that policy's turnover, which is the whole cost of the
+    discipline.
+    """
+    spec = BacktestSpec(costs=CostSpec(commission_bps=10))
+    drifting = walk_forward_run(
+        returns, _inverse_vol, lookback=252, rebalance_every=126,
+        spec=spec, rebalance_frequency="none",
+    )
+    disciplined = walk_forward_run(
+        returns, _inverse_vol, lookback=252, rebalance_every=126,
+        spec=spec, rebalance_frequency="monthly",
+    )
+
+    # Same optimizer, same windows, same solved targets: only the calendar
+    # on which the book is pulled back to them differs.
+    assert disciplined.n_resolves == drifting.n_resolves
+    pd.testing.assert_frame_equal(
+        disciplined.weights_history, drifting.weights_history
+    )
+
+    assert disciplined.n_trade_dates > drifting.n_trade_dates
+    assert disciplined.run.turnover.sum() > drifting.run.turnover.sum()
+    assert disciplined.run.total_cost > drifting.run.total_cost
+
+
+def test_a_finer_trading_cadence_holds_the_book_nearer_its_target(returns):
+    """The point of rebalancing is less drift, and it should be measurable."""
+    spec = BacktestSpec(costs=CostSpec())
+
+    def drift_from_target(walk) -> float:
+        held = walk.run.weights
+        targets = walk.run.targets.reindex(held.index, method="ffill")
+        return float((held - targets).abs().sum(axis=1).mean())
+
+    drifting = walk_forward_run(
+        returns, _inverse_vol, lookback=252, rebalance_every=252,
+        spec=spec, rebalance_frequency="none",
+    )
+    pinned = walk_forward_run(
+        returns, _inverse_vol, lookback=252, rebalance_every=252,
+        spec=spec, rebalance_frequency="daily",
+    )
+    assert drift_from_target(pinned) < drift_from_target(drifting)
+
+
+def test_a_spec_frequency_is_no_longer_silently_overridden(returns):
+    """Asking for quarterly rebalancing used to be dropped without a word."""
+    spec = BacktestSpec(frequency="quarterly", costs=CostSpec(commission_bps=10))
+    walk = walk_forward_run(
+        returns, _inverse_vol, lookback=252, rebalance_every=126, spec=spec
+    )
+    assert walk.rebalance_frequency == "quarterly"
+    # And the spec stamped on the result — the thing the hash is taken over —
+    # says what was actually simulated.
+    assert walk.run.meta.spec["frequency"] == "quarterly"
+    assert walk.n_trade_dates > walk.n_resolves
+
+
+def test_an_explicit_cadence_beats_the_spec_it_is_handed(returns):
+    spec = BacktestSpec(frequency="quarterly")
+    walk = walk_forward_run(
+        returns, _inverse_vol, lookback=252, rebalance_every=126,
+        spec=spec, rebalance_frequency="none",
+    )
+    assert walk.rebalance_frequency == "none"
+    assert walk.n_trade_dates == walk.n_resolves
+
+
+def test_asking_for_no_cadence_at_all_trades_only_on_resolves(returns):
+    """The default has to stay the cheap one: no spec, no argument, no extra trading."""
+    walk = walk_forward_run(
+        returns, _inverse_vol, lookback=252, rebalance_every=126
+    )
+    assert walk.rebalance_frequency == "none"
+    assert walk.n_trade_dates == walk.n_resolves == len(walk.weights_history)
+    assert "trading only on re-solves" in walk.describe()
+
+
+def test_the_cadences_are_both_recorded_on_the_run(returns):
+    """A reader of the result should not have to guess which calendar it used."""
+    walk = walk_forward_run(
+        returns, _inverse_vol, lookback=252, rebalance_every=63,
+        rebalance_frequency="monthly",
+    )
+    notes = walk.run.meta.notes
+    assert notes["rebalance_every"] == 63
+    assert notes["rebalance_frequency"] == "monthly"
+    assert notes["n_resolves"] == walk.n_resolves
+    # Two runs that trade on different calendars are different runs.
+    other = walk_forward_run(
+        returns, _inverse_vol, lookback=252, rebalance_every=63,
+        rebalance_frequency="quarterly",
+    )
+    assert walk.run.meta.spec_hash != other.run.meta.spec_hash
+
+
 # -- transaction-cost analysis ---------------------------------------------
 
 
