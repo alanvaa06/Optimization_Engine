@@ -92,12 +92,30 @@ def _caveats(run: RunResult, deflated: Any, overfitting: Any) -> tuple[str, ...]
             "These weights were chosen knowing these returns. The figures "
             "describe a fit, not a track record."
         )
-    if run.meta.spec.get("costs", {}).get("commission_bps", 0.0) == 0.0 and run.meta.spec.get(
-        "costs", {}
-    ).get("slippage_bps", 0.0) == 0.0:
+    costs = run.meta.spec.get("costs", {})
+    linear_bps = float(costs.get("commission_bps", 0.0)) + float(
+        costs.get("slippage_bps", 0.0)
+    )
+    impact_eta = float(costs.get("impact_coefficient", 0.0))
+    if linear_bps == 0.0 and impact_eta == 0.0:
         caveats.append(
             "Trading was modelled as free. Every turnover figure below is a "
             "cost this backtest did not charge."
+        )
+    elif linear_bps == 0.0:
+        # Impact alone was charged. Calling that "free" contradicts the cost
+        # line right above it; the honest statement is the narrower one.
+        caveats.append(
+            "Only market impact was charged — no commission and no spread. "
+            "The cost below is what size did to the price, not what the trade "
+            "cost to place."
+        )
+    if impact_eta > 0.0 and costs.get("impact_participation_source") == "adv":
+        caveats.append(
+            "Market impact was priced against traded volume where the panel "
+            "carried it. Any asset without volume was charged at the fixed "
+            "participation rate instead — those trades are named in the "
+            "degradation notes."
         )
     if int(run.meta.spec.get("execution_lag", 0)) == 0:
         caveats.append(

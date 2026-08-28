@@ -15,6 +15,7 @@ from dataclasses import dataclass
 import pandas as pd
 
 YAHOO_PRICES_CACHE_KEY = "yahoo_prices_cache"
+INGEST_CACHE_KEY = "ingest_result_cache"
 
 
 def yahoo_cache_key(
@@ -51,6 +52,48 @@ def yahoo_prices_for_rerun(
     prices = fetch_prices()
     state[YAHOO_PRICES_CACHE_KEY] = {"key": cache_key, "prices": prices}
     return prices
+
+
+def ingest_result_for_rerun(
+    *,
+    fetch_clicked: bool,
+    cache_key: str,
+    state: MutableMapping[str, object],
+    fetch: Callable[[], object],
+) -> object | None:
+    """Hold a fetched ingest result across Streamlit's reruns.
+
+    Streamlit re-executes the whole script on every widget interaction. Without
+    this, moving a slider on the constraints tab would re-download the panel —
+    which is slow, burns a rate limit, and can silently change the data
+    underneath a comparison. The result is kept until the request itself
+    changes, and refetched only when the button is pressed again.
+
+    Args:
+        fetch_clicked: Whether the fetch button was pressed this run.
+        cache_key: The request fingerprint. A different key invalidates.
+        state: ``st.session_state`` or any mutable mapping.
+        fetch: Called to perform the fetch. Only invoked on a click.
+
+    Returns:
+        The held result, a freshly fetched one, or ``None`` when nothing has
+        been fetched for this key yet.
+    """
+    cached = state.get(INGEST_CACHE_KEY)
+    if (
+        not fetch_clicked
+        and isinstance(cached, dict)
+        and cached.get("key") == cache_key
+        and cached.get("result") is not None
+    ):
+        return cached["result"]
+
+    if not fetch_clicked:
+        return None
+
+    result = fetch()
+    state[INGEST_CACHE_KEY] = {"key": cache_key, "result": result}
+    return result
 
 
 from optimization_engine.optimizers.requirements import (  # noqa: E402

@@ -37,6 +37,11 @@ _SERIES_ID_PATTERN = re.compile(r"^[A-Z0-9_]{1,30}$")
 
 _USER_AGENT = "optimization-engine/0.2 (+https://github.com/alanvaa06/Optimization_Engine)"
 
+#: Ceiling on one series' CSV body. Generous by three orders of magnitude for
+#: real data, and the difference between a bad endpoint costing a request and
+#: it costing the process.
+_MAX_RESPONSE_BYTES = 64 * 1024 * 1024
+
 
 class FREDError(RuntimeError):
     """Raised when FRED can't be reached or input/output is invalid."""
@@ -81,9 +86,18 @@ def _fetch_fred_csv(
     request = urllib.request.Request(url, headers={"User-Agent": _USER_AGENT})
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
-            payload = response.read()
+            # A single FRED series is at most a few hundred kilobytes. Reading
+            # without a bound lets a malfunctioning or hostile endpoint hold
+            # the process until it runs out of memory.
+            payload = response.read(_MAX_RESPONSE_BYTES + 1)
     except urllib.error.URLError as exc:
         raise FREDError(f"Could not fetch FRED series {series_id}: {exc}") from exc
+
+    if len(payload) > _MAX_RESPONSE_BYTES:
+        raise FREDError(
+            f"FRED returned more than {_MAX_RESPONSE_BYTES // (1024 * 1024)} MB "
+            f"for {series_id}; refusing to read further."
+        )
 
     try:
         df = pd.read_csv(io.BytesIO(payload))

@@ -47,6 +47,19 @@ REBALANCE_DESCRIPTIONS: dict[str, str] = {
 }
 
 
+#: The smallest NAV at which an ADV-based impact charge means anything. Below
+#: it a book of a few currency units cannot move any real market, so a run
+#: configured that way is a mistake rather than a scenario. Inclusive: this
+#: exact value is allowed, so a control offering it as its minimum cannot
+#: produce a spec the validator rejects.
+MIN_ADV_CAPITAL = 1_000.0
+
+#: Where the impact model's participation rate comes from. ``"fixed"`` needs
+#: no market data at all; ``"adv"`` needs a traded-volume panel and degrades
+#: gracefully to the fixed rate for any asset that has none.
+PARTICIPATION_SOURCES: frozenset[str] = frozenset({"fixed", "adv"})
+
+
 class SpecValidationError(ValueError):
     """A spec that cannot describe a runnable backtest."""
 
@@ -78,7 +91,22 @@ class CostSpec:
         impact_participation: The fraction of the book that can be traded in
             one name, in one period, without impact — the weight-space
             analogue of average daily volume. Must be positive when
-            ``impact_coefficient`` is.
+            ``impact_coefficient`` is. Used directly when
+            ``impact_participation_source`` is ``"fixed"``, and as the
+            fallback when it is ``"adv"`` and an asset has no volume.
+        impact_participation_source: Where participation comes from.
+            ``"fixed"`` (the default) uses ``impact_participation`` for every
+            trade and needs no volume data at all — which is what lets an
+            index universe, which has no volume by construction, be
+            backtested. ``"adv"`` derives it from a trailing traded-volume
+            panel, so capacity is measured rather than assumed; assets with no
+            volume fall back to the fixed rate and the run log says so.
+        impact_adv_lookback: Trailing periods averaged when computing ADV.
+        impact_adv_share: The fraction of an asset's average daily traded
+            notional this book is willing to be. 0.10 means "we will not be
+            more than a tenth of the day's volume in one name".
+        min_adv_observations: Below this many volume observations in the
+            window the ADV estimate is not used.
         impact_volatility_lookback: Trailing periods used to estimate the
             per-asset ``sigma`` that scales impact.
         min_impact_observations: Below this many trailing returns the
@@ -93,6 +121,10 @@ class CostSpec:
     impact_participation: float = 0.05
     impact_volatility_lookback: int = 63
     min_impact_observations: int = 21
+    impact_participation_source: str = "fixed"
+    impact_adv_lookback: int = 21
+    impact_adv_share: float = 0.10
+    min_adv_observations: int = 5
 
     def __post_init__(self) -> None:
         # Normalize on construction so that ``CostSpec(commission_bps=10)`` and
@@ -100,10 +132,15 @@ class CostSpec:
         # carry the same hash. An int that survives into the canonical JSON
         # would make two identical runs look like different ones.
         for name in ("commission_bps", "slippage_bps", "impact_coefficient",
-                     "impact_participation"):
+                     "impact_participation", "impact_adv_share"):
             object.__setattr__(self, name, float(getattr(self, name)))
-        for name in ("impact_volatility_lookback", "min_impact_observations"):
+        for name in ("impact_volatility_lookback", "min_impact_observations",
+                     "impact_adv_lookback", "min_adv_observations"):
             object.__setattr__(self, name, int(getattr(self, name)))
+        object.__setattr__(
+            self, "impact_participation_source",
+            str(self.impact_participation_source).strip().lower(),
+        )
         for name in ("commission_bps", "slippage_bps", "impact_coefficient"):
             value = float(getattr(self, name))
             if value < 0.0:
@@ -123,6 +160,27 @@ class CostSpec:
                 "min_impact_observations must be at least 2; "
                 f"got {self.min_impact_observations}."
             )
+        if self.impact_participation_source not in PARTICIPATION_SOURCES:
+            raise SpecValidationError(
+                "impact_participation_source must be one of "
+                f"{', '.join(sorted(PARTICIPATION_SOURCES))}; "
+                f"got {self.impact_participation_source!r}."
+            )
+        if self.impact_adv_lookback < 1:
+            raise SpecValidationError(
+                "impact_adv_lookback must be at least 1 period; "
+                f"got {self.impact_adv_lookback}."
+            )
+        if self.min_adv_observations < 1:
+            raise SpecValidationError(
+                "min_adv_observations must be at least 1; "
+                f"got {self.min_adv_observations}."
+            )
+        if not 0.0 < self.impact_adv_share <= 1.0:
+            raise SpecValidationError(
+                "impact_adv_share is the share of daily volume this book is "
+                f"willing to be, so it must lie in (0, 1]; got {self.impact_adv_share}."
+            )
 
     @property
     def total_linear_bps(self) -> float:
@@ -132,6 +190,17 @@ class CostSpec:
     @property
     def has_impact(self) -> bool:
         return float(self.impact_coefficient) > 0.0
+
+    @property
+    def uses_volume(self) -> bool:
+        """Whether this cost model reads a traded-volume panel.
+
+        False for every default, which is the point: the engine backtests
+        indices, funds and anything else with no volume out of the box, and
+        only asks for a volume panel when explicitly told to price capacity
+        from one.
+        """
+        return self.has_impact and self.impact_participation_source == "adv"
 
     @property
     def is_free(self) -> bool:
@@ -150,6 +219,12 @@ class CostSpec:
             impact_participation=float(data.get("impact_participation", 0.05)),
             impact_volatility_lookback=int(data.get("impact_volatility_lookback", 63)),
             min_impact_observations=int(data.get("min_impact_observations", 21)),
+            impact_participation_source=str(
+                data.get("impact_participation_source", "fixed")
+            ),
+            impact_adv_lookback=int(data.get("impact_adv_lookback", 21)),
+            impact_adv_share=float(data.get("impact_adv_share", 0.10)),
+            min_adv_observations=int(data.get("min_adv_observations", 5)),
         )
 
     @classmethod
@@ -171,8 +246,14 @@ class BacktestSpec:
             execution, which no desk gets. One period is the honest default
             for a daily panel where the decision is taken after the close.
         periods_per_year: Observations per year, for annualizing.
-        initial_capital: Starting NAV. Cosmetic for returns; it makes the
-            trade and cost frames read in currency rather than in fractions.
+        initial_capital: Starting NAV, in the currency the prices are quoted
+            in. Cosmetic for returns — they are fractions either way — but
+            **not** cosmetic once impact is priced from traded volume: capacity
+            is a currency amount, so the fund's size is what decides whether a
+            name's average daily volume is deep or thin for this book. A run
+            with ``impact_participation_source="adv"`` must therefore state a
+            real one; the default of 1.0 describes a one-unit fund, for which
+            every market on earth is infinitely deep.
         is_out_of_sample: Whether the weights were chosen without seeing the
             returns they are replayed on. The single most important caveat
             attached to any backtest number, so it travels with the spec and
@@ -212,6 +293,19 @@ class BacktestSpec:
             )
         if not isinstance(self.costs, CostSpec):
             object.__setattr__(self, "costs", CostSpec.from_dict(dict(self.costs)))
+        if self.costs.uses_volume and self.initial_capital < MIN_ADV_CAPITAL:
+            # Silently allowing this is the worst outcome available: the run
+            # completes, reports a cost near zero, and looks like evidence
+            # that the strategy has no capacity problem. It has no capacity
+            # problem because it is a one-currency-unit fund.
+            raise SpecValidationError(
+                "Pricing impact from traded volume needs a real fund size: "
+                f"initial_capital is {self.initial_capital:g}, which describes "
+                "a book so small that every market is infinitely deep and the "
+                "impact charge rounds to zero. Set initial_capital to the "
+                "capital being deployed, or use "
+                'impact_participation_source="fixed".'
+            )
 
     def with_(self, **changes: Any) -> BacktestSpec:
         """A copy with fields replaced — the way a sweep builds its cells."""
@@ -273,6 +367,8 @@ class BacktestSpec:
 
 __all__ = [
     "FREQUENCY_ALIASES",
+    "MIN_ADV_CAPITAL",
+    "PARTICIPATION_SOURCES",
     "REBALANCE_DESCRIPTIONS",
     "BacktestSpec",
     "CostSpec",

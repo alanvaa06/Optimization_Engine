@@ -154,6 +154,8 @@ def walk_forward_run(
     min_lookback: int | None = None,
     expanding: bool = False,
     rebalance_frequency: RebalanceFrequency | None = None,
+    prices: pd.DataFrame | None = None,
+    volumes: pd.DataFrame | None = None,
 ) -> WalkForwardRun:
     """Roll an estimation window forward, re-solving as it goes.
 
@@ -178,6 +180,11 @@ def walk_forward_run(
             weights drift in between. Any other cadence adds calendar trades
             on top of the re-solves; the target they trade to is always the
             freshest one available on that date, never a future one.
+        prices: Close prices, needed only when the cost model prices capacity
+            from traded volume.
+        volumes: Traded volume per asset and period. Optional: without one the
+            impact model uses its fixed participation rate, which is the only
+            thing it can do for an index universe.
 
     Returns:
         The bundle. ``n_resolves`` counts optimizations, ``n_trade_dates``
@@ -257,7 +264,13 @@ def walk_forward_run(
     # a decision made at the first evaluated date has years of returns behind
     # it, and pricing its impact off the slice alone would throw them away.
     run = run_backtest(
-        evaluation, weights_history, spec, notes=notes, context_returns=returns
+        evaluation,
+        weights_history,
+        spec,
+        notes=notes,
+        context_returns=returns,
+        prices=prices,
+        volumes=volumes,
     )
 
     return WalkForwardRun(

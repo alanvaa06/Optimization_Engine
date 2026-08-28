@@ -8,6 +8,28 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+#: The synthetic universe: ``name -> (group, annual return, annual vol)``.
+#: Module-level so the app and the ingest provider can offer it as a default
+#: universe without restating a list that would then drift out of step.
+SAMPLE_ASSETS: dict[str, tuple[str, float, float]] = {
+    "US_Equity":     ("Equity",       0.08,  0.18),
+    "Intl_Equity":   ("Equity",       0.07,  0.20),
+    "EM_Equity":     ("Equity",       0.09,  0.24),
+    "Real_Estate":   ("Alternatives", 0.06,  0.19),
+    "Commodities":   ("Alternatives", 0.04,  0.22),
+    "Infra":         ("Alternatives", 0.07,  0.16),
+    "Gold":          ("Alternatives", 0.04,  0.15),
+    "US_Treasuries": ("FixedIncome",  0.03,  0.07),
+    "TIPS":          ("FixedIncome",  0.03,  0.06),
+    "IG_Credit":     ("FixedIncome",  0.04,  0.08),
+    "HY_Credit":     ("FixedIncome",  0.05,  0.11),
+    "EM_Debt":       ("FixedIncome",  0.05,  0.10),
+    "Cash":          ("FixedIncome",  0.025, 0.005),
+}
+
+#: Just the names, in generation order.
+SAMPLE_UNIVERSE: tuple[str, ...] = tuple(SAMPLE_ASSETS)
+
 
 def load_prices(
     path: str | Path,
@@ -55,21 +77,7 @@ def sample_dataset(
     """
     rng = np.random.default_rng(seed)
 
-    default_assets = {
-        "US_Equity":     ("Equity",       0.08,  0.18),
-        "Intl_Equity":   ("Equity",       0.07,  0.20),
-        "EM_Equity":     ("Equity",       0.09,  0.24),
-        "Real_Estate":   ("Alternatives", 0.06,  0.19),
-        "Commodities":   ("Alternatives", 0.04,  0.22),
-        "Infra":         ("Alternatives", 0.07,  0.16),
-        "Gold":          ("Alternatives", 0.04,  0.15),
-        "US_Treasuries": ("FixedIncome",  0.03,  0.07),
-        "TIPS":          ("FixedIncome",  0.03,  0.06),
-        "IG_Credit":     ("FixedIncome",  0.04,  0.08),
-        "HY_Credit":     ("FixedIncome",  0.05,  0.11),
-        "EM_Debt":       ("FixedIncome",  0.05,  0.10),
-        "Cash":          ("FixedIncome",  0.025, 0.005),
-    }
+    default_assets = SAMPLE_ASSETS
 
     if assets is not None:
         keys = list(assets)

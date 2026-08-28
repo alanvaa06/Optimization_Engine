@@ -20,6 +20,24 @@ Two families:
   model in which capacity is visible at all: an allocation that is free at
   fund size 1× need not be at 10×.
 
+Participation — the denominator of that square root — can come from either of
+two places, and the choice is the whole reason volume is optional here.
+
+* **Fixed.** A single number: "I can trade 5% of the book in one name in one
+  period without moving it." It needs no volume data at all, which is what
+  makes an index backtest possible: an index has no volume, has never had
+  volume, and never will. The number is an assumption, and treating it as one
+  is honest.
+* **From ADV.** Trailing dollar volume times the share of it you are willing
+  to be, divided by NAV. This is the real thing, and it is the only setting
+  under which capacity is genuinely measured rather than assumed — the same
+  strategy's costs now rise as the fund grows and as a name's turnover dries
+  up. It needs a volume panel, which only some providers publish.
+
+Choosing ADV without a volume panel does not fail. Each affected trade falls
+back to the fixed rate and records why, so the result is still produced and
+the run log says exactly which assumption it rests on.
+
 When impact cannot be computed — too little history to estimate ``sigma`` —
 the trade degrades to the linear charge and the reason is recorded on the run
 log. It is never silently replaced by zero, and it never raises: a missing
@@ -53,9 +71,16 @@ class MarketContext:
     Attributes:
         volatility: Trailing per-period volatility, or ``None`` when there is
             not enough history to estimate it.
+        participation: The fraction of the *current* book that the asset's
+            trailing traded volume supports in one period, or ``None`` when
+            no volume panel was supplied. It is a fraction of NAV rather than
+            a fixed quantity because that is how capacity actually behaves:
+            the same dollar depth is a large trade for a big fund and a
+            rounding error for a small one.
     """
 
     volatility: float | None = None
+    participation: float | None = None
 
 
 @dataclass(frozen=True)
@@ -91,6 +116,15 @@ class CostModel(Protocol):
         """
         ...
 
+    def participation_lookback(self) -> int:
+        """Trailing periods of traded volume the model needs, or ``0``.
+
+        Zero — the default for every model that does not price from ADV — is
+        what lets the runner skip the volume machinery entirely, and what lets
+        a universe with no volume run unchanged.
+        """
+        ...
+
     def charge(
         self, *, asset: str, traded_weight: float, context: MarketContext
     ) -> CostQuote:
@@ -103,6 +137,9 @@ class ZeroCost:
     """Free trading. Honest only as a deliberate upper bound on performance."""
 
     def volatility_lookback(self) -> int:
+        return 0
+
+    def participation_lookback(self) -> int:
         return 0
 
     def charge(
@@ -119,6 +156,9 @@ class LinearCost:
     slippage_bps: float = 0.0
 
     def volatility_lookback(self) -> int:
+        return 0
+
+    def participation_lookback(self) -> int:
         return 0
 
     def charge(
@@ -147,9 +187,17 @@ class SquareRootImpactCost:
     participation: float = 0.05
     lookback: int = 63
     min_observations: int = 21
+    #: ``"fixed"`` uses :attr:`participation` for every trade; ``"adv"`` reads
+    #: the participation the trailing volume panel supports and falls back to
+    #: :attr:`participation` when there is none.
+    participation_source: str = "fixed"
+    adv_lookback: int = 21
 
     def volatility_lookback(self) -> int:
         return int(self.lookback)
+
+    def participation_lookback(self) -> int:
+        return int(self.adv_lookback) if self.participation_source == "adv" else 0
 
     def charge(
         self, *, asset: str, traded_weight: float, context: MarketContext
@@ -159,20 +207,64 @@ class SquareRootImpactCost:
         slippage = traded * self.slippage_bps / _BPS
         if traded <= 0.0:
             return CostQuote(commission=commission, slippage=slippage)
+
         sigma = context.volatility
-        if sigma is None or not math.isfinite(sigma) or self.participation <= 0.0:
-            reason = (
-                f"square-root impact degraded to zero for {asset}: "
-                "insufficient history to estimate volatility"
-                if sigma is None or not math.isfinite(sigma)
-                else f"square-root impact degraded to zero for {asset}: "
-                "non-positive participation"
-            )
+        if sigma is None or not math.isfinite(sigma):
             return CostQuote(
-                commission=commission, slippage=slippage, degraded_reason=reason
+                commission=commission,
+                slippage=slippage,
+                degraded_reason=(
+                    f"square-root impact degraded to zero for {asset}: "
+                    "insufficient history to estimate volatility"
+                ),
             )
-        impact = self.eta * sigma * math.sqrt(traded / self.participation)
-        return CostQuote(commission=commission, slippage=slippage + traded * impact)
+
+        participation, reason = self._participation_for(asset, context)
+        if participation is None:
+            return CostQuote(
+                commission=commission,
+                slippage=slippage,
+                degraded_reason=reason,
+            )
+
+        impact = self.eta * sigma * math.sqrt(traded / participation)
+        return CostQuote(
+            commission=commission,
+            slippage=slippage + traded * impact,
+            degraded_reason=reason,
+        )
+
+    def _participation_for(
+        self, asset: str, context: MarketContext
+    ) -> tuple[float | None, str | None]:
+        """Resolve the participation rate to price this trade against.
+
+        Returns a ``(participation, reason)`` pair. A ``reason`` alongside a
+        usable participation means the model fell back — the trade is still
+        priced, but the run log records that it rests on the fixed assumption
+        rather than on observed volume.
+        """
+        if self.participation_source != "adv":
+            if self.participation <= 0.0:
+                return None, (
+                    f"square-root impact degraded to zero for {asset}: "
+                    "non-positive participation"
+                )
+            return float(self.participation), None
+
+        observed = context.participation
+        if observed is not None and math.isfinite(observed) and observed > 0.0:
+            return float(observed), None
+
+        if self.participation > 0.0:
+            return float(self.participation), (
+                f"ADV-based impact fell back to the fixed participation rate "
+                f"for {asset}: no traded volume available"
+            )
+        return None, (
+            f"square-root impact degraded to zero for {asset}: "
+            "no traded volume and no positive fallback participation"
+        )
 
 
 def build_cost_model(costs: CostSpec) -> CostModel:
@@ -191,6 +283,8 @@ def build_cost_model(costs: CostSpec) -> CostModel:
         participation=float(costs.impact_participation),
         lookback=int(costs.impact_volatility_lookback),
         min_observations=int(costs.min_impact_observations),
+        participation_source=str(costs.impact_participation_source),
+        adv_lookback=int(costs.impact_adv_lookback),
     )
 
 
@@ -211,6 +305,52 @@ def trailing_volatilities(
     return vol.replace([np.inf, -np.inf], np.nan)
 
 
+def trailing_dollar_volume(
+    prices: pd.DataFrame,
+    volumes: pd.DataFrame,
+    lookback: int,
+    min_observations: int,
+) -> pd.DataFrame:
+    """Per-asset trailing average traded notional, using only the past.
+
+    ``price × volume`` rather than volume alone, because share counts are not
+    comparable across a $4 stock and a $400 one — the quantity that bounds a
+    trade is money, not shares.
+
+    Like :func:`trailing_volatilities`, the window ending at ``t`` excludes
+    ``t``: a trade decided on ``t`` cannot be sized off that day's own
+    turnover. Assets with no volume at all come back as all-NaN columns, which
+    the cost model reads as "no ADV here" and prices from its fixed rate
+    instead.
+
+    Args:
+        prices: Close prices, one column per asset.
+        volumes: Traded volume on the same index and columns. Columns absent
+            here are treated as having no volume.
+        lookback: Trailing periods to average over.
+        min_observations: Below this many observations in the window the
+            average is not used.
+
+    Returns:
+        A frame on ``prices``' index and columns, in the currency the prices
+        are quoted in.
+    """
+    if lookback <= 0:
+        return pd.DataFrame(index=prices.index, columns=prices.columns, dtype=float)
+
+    aligned = volumes.reindex(index=prices.index, columns=prices.columns)
+    notional = prices.astype(float) * aligned.astype(float)
+    notional = notional.replace([np.inf, -np.inf], np.nan)
+    trailing = (
+        notional.shift(1)
+        .rolling(window=int(lookback), min_periods=int(min_observations))
+        .mean()
+    )
+    # A zero average is "cannot trade", which is not something a volume panel
+    # can actually assert — it means the field was padded. Treat it as absent.
+    return trailing.where(trailing > 0.0)
+
+
 __all__ = [
     "CostModel",
     "CostQuote",
@@ -219,5 +359,6 @@ __all__ = [
     "SquareRootImpactCost",
     "ZeroCost",
     "build_cost_model",
+    "trailing_dollar_volume",
     "trailing_volatilities",
 ]

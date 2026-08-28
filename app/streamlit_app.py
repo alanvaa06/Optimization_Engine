@@ -50,6 +50,12 @@ from components import (  # noqa: E402
     render_portfolio_diagnostics,
     render_projection_distance,
 )
+from data_sources import (  # noqa: E402
+    render_empty_state,
+    render_ingest_panel,
+    render_liquidity_selector,
+    render_source_picker,
+)
 from layer_editor import (  # noqa: E402
     current_layers,
     render_layer_builder,
@@ -67,6 +73,7 @@ from optimization_engine.analytics.risk import drawdown_table  # noqa: E402
 from optimization_engine.backtest import (  # noqa: E402
     BacktestSpec,
     CostSpec,
+    SpecValidationError,
     compute_tca,
     cost_by_asset,
 )
@@ -83,15 +90,8 @@ from optimization_engine.data.fx import (  # noqa: E402
     convert_prices_to_base,
     supported_currencies,
 )
-from optimization_engine.data.loader import (  # noqa: E402
-    prices_to_returns,
-    sample_dataset,
-)
+from optimization_engine.data.loader import prices_to_returns  # noqa: E402
 from optimization_engine.data.quality import align_panel, analyze_prices  # noqa: E402
-from optimization_engine.data.yahoo import (  # noqa: E402
-    YahooFinanceError,
-    load_prices_yahoo,
-)
 from optimization_engine.engine import run_engine  # noqa: E402
 from optimization_engine.optimizers.factory import (  # noqa: E402
     available_optimizers,
@@ -143,8 +143,6 @@ from optimization_engine.scenarios import (
 )
 from optimization_engine.ui_state import (  # noqa: E402
     derive_widget_state,
-    yahoo_cache_key,
-    yahoo_prices_for_rerun,
 )
 
 # ---------------------------------------------------------------------------
@@ -182,6 +180,7 @@ _DEFAULT_STATE = {
     "last_error": None,
     "walk_forward": None,
     "frontier_uncertainty": None,
+    "ingest": None,
 }
 for key, default in _DEFAULT_STATE.items():
     if key not in st.session_state:
@@ -303,24 +302,6 @@ st.caption(
 # ---------------------------------------------------------------------------
 
 
-@st.cache_data(show_spinner=False)
-def _load_sample(n_periods: int) -> pd.DataFrame:
-    return sample_dataset(n_periods=n_periods)
-
-
-@st.cache_data(show_spinner=True, ttl=60 * 60)
-def _load_yahoo_cached(
-    tickers: tuple[str, ...],
-    period: str,
-    start: str | None,
-    end: str | None,
-    interval: str,
-) -> pd.DataFrame:
-    if start:
-        return load_prices_yahoo(list(tickers), start=start, end=end or None, interval=interval)
-    return load_prices_yahoo(list(tickers), period=period, interval=interval)
-
-
 @st.cache_data(show_spinner=False, max_entries=16)
 def _frame_hash(df: pd.DataFrame) -> str:
     return pd.util.hash_pandas_object(df, index=True).values.tobytes().hex()
@@ -374,82 +355,40 @@ with st.sidebar:
     st.header("1 · Data")
     data_source = st.radio(
         "Source",
-        options=["Sample", "Upload file", "Yahoo Finance"],
+        options=["Data provider", "Upload file"],
         index=0,
         horizontal=True,
+        help=(
+            "Providers are fetched live and return the same column names "
+            "whichever one you pick. Upload is for a panel you already have."
+        ),
     )
 
-    if data_source == "Sample":
-        years = st.slider("Years of history", 2, 15, 8)
-        raw_prices = _load_sample(years * 252)
-    elif data_source == "Upload file":
+    if data_source == "Data provider":
+        raw_prices, ingest_result = render_source_picker(st.session_state)
+    else:
         uploaded = st.file_uploader(
             "Price file (Excel/CSV/Parquet)",
             type=["xlsx", "xls", "xlsm", "csv", "parquet"],
         )
         sheet = st.text_input("Sheet name (Excel)", value="Precios")
-        if uploaded is None:
-            st.info("Upload a file to continue, or switch to Sample data.")
-            st.stop()
-        raw_prices = _load_uploaded(uploaded, sheet)
-        raw_prices.index = pd.to_datetime(raw_prices.index)
-        raw_prices = raw_prices.sort_index().dropna(how="all")
-    else:
-        st.markdown(
-            "Pull adjusted prices directly from Yahoo Finance. "
-            "Tickers are validated locally before any network call."
-        )
-        yahoo_tickers = st.text_input(
-            "Tickers (comma- or space-separated)",
-            value="SPY, QQQ, EFA, EEM, AGG, TLT, IEF, GLD, DBC, VNQ",
-        )
-        yahoo_period = st.selectbox(
-            "Period",
-            options=["1y", "2y", "5y", "10y", "max", "Custom range"],
-            index=2,
-        )
-        yahoo_start: str | None = None
-        yahoo_end: str | None = None
-        if yahoo_period == "Custom range":
-            today = pd.Timestamp.today().normalize()
-            default_start = (today - pd.DateOffset(years=5)).date()
-            yahoo_start = str(st.date_input("Start", value=default_start))
-            yahoo_end = str(st.date_input("End", value=today.date()))
-            yahoo_period = "5y"  # ignored when start is set
-        yahoo_interval = st.selectbox(
-            "Interval", options=["1d", "1wk", "1mo"], index=0
-        )
+        # An uploaded panel carries no ingest provenance; the Data tab then
+        # shows the quality report alone rather than an empty source block.
+        ingest_result = None
+        raw_prices = None
+        if uploaded is not None:
+            raw_prices = _load_uploaded(uploaded, sheet)
+            raw_prices.index = pd.to_datetime(raw_prices.index)
+            raw_prices = raw_prices.sort_index().dropna(how="all")
+    st.session_state["ingest"] = ingest_result
 
-        fetch_clicked = st.button("Fetch from Yahoo", type="primary")
+# The guidance is drawn in the main area, where the data is about to appear,
+# rather than in a narrow sidebar column beside it.
+if raw_prices is None:
+    render_empty_state(awaiting_upload=data_source == "Upload file")
+    st.stop()
 
-        tickers_tuple = tuple(t for t in yahoo_tickers.replace(",", " ").split() if t)
-        cache_key = yahoo_cache_key(
-            tickers_tuple, yahoo_period, yahoo_start, yahoo_end, yahoo_interval,
-        )
-
-        try:
-            raw_prices = yahoo_prices_for_rerun(
-                fetch_clicked=fetch_clicked,
-                cache_key=cache_key,
-                state=st.session_state,
-                fetch_prices=lambda: _load_yahoo_cached(
-                    tickers_tuple,
-                    period=yahoo_period,
-                    start=yahoo_start,
-                    end=yahoo_end,
-                    interval=yahoo_interval,
-                ),
-            )
-        except YahooFinanceError as exc:
-            st.error(f"Yahoo Finance error: {exc}")
-            st.stop()
-        except Exception as exc:  # network / library issues
-            st.error(f"Could not load Yahoo prices: {exc}")
-            st.stop()
-        if raw_prices is None:
-            st.info("Set tickers and click **Fetch from Yahoo** to download prices.")
-            st.stop()
-
+with st.sidebar:
     selected_assets = st.multiselect(
         "Universe (assets to include)",
         options=list(raw_prices.columns),
@@ -974,6 +913,8 @@ with tab_overview:
             ("End", str(returns.index.max().date()), None),
         ]
     )
+
+    render_ingest_panel(ingest_result)
 
     render_data_quality(quality)
     if alignment_actions:
@@ -2190,19 +2131,47 @@ with tab_backtest:
                 ),
             )
 
-        cost_bps = float(commission_bps) + float(slippage_bps)
-        backtest_spec = BacktestSpec(
-            frequency=frequency,
-            costs=CostSpec(
-                commission_bps=float(commission_bps),
-                slippage_bps=float(slippage_bps),
-                impact_coefficient=float(impact_eta),
-                impact_participation=float(participation) / 100.0,
-            ),
-            execution_lag=int(execution_lag),
-            periods_per_year=int(periods_per_year),
+        # Volume is optional throughout. With none — the normal state for an
+        # index universe — the impact model prices from the fixed rate above,
+        # and the selector says so rather than letting the fallback be a
+        # surprise in the run log.
+        backtest_volumes = (
+            ingest_result.volumes if ingest_result is not None else None
         )
-        bt = run.simulate(backtest_spec)
+        if float(impact_eta) > 0.0:
+            liquidity, initial_capital = render_liquidity_selector(backtest_volumes)
+        else:
+            liquidity, initial_capital = {"impact_participation_source": "fixed"}, 1.0
+
+        cost_bps = float(commission_bps) + float(slippage_bps)
+        try:
+            backtest_spec = BacktestSpec(
+                frequency=frequency,
+                costs=CostSpec(
+                    commission_bps=float(commission_bps),
+                    slippage_bps=float(slippage_bps),
+                    impact_coefficient=float(impact_eta),
+                    impact_participation=float(participation) / 100.0,
+                    **liquidity,
+                ),
+                execution_lag=int(execution_lag),
+                periods_per_year=int(periods_per_year),
+                initial_capital=float(initial_capital),
+            )
+        except SpecValidationError as exc:
+            # A cost model the numbers cannot express is something to say, not
+            # something to fall over on.
+            st.error(str(exc))
+            st.stop()
+        bt = run.simulate(
+            backtest_spec,
+            prices=prices.reindex(returns.index) if backtest_volumes is not None else None,
+            volumes=(
+                backtest_volumes.reindex(index=returns.index, columns=returns.columns)
+                if backtest_volumes is not None
+                else None
+            ),
+        )
         metric_row(
             [
                 (

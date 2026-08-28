@@ -377,6 +377,8 @@ class EngineRun:
         spec: BacktestSpec | None = None,
         *,
         weights: pd.Series | None = None,
+        prices: pd.DataFrame | None = None,
+        volumes: pd.DataFrame | None = None,
     ) -> RunResult:
         """Replay the solved weights and return the full result bundle.
 
@@ -388,10 +390,21 @@ class EngineRun:
 
         Still in-sample unless the spec says otherwise — the optimizer saw
         this history.
+
+        Args:
+            spec: The run description.
+            weights: Targets to replay. Defaults to this run's solution.
+            prices: Close prices, needed only to convert share volume into
+                traded notional.
+            volumes: Traded volume per asset. Optional: without it the impact
+                model prices from a fixed participation rate, which is the
+                only thing available for an index universe.
         """
         spec = spec or BacktestSpec(periods_per_year=self.config.periods_per_year)
         target = self.result.weights if weights is None else weights
-        return run_backtest(self.returns, target, spec)
+        return run_backtest(
+            self.returns, target, spec, prices=prices, volumes=volumes
+        )
 
     def walk_forward_run(
         self,
@@ -402,6 +415,8 @@ class EngineRun:
         solve: Callable[[pd.DataFrame], pd.Series] | None = None,
         reestimate_expected_returns: bool = True,
         rebalance_frequency: RebalanceFrequency | None = None,
+        prices: pd.DataFrame | None = None,
+        volumes: pd.DataFrame | None = None,
     ) -> WalkForwardRun:
         """:meth:`walk_forward`, returning the full bundle instead of the digest.
 
@@ -413,6 +428,13 @@ class EngineRun:
         ``rebalance_frequency`` — or, if that is not given, the spec's own
         ``frequency`` — is the trading cadence. With no spec and no argument
         the book trades only when it re-solves.
+
+        Args:
+            prices: Close prices, needed only to convert share volume into
+                traded notional.
+            volumes: Traded volume per asset. Optional everywhere: without it
+                the impact model prices from a fixed participation rate, which
+                is the only thing available for an index universe.
         """
         ppy = self.config.periods_per_year
         # An explicit "none" rather than the spec default: a caller who never
@@ -426,6 +448,8 @@ class EngineRun:
             spec=spec,
             expanding=expanding,
             rebalance_frequency=rebalance_frequency,
+            prices=prices,
+            volumes=volumes,
         )
 
     def tearsheet(
@@ -464,6 +488,8 @@ class EngineRun:
         expanding: bool = False,
         progress: Callable[[int, int], None] | None = None,
         rebalance_frequency: RebalanceFrequency | None = None,
+        prices: pd.DataFrame | None = None,
+        volumes: pd.DataFrame | None = None,
     ) -> SweepResults:
         """Walk-forward every cell of a grid, and count the trials.
 
@@ -471,6 +497,14 @@ class EngineRun:
         measures how well each configuration memorized the history rather than
         how well it would have done. The results carry the trial count that
         the deflated Sharpe and the overfitting probability both need.
+
+        Args:
+            prices: Close prices, needed only to turn share volume into traded
+                notional.
+            volumes: Traded volume per asset. Every cell is priced the same
+                way, so a grid run with a capacity-aware cost model must be
+                handed the same panel the single run was — otherwise the grid
+                is cheaper than the run it is supposed to contextualize.
         """
         ppy = self.config.periods_per_year
         run_spec = spec or BacktestSpec(periods_per_year=ppy, frequency="none")
@@ -496,6 +530,8 @@ class EngineRun:
                 spec=run_spec,
                 expanding=expanding,
                 rebalance_frequency=rebalance_frequency,
+                prices=prices,
+                volumes=volumes,
             ).returns
 
         return run_sweep(
