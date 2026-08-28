@@ -155,7 +155,19 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     backtest.add_argument(
         "--rebalance-every", type=int, metavar="N",
-        help="Periods between re-solves. Defaults to one quarter.",
+        help="Periods between re-solves — the re-optimization cadence. "
+             "Defaults to one quarter.",
+    )
+    backtest.add_argument(
+        "--rebalance", default="none",
+        choices=["none", "daily", "weekly", "monthly", "quarterly", "annual"],
+        help="How often the book is traded back to the current target "
+             "*between* re-solves — the rebalancing cadence, which is a "
+             "separate decision from --rebalance-every. Defaults to 'none': "
+             "hold each solution untouched until the next one and let the "
+             "weights drift. A committee that re-solves quarterly but "
+             "rebalances monthly wants --rebalance-every 63 --rebalance "
+             "monthly on a daily panel.",
     )
     backtest.add_argument(
         "--expanding", action="store_true",
@@ -446,7 +458,8 @@ def _cmd_optimize(args: argparse.Namespace) -> int:
         )
         gap = float(comparison.loc["Sharpe Ratio", "Degradation"])
         print(
-            f"  Walk-forward: {walk_forward.n_rebalances} re-solve(s), "
+            f"  Walk-forward: {walk_forward.n_resolves} re-solve(s) over "
+            f"{walk_forward.n_trade_dates} trade date(s), "
             f"Sharpe falls {gap:.2f} out of sample"
         )
         _report_deflated_sharpe(walk_forward.returns, args, config)
@@ -882,6 +895,7 @@ def _cmd_backtest(args: argparse.Namespace) -> int:
 
     try:
         spec = BacktestSpec(
+            frequency=args.rebalance,
             costs=CostSpec(
                 commission_bps=args.commission_bps,
                 slippage_bps=args.slippage_bps,
@@ -931,6 +945,7 @@ def _cmd_backtest(args: argparse.Namespace) -> int:
         return 2
 
     print(f"  {walk.run.describe()}")
+    print(f"  {walk.describe()}")
     if walk.n_failures:
         print(f"  {walk.n_failures} solve(s) failed; the previous book was carried forward.")
 

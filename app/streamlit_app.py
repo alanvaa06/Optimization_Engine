@@ -2353,7 +2353,10 @@ with tab_backtest:
         st.caption(
             "Re-estimates and re-solves on a rolling window, then holds each "
             "solution over returns the optimizer never saw. The gap against "
-            "the in-sample curve is how much of the backtest was hindsight."
+            "the in-sample curve is how much of the backtest was hindsight. "
+            "Two cadences to set, and they are different decisions: how often "
+            "the optimizer **re-solves**, and how often the book is **traded "
+            "back** to whatever target is current."
         )
         w1, w2, w3 = st.columns(3)
         with w1:
@@ -2368,6 +2371,29 @@ with tab_backtest:
                 "Re-solve every (periods)",
                 min_value=1, max_value=int(periods_per_year * 2),
                 value=max(int(periods_per_year // 4), 1),
+                help=(
+                    "The re-optimization cadence: how often the optimizer "
+                    "sees new data and re-solves. Separate from how often the "
+                    "book trades — set that below."
+                ),
+            )
+            wf_frequency = st.selectbox(
+                "Rebalance between re-solves",
+                options=["none", "monthly", "quarterly", "annual", "weekly", "daily"],
+                index=0,
+                format_func=lambda f: (
+                    "Only when re-solving" if f == "none" else f.title()
+                ),
+                help=(
+                    "The rebalancing cadence, which is a different question "
+                    "from the one above. 'Only when re-solving' holds each "
+                    "solution untouched until the next one and lets the "
+                    "weights drift. Anything else pulls the book back to the "
+                    "current target on that calendar — more turnover, more "
+                    "cost, less drift. A quarterly committee with a monthly "
+                    "rebalancing discipline re-solves four times a year and "
+                    "trades twelve."
+                ),
             )
         with w3:
             expanding = st.checkbox(
@@ -2396,6 +2422,8 @@ with tab_backtest:
                         rebalance_every=int(rebalance_every),
                         transaction_cost_bps=float(cost_bps),
                         expanding=expanding,
+                        reestimate_expected_returns=bool(reestimate_mu),
+                        rebalance_frequency=wf_frequency,
                     )
                 except Exception as exc:
                     st.session_state.walk_forward = None
@@ -2405,7 +2433,17 @@ with tab_backtest:
         if wf is not None:
             metric_row(
                 [
-                    ("Re-solves", str(wf.n_rebalances), None),
+                    (
+                        "Re-solves",
+                        str(wf.n_resolves),
+                        "Times the optimizer re-estimated and re-solved.",
+                    ),
+                    (
+                        "Trade dates",
+                        str(wf.n_trade_dates),
+                        "Dates the book actually traded. Above the re-solve "
+                        "count when a rebalancing cadence sits between them.",
+                    ),
                     (
                         "OOS annualized return",
                         pct(

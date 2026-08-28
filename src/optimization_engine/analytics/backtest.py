@@ -228,14 +228,29 @@ class WalkForwardResult:
         return self.backtest.returns
 
     @property
-    def n_rebalances(self) -> int:
+    def n_resolves(self) -> int:
+        """How many times the optimizer actually re-solved."""
         return len(self.weights_history)
 
+    @property
+    def n_rebalances(self) -> int:
+        """Deprecated spelling of :attr:`n_resolves`.
+
+        Ambiguous now that the trading cadence is separable from the re-solve
+        cadence: the book can rebalance without the optimizer re-solving.
+        """
+        return self.n_resolves
+
+    @property
+    def n_trade_dates(self) -> int:
+        """How many dates the book actually traded on."""
+        return len(self.backtest.rebalance_dates)
+
     def weight_stability(self) -> pd.Series:
-        """Average absolute change in each asset's weight between rebalances.
+        """Average absolute change in each asset's weight between re-solves.
 
         High values mean the optimizer is chasing estimation noise: the
-        allocation is being rewritten every period on data that barely moved.
+        allocation is being rewritten every window on data that barely moved.
         """
         if len(self.weights_history) < 2:
             return pd.Series(dtype=float)
@@ -253,10 +268,11 @@ def walk_forward_backtest(
     expanding: bool = False,
     *,
     spec: BacktestSpec | None = None,
+    rebalance_frequency: RebalanceFrequency | None = None,
 ) -> WalkForwardResult:
     """Re-estimate and re-solve on a rolling window, holding results forward.
 
-    At each rebalance the optimizer sees only returns strictly *before* the
+    At each re-solve the optimizer sees only returns strictly *before* the
     decision date; the resulting weights are then held over the following
     ``rebalance_every`` periods. No information from the evaluation window
     reaches the estimate, which is what makes the resulting track record
@@ -267,7 +283,8 @@ def walk_forward_backtest(
         solve: Callable taking a returns window and returning target weights.
             Typically wraps ``run_engine`` with a fixed config.
         lookback: Estimation window length in periods.
-        rebalance_every: Periods between re-solves.
+        rebalance_every: Periods between **re-solves** — the re-optimization
+            cadence.
         transaction_cost_bps: One-way cost on traded notional.
         periods_per_year: Observations per year.
         min_lookback: Minimum window before the first solve. Defaults to
@@ -275,14 +292,27 @@ def walk_forward_backtest(
         expanding: Use a growing window anchored at the start instead of a
             fixed-length rolling one.
         spec: A full backtest spec, for cost models and execution lag the
-            scalar arguments cannot express.
+            scalar arguments cannot express. Its ``frequency`` is read as the
+            trading cadence unless ``rebalance_frequency`` overrides it.
+        rebalance_frequency: How often the book is **traded back** to the
+            current target between re-solves. Defaults to ``"none"`` — trade
+            only when a new target is solved. See
+            :func:`~optimization_engine.backtest.walkforward.walk_forward_run`
+            for why the two cadences are worth separating.
 
     Raises:
         ValueError: If the history is too short to produce a single
             out-of-sample period, or if every solve fails.
     """
+    trading = rebalance_frequency
+    if trading is None:
+        # The scalar-argument form has never traded between re-solves, so its
+        # own default spec must not smuggle a cadence in: adding turnover
+        # silently would move every existing caller's cost figures.
+        trading = spec.frequency if spec is not None else "none"
     if spec is None:
         spec = BacktestSpec(
+            frequency=trading,
             costs=CostSpec.from_bps(transaction_cost_bps),
             periods_per_year=periods_per_year,
         )
@@ -294,12 +324,12 @@ def walk_forward_backtest(
         spec=spec,
         min_lookback=min_lookback,
         expanding=expanding,
+        rebalance_frequency=trading,
     )
-    backtest = _adapt(
-        walk.run,
-        pd.DatetimeIndex([walk.run.weights.index[0]]),
-        dict(walk.metadata),
-    )
+    # The dates the book actually traded on. Reporting only the first one —
+    # which this did — makes every walk-forward look like a single purchase,
+    # and hides the calendar trades entirely once the cadences differ.
+    backtest = _adapt(walk.run, walk.run.rebalance_dates, dict(walk.metadata))
     return WalkForwardResult(
         backtest=backtest,
         weights_history=walk.weights_history,
