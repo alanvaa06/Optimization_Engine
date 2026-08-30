@@ -8,6 +8,8 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from optimization_engine._optional import require
+
 #: The synthetic universe: ``name -> (group, annual return, annual vol)``.
 #: Module-level so the app and the ingest provider can offer it as a default
 #: universe without restating a list that would then drift out of step.
@@ -44,6 +46,7 @@ def load_prices(
     p = Path(path)
     suf = p.suffix.lower()
     if suf in {".xlsx", ".xls", ".xlsm"}:
+        require("openpyxl", extra="excel", purpose="reading Excel workbooks")
         df = pd.read_excel(p, sheet_name=sheet_name, index_col=index_col, parse_dates=True)
     elif suf == ".csv":
         df = pd.read_csv(p, index_col=index_col, parse_dates=True)

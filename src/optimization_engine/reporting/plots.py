@@ -13,8 +13,16 @@ from __future__ import annotations
 
 import numpy as np
 import pandas as pd
-import plotly.express as px
-import plotly.graph_objects as go
+
+from optimization_engine._optional import LazyModule
+
+#: Plotly is an optional extra (``viz``). Bound lazily so that importing
+#: this module — which the reporting package does eagerly — costs nothing
+#: until a figure is actually built. Return annotations naming ``go.Figure``
+#: are strings under ``from __future__ import annotations``, so they never
+#: trigger the import either.
+px = LazyModule("plotly.express", extra="viz", purpose="plotting")
+go = LazyModule("plotly.graph_objects", extra="viz", purpose="plotting")
 
 #: Categorical palette, in fixed slot order. The ordering is the
 #: colour-vision-deficiency safety mechanism, not cosmetics: every *adjacent*

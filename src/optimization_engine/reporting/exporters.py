@@ -13,6 +13,8 @@ from pathlib import Path
 
 import pandas as pd
 
+from optimization_engine._optional import require
+
 #: Excel refuses sheet names longer than this.
 _SHEET_NAME_LIMIT = 31
 
@@ -30,6 +32,10 @@ def write_excel_report(
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
     used: set[str] = set()
+    # Checked before opening the writer: pandas resolves the engine by
+    # name and its own ImportError names xlsxwriter without saying which
+    # extra ships it.
+    require("xlsxwriter", extra="excel", purpose="writing Excel workbooks")
     with pd.ExcelWriter(p, engine="xlsxwriter") as writer:
         for name, df in sheets.items():
             if df is None:

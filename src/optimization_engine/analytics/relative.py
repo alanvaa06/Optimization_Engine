@@ -11,8 +11,8 @@ from __future__ import annotations
 
 import numpy as np
 import pandas as pd
-import statsmodels.api as sm
 
+from optimization_engine._optional import LazyModule
 from optimization_engine.analytics.performance import (
     annualize_returns,
     annualize_volatility,
@@ -20,6 +20,11 @@ from optimization_engine.analytics.performance import (
     sharpe_ratio,
 )
 from optimization_engine.analytics.risk import downside_deviation
+
+#: statsmodels is only needed by the OLS-based metrics below (beta,
+#: conditional beta, regression stats). Everything else in this module is
+#: numpy and pandas, so it stays importable without the ``stats`` extra.
+sm = LazyModule("statsmodels.api", extra="stats", purpose="OLS regression metrics")
 
 
 def spread(
