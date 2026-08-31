@@ -1,0 +1,145 @@
+# Releasing
+
+The release workflow (`.github/workflows/release.yml`) publishes through
+**Trusted Publishing**: GitHub Actions proves its identity to the index over
+OIDC and receives a short-lived token scoped to this one upload. There is no
+API token in this repository's secrets — nothing to leak, nothing to rotate,
+and nothing that keeps working if someone copies it.
+
+That identity is checked against a publisher you register once per index.
+Until you do, the workflow builds and verifies fine and then fails at the
+upload step with a permissions error. This page is that setup, and the
+release procedure after it.
+
+## One-time setup
+
+### 1. Register the publisher on each index
+
+The project does not exist on either index yet, so both start as a **pending
+publisher** — a claim on a name that converts to a normal project on the
+first successful upload.
+
+Do this twice, once per index:
+
+| | |
+| --- | --- |
+| TestPyPI | <https://test.pypi.org/manage/account/publishing/> |
+| PyPI | <https://pypi.org/manage/account/publishing/> |
+
+Fill in exactly these values. Every field is compared literally against the
+OIDC claim, so a wrong repository name or environment fails closed:
+
+| Field | Value |
+| --- | --- |
+| PyPI Project Name | `finport-optengine` |
+| Owner | `alanvaa06` |
+| Repository name | `Optimization_Engine` |
+| Workflow name | `release.yml` |
+| Environment name | `testpypi` on TestPyPI, `pypi` on PyPI |
+
+The two indexes are separate accounts. Registering on one does nothing for
+the other.
+
+### 2. Create the two GitHub environments
+
+**Settings → Environments**, then add `testpypi` and `pypi`. The names have
+to match what you registered above and what the workflow declares.
+
+Leave `testpypi` unprotected — the point of it is to be cheap to run.
+
+On `pypi`, add yourself under **Required reviewers**. A PyPI upload cannot
+be undone: yanking a release hides it from resolution but the version number
+is burned forever, and the file stays downloadable. A review gate is the
+last point at which a mistake is still free.
+
+## Publishing to TestPyPI
+
+**Actions → Release → Run workflow.** That is the whole procedure.
+
+Every manual run publishes `<current version>.devN`, where `N` is the run
+number. This is deliberate: TestPyPI rejects a version it has already seen,
+and the alternative — skipping the upload and carrying on green — would
+leave you believing you had tested an artifact that was never uploaded. A
+fresh `.devN` each time means the round trip is always real.
+
+The run does four things in order, and stops at the first that fails:
+
+1. **build** — checks that `pyproject.toml` and `__init__.py` declare the
+   same version, stamps the dev suffix, builds the sdist and wheel, runs
+   `twine check --strict`, and asserts the wheel actually contains
+   `py.typed`.
+2. **verify** — installs the **wheel**, not the checkout, with no extras,
+   and solves a portfolio end to end. A packaging mistake that leaves a
+   module out of the distribution is invisible to tests that run against the
+   source tree; this is what catches it. Then installs `[all]` and drives
+   the `optengine` console script through a real report.
+3. **testpypi** — uploads.
+4. **testpypi-install** — installs the version it just published *from
+   TestPyPI* and asserts `optimization_engine.__version__` matches. This is
+   the only step that proves the artifact is reachable and installable from
+   an index rather than from a local file.
+
+### Installing a TestPyPI build by hand
+
+TestPyPI carries none of the real dependencies, so it needs PyPI as a
+fallback index or the install fails resolving numpy:
+
+```bash
+pip install \
+  --index-url https://test.pypi.org/simple/ \
+  --extra-index-url https://pypi.org/simple/ \
+  finport-optengine==0.4.0.dev3
+```
+
+## Publishing to PyPI
+
+1. Update `CHANGELOG.md`: move what is under `## [Unreleased]` into a new
+   version section with today's date.
+2. Bump the version **in both places** — `pyproject.toml` and
+   `src/optimization_engine/__init__.py`. The build fails if they disagree,
+   so a half-done bump cannot ship.
+3. Commit, and push to `main`.
+4. Tag and push the tag:
+
+   ```bash
+   git tag v0.5.0
+   git push origin v0.5.0
+   ```
+
+The tag is what triggers the PyPI path. The build re-checks that the tag
+matches the version in the source and fails if it does not, so a mistyped
+tag stops the release instead of publishing under the wrong number.
+
+Approve the `pypi` environment when GitHub asks, and the upload runs.
+
+### If something goes wrong
+
+A published version cannot be replaced. `pip install finport-optengine`
+resolves to whatever is on the index, and re-uploading the same version is
+rejected.
+
+- **Bad release, caught early** — yank it on PyPI (Manage → Releases →
+  Yank). Existing pins keep working, new resolutions skip it. Then fix
+  forward with a new patch version.
+- **A secret got published** — yank, then rotate the secret. Assume it was
+  scraped; the file remains downloadable after a yank.
+
+Fixing forward is always the answer. There is no version number to reuse.
+
+## Keeping the publish action current
+
+`pypa/gh-action-pypi-publish` is pinned by commit SHA rather than by tag,
+with the version in a trailing comment:
+
+```yaml
+uses: pypa/gh-action-pypi-publish@a892a5a61159132606e93a2fa6f4358831b04d26 # v1.14.2
+```
+
+A git tag can be repointed at a different commit; a SHA cannot. Since this
+is the step holding a token that can publish under your name, it is worth
+the small cost of updating the pin deliberately. To move it, resolve the new
+tag and replace both the SHA and the comment:
+
+```bash
+git ls-remote https://github.com/pypa/gh-action-pypi-publish refs/tags/v1.15.0
+```

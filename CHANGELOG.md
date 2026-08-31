@@ -11,6 +11,18 @@ with what to do about it.
 
 ## [Unreleased]
 
+### Added
+
+- A release workflow (`.github/workflows/release.yml`) publishing through
+  Trusted Publishing (OIDC), so no API token is stored in the repository.
+  A manual run publishes a fresh `.devN` to TestPyPI and then installs it
+  back *from* TestPyPI to prove the artifact is reachable; pushing a `v*`
+  tag publishes to PyPI behind a required-reviewer gate. The build refuses
+  to proceed if `pyproject.toml` and `__init__.py` disagree on the version,
+  or if a tag does not match the version it claims.
+- `docs/RELEASING.md` — the one-time Trusted Publishing setup each index
+  needs, the release procedure, and what to do about a bad release.
+
 ## [0.4.0] — 2026-08-30
 
 The release that makes the project installable from PyPI. No optimizer,
