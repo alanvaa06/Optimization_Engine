@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import sys
+from collections.abc import Callable
 from pathlib import Path
 
 import pandas as pd
@@ -27,6 +29,13 @@ from optimization_engine.optimizers._cvxpy_helpers import SolverFailure
 from optimization_engine.optimizers.factory import available_optimizers
 from optimization_engine.optimizers.requirements import requirements_for
 from optimization_engine.reporting.exporters import run_sheets, write_excel_report
+from optimization_engine.reporting.payloads import (
+    SCHEMA_VERSION,
+    backtest_payload,
+    check_payload,
+    describe_payload,
+    optimization_payload,
+)
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -37,6 +46,13 @@ def _build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
 
     optimize = sub.add_parser("optimize", help="Run an optimization end-to-end.")
+    optimize.add_argument(
+        "--json",
+        action="store_true",
+        help=(
+            "Emit the result as JSON on stdout instead of a formatted report. Human-readable narration moves to stderr, so stdout stays parseable."
+        ),
+    )
     optimize.add_argument("--config", required=True, help="Path to YAML/JSON config.")
     optimize.add_argument("--prices", help="Excel/CSV/Parquet file of prices.")
     optimize.add_argument("--sheet", default="Precios", help="Excel sheet name.")
@@ -136,6 +152,13 @@ def _build_parser() -> argparse.ArgumentParser:
         "backtest",
         help="Walk-forward the configured process, price the trading, and "
              "report what the search cost. Optionally sweep a grid.",
+    )
+    backtest.add_argument(
+        "--json",
+        action="store_true",
+        help=(
+            "Emit the result as JSON on stdout instead of a formatted report. Human-readable narration moves to stderr, so stdout stays parseable."
+        ),
     )
     backtest.add_argument("--config", required=True, help="Path to YAML/JSON config.")
     backtest.add_argument("--prices", help="Excel/CSV/Parquet file of prices.")
@@ -254,6 +277,13 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Validate data and constraints without solving. Reports data "
              "quality, covariance conditioning and constraint feasibility.",
     )
+    check.add_argument(
+        "--json",
+        action="store_true",
+        help=(
+            "Emit the result as JSON on stdout instead of a formatted report. Human-readable narration moves to stderr, so stdout stays parseable."
+        ),
+    )
     check.add_argument("--config", required=True, help="Path to YAML/JSON config.")
     check.add_argument("--prices", help="Excel/CSV/Parquet file of prices.")
     check.add_argument("--sheet", default="Precios", help="Excel sheet name.")
@@ -271,6 +301,13 @@ def _build_parser() -> argparse.ArgumentParser:
 
     describe = sub.add_parser(
         "describe", help="Explain one optimizer: what it needs and what it assumes."
+    )
+    describe.add_argument(
+        "--json",
+        action="store_true",
+        help=(
+            "Emit the result as JSON on stdout instead of a formatted report. Human-readable narration moves to stderr, so stdout stays parseable."
+        ),
     )
     describe.add_argument("name", help="Optimizer name (see list-optimizers).")
 
@@ -484,6 +521,7 @@ def _cmd_optimize(args: argparse.Namespace) -> int:
                     f"worst position {row['max_weight_drift']:.2%}"
                 )
     print(f"Wrote {out} ({len(sheets)} sheets)")
+    _capture(args, optimization_payload(run, output_path=str(out)))
     return 0
 
 
@@ -671,6 +709,7 @@ def _cmd_describe(args: argparse.Namespace) -> int:
     ]
     print(f"Supports: {', '.join(supports) if supports else 'no optional settings'}")
     print(f"Bounds: {req.bounds_note}")
+    _capture(args, describe_payload(req))
     return 0
 
 
@@ -1024,12 +1063,21 @@ def _cmd_backtest(args: argparse.Namespace) -> int:
             f"{float(outcome.summary.loc['holdout', 'Sharpe Ratio']):.2f}"
         )
 
+    out = None
     if args.output:
         frames = sheet.to_frames()
         if sweep_results is not None:
             frames["sweep"] = sweep_results.frame
         out = write_excel_report(args.output, frames)
         print(f"Wrote {out} ({len(frames)} sheets)")
+    _capture(
+        args,
+        backtest_payload(
+            walk.run,
+            tearsheet=sheet,
+            output_path=str(out) if out is not None else None,
+        ),
+    )
     return 0
 
 
@@ -1101,6 +1149,7 @@ def _cmd_check(args: argparse.Namespace) -> int:
             line += f" (efficient above {report.min_variance_return:.2%})"
         print(line)
 
+    _capture(args, check_payload(quality, report, diag))
     if quality.errors or not report.is_feasible:
         print("\nNot ready to optimize.", file=sys.stderr)
         return 1
@@ -1253,10 +1302,54 @@ def _cmd_fred(args: argparse.Namespace) -> int:
     return 0
 
 
+def _emit_json(
+    args: argparse.Namespace, command: Callable[[argparse.Namespace], int]
+) -> int:
+    """Run a command in JSON mode: payload on stdout, narration on stderr.
+
+    The commands below print as they work — data-quality findings, solver
+    fallbacks, constraint warnings — and that narration is useful even to a
+    machine caller, but not on the stream it is parsing. So stdout is
+    redirected to stderr for the duration and the payload is written to the
+    real stdout afterwards, which keeps every existing ``print`` where it is
+    instead of threading a formatter through several hundred lines.
+
+    A command that fails before producing a payload still emits one. A
+    caller parsing stdout should never have to distinguish "no JSON" from
+    "JSON I could not read"; an error object with the exit code is
+    unambiguous, and the human-readable reason is on stderr.
+    """
+    import json
+
+    sink: dict[str, object] = {}
+    args._json_sink = sink
+    with contextlib.redirect_stdout(sys.stderr):
+        code = command(args)
+    payload = sink.get("payload")
+    if payload is None:
+        payload = {
+            "schema_version": SCHEMA_VERSION,
+            "command": args.command,
+            "error": "the command exited before producing a result",
+            "exit_code": code,
+        }
+    print(json.dumps(payload, indent=2, default=str))
+    return code
+
+
+def _capture(args: argparse.Namespace, payload: dict[str, object]) -> None:
+    """Hand a payload to :func:`_emit_json`, if this run is in JSON mode."""
+    sink = getattr(args, "_json_sink", None)
+    if sink is not None:
+        sink["payload"] = payload
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
     if args.command == "optimize":
+        if args.json:
+            return _emit_json(args, _cmd_optimize)
         return _cmd_optimize(args)
     if args.command == "list-optimizers":
         return _cmd_list_optimizers()
@@ -1265,10 +1358,16 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "fred":
         return _cmd_fred(args)
     if args.command == "check":
+        if args.json:
+            return _emit_json(args, _cmd_check)
         return _cmd_check(args)
     if args.command == "backtest":
+        if args.json:
+            return _emit_json(args, _cmd_backtest)
         return _cmd_backtest(args)
     if args.command == "describe":
+        if args.json:
+            return _emit_json(args, _cmd_describe)
         return _cmd_describe(args)
     if args.command == "providers":
         return _cmd_providers(args)

@@ -11,6 +11,26 @@ with what to do about it.
 
 ## [Unreleased]
 
+### Added
+
+- `--json` on `optimize`, `backtest`, `check` and `describe`. Human
+  narration moves to stderr, so stdout is one parseable document and an
+  agent or pipeline can act on a result without scraping a formatted table.
+  Every payload carries `schema_version`, and a command that fails before
+  producing a result still emits JSON — an object with `error` and
+  `exit_code` — so a caller never has to distinguish "no output" from
+  "output I could not parse".
+- `optimization_engine.reporting.payloads`, the JSON contract as an
+  importable module rather than formatting buried in the CLI. Keys are
+  chosen for the reader instead of inherited from the attributes they came
+  from, and a value absent this run is `null` rather than a missing key, so
+  a consumer can test a value and never a key.
+- `AGENTS.md` and `llms.txt` — an API map for coding agents, including the
+  mistakes that cost real debugging time here: `sample_dataset()` returns
+  prices rather than returns, the solver is in `result.extras`, the
+  backtest hashes are on `result.meta`, and unconstrained `max_sharpe` puts
+  98.5% in cash on the sample panel.
+
 ## [0.4.1] — 2026-08-31
 
 A correctness and packaging release. Two of the three entries below only
