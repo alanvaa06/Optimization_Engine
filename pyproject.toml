@@ -3,13 +3,13 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "optimization-engine"
-version = "0.3.0"
+name = "finport-optengine"
+version = "0.4.0"
 description = "Multi-asset portfolio optimization engine with mean-variance, risk parity, HRP, Black-Litterman, CVaR and more."
 readme = "README.md"
 license = { file = "LICENSE" }
 requires-python = ">=3.9"
-authors = [{ name = "Optimization Engine Contributors" }]
+authors = [{ name = "Alan Vazquez" }]
 keywords = ["portfolio", "optimization", "finance", "quant", "risk-parity", "black-litterman", "hrp", "cvar"]
 classifiers = [
     "Programming Language :: Python :: 3",
@@ -17,28 +17,66 @@ classifiers = [
     "Operating System :: OS Independent",
     "Topic :: Office/Business :: Financial :: Investment",
 ]
+# The core solves and reports. Everything a caller can reach without asking
+# for a chart, a workbook or a regression lives on these five, so
+# ``pip install finport-optengine`` stays a small install; the rest is behind
+# the extras below. ``matplotlib`` and ``seaborn`` used to be listed here and
+# are gone rather than moved: nothing in the project imports either one.
 dependencies = [
     "numpy>=1.24",
     "pandas>=2.0",
     "scipy>=1.10",
-    "matplotlib>=3.7",
-    "seaborn>=0.12",
-    "plotly>=5.17",
     "cvxpy>=1.4",
-    "scikit-learn>=1.3",
-    "statsmodels>=0.14",
+    # Named rather than left to cvxpy because SOLVER_FALLBACK reaches for SCS
+    # by name, and 3.3.0's wheel ships an incomplete Intel oneMKL bundle:
+    # importing it and solving aborts the interpreter with "Cannot load
+    # libmkl_avx512.so.3 or libmkl_def.so.3" — a process death, not an
+    # exception, so no fallback can catch it and no traceback says why.
+    # Reproduced on GitHub's runners and in a local container; 3.2.11 is fine.
+    # Drop the exclusion once a fixed release is out.
+    "scs>=3.2,!=3.3.0",
     "pyyaml>=6.0",
-    "openpyxl>=3.1",
-    "xlsxwriter>=3.1",
+    # In the core because it backs the *default* covariance estimator:
+    # ``covariance_matrix`` shrinks with Ledoit-Wolf unless told otherwise.
+    # Demoting it to an extra would mean the first call in the README fails
+    # on a fresh install, or that the default silently becomes the sample
+    # covariance — a change to everyone's numbers, traded for ~15MB.
+    "scikit-learn>=1.3",
 ]
 
+[project.urls]
+Homepage = "https://github.com/alanvaa06/optimization_engine"
+Repository = "https://github.com/alanvaa06/optimization_engine"
+Issues = "https://github.com/alanvaa06/optimization_engine/issues"
+Changelog = "https://github.com/alanvaa06/optimization_engine/blob/main/CHANGELOG.md"
+
 [project.optional-dependencies]
-ui = ["streamlit>=1.49", "ipywidgets>=8.0"]
+# Plotly figures from ``optimization_engine.reporting.plots``. The module
+# imports without it; building a figure is what raises.
+viz = ["plotly>=5.17"]
+# Reading and writing .xlsx. ``xlsxwriter`` writes the report workbook,
+# ``openpyxl`` is the engine pandas reads one back with.
+excel = ["openpyxl>=3.1", "xlsxwriter>=3.1"]
+# The OLS-based benchmark-relative metrics — beta, conditional beta,
+# regression stats. Only reached when a benchmark is supplied, so an
+# absolute-return workflow never needs it.
+stats = ["statsmodels>=0.14"]
+ui = ["streamlit>=1.49", "ipywidgets>=8.0", "plotly>=5.17"]
 # ``pyarrow`` is what pandas uses to read and write Parquet. Nothing in the
 # engine's core needs it — the panel cache deliberately stores NumPy so that it
 # does not — but ``--output prices.parquet`` and ``--prices panel.parquet`` do.
 data = ["yfinance>=0.2.40", "pyarrow>=14.0"]
 extras = ["riskfolio-lib>=5.0"]
+# What the CLI and the README's worked examples assume: they write .xlsx and
+# draw figures, so a bare core install cannot run them end to end.
+all = [
+    "plotly>=5.17",
+    "openpyxl>=3.1",
+    "xlsxwriter>=3.1",
+    "statsmodels>=0.14",
+    "yfinance>=0.2.40",
+    "pyarrow>=14.0",
+]
 dev = ["pytest>=7.4", "pytest-cov>=4.1", "ruff>=0.5"]
 
 [project.scripts]

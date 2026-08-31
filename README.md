@@ -1,7 +1,9 @@
 # Optimization Engine
 
 A multi-asset portfolio optimization engine with a clean API, a Streamlit
-UI, and a CLI. Built on top of `cvxpy`, `scipy`, `pandas`, and `plotly`.
+UI, and a CLI. Built on top of `cvxpy`, `scipy`, `pandas` and
+`scikit-learn`, with plotting, Excel and regression support behind
+optional extras.
 
 The engine is opinionated about one thing: **an allocation is not a result
 until you can see what it rests on.** Every solve returns the weights *and*
@@ -597,12 +599,38 @@ tests/                # pytest suite
 ## Install
 
 ```bash
-pip install -e ".[ui,extras,dev]"
+pip install finport-optengine
 ```
 
-The `extras` pull `riskfolio-lib`; `ui` pulls Streamlit and ipywidgets.
-Without `extras` the engine falls back to scikit-learn's Ledoit-Wolf for
-the `shrink` covariance method.
+That is the core: the optimizers, the covariance estimators, the backtest
+and the analytics, on numpy, pandas, scipy, cvxpy, scikit-learn and pyyaml.
+The parts most callers do not need are extras:
+
+| Extra | Pulls | Needed for |
+| --- | --- | --- |
+| `viz` | plotly | Every figure in `reporting.plots` |
+| `excel` | openpyxl, xlsxwriter | Reading and writing `.xlsx` |
+| `stats` | statsmodels | Benchmark-relative OLS metrics (beta, regression stats) |
+| `data` | yfinance, pyarrow | The Yahoo provider, and Parquet panels |
+| `ui` | streamlit, ipywidgets, plotly | The Streamlit app |
+| `extras` | riskfolio-lib | Its covariance estimators, where installed |
+| `all` | everything above except `ui`/`extras` | The CLI's worked examples |
+
+Reaching a feature whose extra is missing raises with the command that fixes
+it, rather than a bare `ModuleNotFoundError`. To run the CLI end to end:
+
+```bash
+pip install "finport-optengine[all]"
+```
+
+For a source checkout, working on the engine itself:
+
+```bash
+pip install -e ".[all,ui,extras,dev]"
+```
+
+The import name stays `optimization_engine` and the console script stays
+`optengine`, whichever way it was installed.
 
 ## Use it
 

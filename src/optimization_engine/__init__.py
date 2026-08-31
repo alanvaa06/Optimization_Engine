@@ -1,5 +1,24 @@
-"""Multi-asset portfolio optimization engine."""
+"""Multi-asset portfolio optimization engine.
 
+The data-ingestion API is reachable two ways. The names most callers touch —
+:class:`IngestRequest`, :class:`IngestResult`, :class:`PricePanel` and the
+:class:`IngestError` base — are re-exported here. Everything else stays in
+:mod:`optimization_engine.ingest`, which is bound as an attribute of this
+package::
+
+    from optimization_engine import ingest
+    result = ingest.ingest(IngestRequest(identifiers=["SPY"], provider="yahoo"))
+
+The subpackage is not flattened into this namespace on purpose. Its field
+constants are named for what they mean *inside a price panel* — ``CLOSE``,
+``OPEN``, ``HIGH``, ``LOW``, ``VOLUME`` — and those are far too generic to
+own a slot in the top-level namespace of a library that also exports
+optimizers, estimators and analytics. The ``ingest`` function keeps its
+qualified spelling for the same reason: unqualified, it would shadow the
+subpackage that shares its name.
+"""
+
+from optimization_engine import ingest
 from optimization_engine.analytics.active import (
     FundamentalLawReport,
     InformationCoefficient,
@@ -124,6 +143,12 @@ from optimization_engine.data.yahoo import (
 )
 from optimization_engine.engine import EngineRun, run_engine
 from optimization_engine.frontier import FrontierResult, efficient_frontier
+from optimization_engine.ingest import (
+    IngestError,
+    IngestRequest,
+    IngestResult,
+    PricePanel,
+)
 from optimization_engine.optimizers import (
     BaseOptimizer,
     BlackLittermanOptimizer,
@@ -177,7 +202,7 @@ from optimization_engine.scenarios import (
     scenario_to_dict,
 )
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 __all__ = [
     "BenchmarkSpec",
@@ -243,6 +268,11 @@ __all__ = [
     "run_engine",
     "FrontierResult",
     "efficient_frontier",
+    "ingest",
+    "IngestError",
+    "IngestRequest",
+    "IngestResult",
+    "PricePanel",
     "FrontierUncertainty",
     "MCOSResult",
     "bootstrap_frontier",

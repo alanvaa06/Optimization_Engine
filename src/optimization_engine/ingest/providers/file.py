@@ -21,6 +21,7 @@ from pathlib import Path
 
 import pandas as pd
 
+from optimization_engine._optional import require
 from optimization_engine.ingest import fields as F
 from optimization_engine.ingest.adjust import rescale_frames_to_adjusted
 from optimization_engine.ingest.errors import (
@@ -132,6 +133,7 @@ class LocalFile(PriceProvider):
         if suffix in {".csv", ".txt"}:
             return pd.read_csv(self._path)
         if suffix in {".xlsx", ".xls", ".xlsm"}:
+            require("openpyxl", extra="excel", purpose="reading Excel workbooks")
             return pd.read_excel(self._path, sheet_name=self._sheet_name)
         if suffix == ".parquet":
             return pd.read_parquet(self._path)

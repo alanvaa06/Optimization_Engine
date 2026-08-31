@@ -1,0 +1,273 @@
+name: Release
+
+# Two ways in, and they cannot be confused for one another:
+#
+#   workflow_dispatch  → TestPyPI, always as a fresh .devN of the current
+#                        version, because TestPyPI refuses a version it has
+#                        already seen and silently skipping the upload would
+#                        leave you testing the *previous* artifact.
+#   push of a v* tag   → PyPI, and only if the tag matches the version in
+#                        the source. A tag that disagrees fails the build
+#                        rather than publishing something nobody asked for.
+#
+# Both paths publish through Trusted Publishing (OIDC): the workflow proves
+# its identity to the index and receives a short-lived token. There is no API
+# token in this repository's secrets, so there is none to leak or rotate.
+# See docs/RELEASING.md for the one-time setup each index needs.
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+# Nothing here needs write access to the repository itself. The publishing
+# jobs add `id-token: write` locally, which is what mints the OIDC token.
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build and check artifacts
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Version is declared once and agrees with itself
+        id: version
+        run: |
+          python - <<'PY' >> "$GITHUB_OUTPUT"
+          import os
+          import re
+          import sys
+          import tomllib
+          from pathlib import Path
+
+          pyproject = tomllib.loads(Path("pyproject.toml").read_text())["project"]["version"]
+          source = re.search(
+              r'^__version__ = "([^"]+)"$',
+              Path("src/optimization_engine/__init__.py").read_text(),
+              re.M,
+          )
+          if source is None:
+              sys.exit("no __version__ in src/optimization_engine/__init__.py")
+          if source[1] != pyproject:
+              sys.exit(
+                  f"version drift: pyproject says {pyproject}, "
+                  f"__init__ says {source[1]}"
+              )
+
+          version = pyproject
+          ref = os.environ["GITHUB_REF"]
+          if ref.startswith("refs/tags/"):
+              # A real release. The tag is the claim; the source is the truth.
+              tag = ref.removeprefix("refs/tags/").lstrip("v")
+              if tag != version:
+                  sys.exit(f"tag v{tag} does not match version {version}")
+          else:
+              # A TestPyPI run. Uniquify so every dispatch publishes something
+              # installable rather than colliding with an earlier upload.
+              version = f"{version}.dev{os.environ['GITHUB_RUN_NUMBER']}"
+          print(f"version={version}")
+          PY
+
+      - name: Stamp the dev version
+        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          python - <<'PY'
+          import os
+          import re
+          from pathlib import Path
+
+          version = os.environ["VERSION"]
+          for path, pattern in (
+              ("pyproject.toml", r'^version = "[^"]+"$'),
+              ("src/optimization_engine/__init__.py", r'^__version__ = "[^"]+"$'),
+          ):
+              p = Path(path)
+              replacement = (
+                  f'version = "{version}"'
+                  if path.endswith(".toml")
+                  else f'__version__ = "{version}"'
+              )
+              text, n = re.subn(pattern, replacement, p.read_text(), count=1, flags=re.M)
+              assert n == 1, path
+              p.write_text(text)
+          print(f"stamped {version}")
+          PY
+
+      - name: Build
+        run: |
+          python -m pip install --upgrade pip build twine
+          python -m build
+
+      - name: Check metadata
+        run: python -m twine check --strict dist/*
+
+      - name: The wheel carries py.typed
+        run: |
+          python - <<'PY'
+          import glob
+          import sys
+          import zipfile
+
+          wheel = glob.glob("dist/*.whl")[0]
+          names = zipfile.ZipFile(wheel).namelist()
+          if "optimization_engine/py.typed" not in names:
+              sys.exit(f"{wheel} ships no py.typed — type checkers would ignore it")
+          print(f"{wheel} carries py.typed")
+          PY
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error
+
+  verify:
+    name: Installed artifact works
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      # Checked out for config/example_multi_asset.yaml alone — the code under
+      # test comes from the wheel, never from this tree.
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      # Installs the built wheel, not the checkout. A packaging mistake that
+      # leaves a module or a data file out of the distribution is invisible to
+      # every test that runs against the source tree.
+      - name: Install the wheel, core only
+        run: |
+          python -m pip install --upgrade pip
+          pip install dist/*.whl
+
+      - name: The core solves without any extra
+        run: |
+          python - <<'PY'
+          import numpy as np
+          import pandas as pd
+          import optimization_engine as oe
+
+          rng = np.random.default_rng(0)
+          returns = pd.DataFrame(
+              rng.normal(0.0004, 0.01, (500, 4)),
+              columns=list("ABCD"),
+              index=pd.bdate_range("2022-01-01", periods=500),
+          )
+          run = oe.run_engine(
+              returns, oe.EngineConfig(optimizer=oe.OptimizerSpec(name="max_sharpe"))
+          )
+          assert abs(float(run.result.weights.sum()) - 1.0) < 1e-6
+          assert oe.ingest.ingest(
+              oe.IngestRequest(identifiers=["A", "B"], provider="sample")
+          ).prices.shape[1] == 2
+          print(f"optimization_engine {oe.__version__} works from the wheel")
+          PY
+
+      - name: The console script is wired up
+        run: |
+          pip install "$(echo dist/*.whl)[all]"
+          optengine list-optimizers > /dev/null
+          optengine optimize \
+            --config config/example_multi_asset.yaml \
+            --sample --output /tmp/report.xlsx
+          test -s /tmp/report.xlsx
+        shell: bash
+
+  testpypi:
+    name: Publish to TestPyPI
+    # Manual runs only. A tag goes to the real index.
+    if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+    needs: [build, verify]
+    runs-on: ubuntu-latest
+    environment:
+      name: testpypi
+      url: https://test.pypi.org/p/finport-optengine
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@a892a5a61159132606e93a2fa6f4358831b04d26 # v1.14.2
+        with:
+          repository-url: https://test.pypi.org/legacy/
+
+  testpypi-install:
+    name: Install from TestPyPI
+    needs: [build, testpypi]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      # The whole point of the TestPyPI round trip: prove the thing is
+      # installable *from an index*, not just from a local file. TestPyPI
+      # carries none of the real dependencies, so PyPI stays as the extra
+      # index for those.
+      - name: Install the published version
+        env:
+          VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          for attempt in 1 2 3 4 5; do
+            if pip install \
+                --index-url https://test.pypi.org/simple/ \
+                --extra-index-url https://pypi.org/simple/ \
+                "finport-optengine==${VERSION}"; then
+              echo "installed on attempt ${attempt}"
+              exit 0
+            fi
+            echo "not indexed yet; retrying in $((attempt * 15))s"
+            sleep $((attempt * 15))
+          done
+          echo "finport-optengine==${VERSION} never became installable"
+          exit 1
+      - name: It imports and reports the version we published
+        env:
+          VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          python -c "
+          import os, optimization_engine as oe
+          assert oe.__version__ == os.environ['VERSION'], (oe.__version__, os.environ['VERSION'])
+          print('TestPyPI round trip OK:', oe.__version__)
+          "
+
+  pypi:
+    name: Publish to PyPI
+    # Tags only, and only ones the build agreed with.
+    if: ${{ startsWith(github.ref, 'refs/tags/') }}
+    needs: [build, verify]
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/finport-optengine
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@a892a5a61159132606e93a2fa6f4358831b04d26 # v1.14.2

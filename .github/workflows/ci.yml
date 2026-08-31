@@ -50,7 +50,7 @@ jobs:
       - name: Install
         run: |
           python -m pip install --upgrade pip
-          pip install -e ".[dev]"
+          pip install -e ".[all,dev]"
       - name: Test
         # The suite is fully offline: the Yahoo and FRED loaders are mocked,
         # so nothing here depends on a network round-trip.
@@ -73,7 +73,7 @@ jobs:
       - name: Install
         run: |
           python -m pip install --upgrade pip
-          pip install -e ".[dev,ui]"
+          pip install -e ".[all,dev,ui]"
       # Drives the real page through Streamlit's AppTest harness. Without this
       # job the app tests would skip silently everywhere, since the matrix
       # above installs no UI extra.
@@ -83,6 +83,81 @@ jobs:
       # test, because it looks like coverage.
       - name: Test
         run: pytest -q tests/test_app_*.py tests/test_ui_state.py
+
+  core:
+    name: Core install (no extras)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      # Deliberately no extras. This job is what keeps the core small: a
+      # module-level ``import plotly`` added anywhere on an import path the
+      # package touches at load time would pass every other job here and
+      # fail only for users who installed without extras.
+      - name: Install core only
+        run: |
+          python -m pip install --upgrade pip
+          pip install .
+      - name: No optional dependency leaked into the core
+        run: |
+          python - <<'PY'
+          import importlib, sys
+          leaked = []
+          for mod in ("plotly", "statsmodels", "openpyxl", "xlsxwriter",
+                      "matplotlib", "seaborn", "yfinance", "streamlit"):
+              try:
+                  importlib.import_module(mod)
+              except ImportError:
+                  continue
+              leaked.append(mod)
+          if leaked:
+              sys.exit(f"optional dependencies present in a core install: {leaked}")
+          print("core install is clean")
+          PY
+      - name: The core solves, reports and ingests
+        run: |
+          python - <<'PY'
+          import numpy as np, pandas as pd
+          import optimization_engine as oe
+
+          rng = np.random.default_rng(0)
+          returns = pd.DataFrame(
+              rng.normal(0.0004, 0.01, (750, 4)),
+              columns=list("ABCD"),
+              index=pd.bdate_range("2021-01-01", periods=750),
+          )
+          # The default covariance estimator is Ledoit-Wolf, so this also
+          # asserts scikit-learn stayed in the core.
+          run = oe.run_engine(returns, oe.EngineConfig(
+              optimizer=oe.OptimizerSpec(name="max_sharpe")))
+          assert abs(float(run.result.weights.sum()) - 1.0) < 1e-6
+
+          # Importable without plotly / statsmodels installed.
+          import optimization_engine.analytics.relative  # noqa: F401
+          import optimization_engine.reporting.plots  # noqa: F401
+
+          panel = oe.ingest.ingest(
+              oe.IngestRequest(identifiers=["A", "B"], provider="sample"))
+          assert not panel.prices.empty
+          print("core engine OK")
+          PY
+      - name: A missing extra names the extra
+        run: |
+          python - <<'PY'
+          import pandas as pd
+          from optimization_engine.reporting.plots import plot_correlation_heatmap
+          try:
+              plot_correlation_heatmap(pd.DataFrame([[1.0, 0.2], [0.2, 1.0]]))
+          except ImportError as exc:
+              assert "finport-optengine[viz]" in str(exc), str(exc)
+              print("error message points at the right extra")
+          else:
+              raise SystemExit("expected ImportError without plotly")
+          PY
 
   smoke:
     name: CLI smoke test
@@ -97,7 +172,7 @@ jobs:
       - name: Install
         run: |
           python -m pip install --upgrade pip
-          pip install -e ".[dev]"
+          pip install -e ".[all,dev]"
       # Exercises the installed console-script entry point, which unit tests
       # calling main() directly would not catch if packaging broke.
       - name: Method registry
