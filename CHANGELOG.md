@@ -11,6 +11,35 @@ with what to do about it.
 
 ## [Unreleased]
 
+### Fixed
+
+- `covariance_method="shrink"` no longer means different mathematics on
+  different machines. It routed through `riskfolio-lib` when that package
+  happened to be installed and fell back to scikit-learn's Ledoit-Wolf when
+  it did not — a silent fork, since `CovarianceDiagnostics` recorded no such
+  thing, so the same config on the same data produced different numbers with
+  nothing in the output saying which estimator had run. On the sample panel
+  the two differ by 8.3% of the largest element, which is an estimator
+  change, not a rounding difference. Worse, the fallback caught bare
+  `Exception`, so any riskfolio error or API change swapped the estimator
+  silently too.
+
+  `shrink` is now a documented alias for `ledoit_wolf`, so configs and saved
+  scenarios written against it keep loading and now reproduce anywhere. The
+  `extras` optional dependency, whose only purpose was this route, is gone.
+
+- The README renders on PyPI. Every image and repository link was a relative
+  path, which resolves against the repo on GitHub and against nothing on
+  PyPI — all nine figures were broken on the project page, along with the
+  links to the licence and the research notes. They are absolute now.
+
+### Changed
+
+- The README leads with the install command and a runnable quickstart
+  instead of burying `pip install` 600 lines down. The example's printed
+  output is checked against what the code in that same block actually
+  produces, so it cannot drift into fiction.
+
 ## [0.4.0] — 2026-08-31
 
 The release that makes the project installable from PyPI. No optimizer,

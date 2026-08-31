@@ -1,9 +1,15 @@
 """Covariance and expected-return estimation.
 
 Wraps the common estimators (sample, Ledoit-Wolf, OAS, EWMA, semicovariance)
-behind a single, ergonomic API. We deliberately avoid hard-coding
-``riskfolio-lib``; if it's installed we route ``covariance_method="shrink"``
-through it, otherwise we fall back to ``sklearn``'s Ledoit-Wolf shrinkage.
+behind a single, ergonomic API.
+
+Every method name resolves to exactly one estimator, on every machine. That
+is a deliberate constraint rather than an obvious one: ``"shrink"`` used to
+route through ``riskfolio-lib`` when it happened to be installed and fall
+back to Ledoit-Wolf when it was not, which meant the same config on the same
+data produced different numbers depending on the environment, with nothing
+in the output saying which had run. An engine that reports what an
+allocation rests on cannot have an estimator that varies with the virtualenv.
 
 Every estimator returns a matrix that is symmetric and positive semi-definite:
 estimators that can produce indefinite matrices (EWMA on short samples,
@@ -44,7 +50,8 @@ COVARIANCE_DESCRIPTIONS: dict[str, str] = {
         "harder on short samples."
     ),
     "shrink": (
-        "riskfolio-lib shrinkage when installed, otherwise Ledoit-Wolf."
+        "Alias for ledoit_wolf, kept so that configs and saved scenarios "
+        "written against it keep loading. Prefer ledoit_wolf in new work."
     ),
     "ewma": (
         "RiskMetrics exponentially-weighted covariance. Reacts fast to "
@@ -261,15 +268,6 @@ def _semi(returns: pd.DataFrame, mar: float | pd.Series | None = None) -> pd.Dat
     return pd.DataFrame(cov, index=returns.columns, columns=returns.columns)
 
 
-def _shrink(returns: pd.DataFrame) -> pd.DataFrame:
-    try:
-        import riskfolio as rf
-
-        return rf.ParamsEstimation.covar_matrix(returns, method="shrink")
-    except Exception:
-        return _ledoit_wolf(returns)
-
-
 def covariance_matrix(
     returns: pd.DataFrame,
     method: CovarianceMethod = "ledoit_wolf",
@@ -339,7 +337,8 @@ def covariance_matrix(
     elif method == "oas":
         cov = _oas(returns)
     elif method == "shrink":
-        cov = _shrink(returns)
+        # An alias, not a third shrinkage estimator — see the module docstring.
+        cov = _ledoit_wolf(returns)
     elif method == "ewma":
         cov = _ewma(returns, lam=ewma_lambda)
     elif method == "semi":

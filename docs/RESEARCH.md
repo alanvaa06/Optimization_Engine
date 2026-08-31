@@ -151,8 +151,12 @@ Optimization* (2021), *Convex Optimization of Portfolio Kurtosis* (2022),
 *Portfolio Optimization of Relativistic Value at Risk* (2023), and the 2025
 book *Advanced Portfolio Optimization*.
 
-**Already implemented:** mean-CVaR (Rockafellar-Uryasev), semicovariance, and a
-passthrough to riskfolio-lib's shrinkage when installed.
+**Already implemented:** mean-CVaR (Rockafellar-Uryasev) and semicovariance,
+both natively. A passthrough to riskfolio-lib's shrinkage existed and was
+removed: it resolved to riskfolio's estimator when the package happened to be
+installed and to Ledoit-Wolf when it was not, so the same method name meant
+different mathematics on different machines, and nothing in the output said
+which had run.
 
 **Added:** mean-CDaR (§4 below), and downside risk measures (CVaR, conditional
 drawdown) as the cluster-splitting criterion inside HERC — the pluggable-risk-
@@ -169,7 +173,9 @@ measure idea applied where it costs nothing to support.
   express its own objective. Worth doing; worth doing properly.
 * **OWA / range risk measures** (Gini mean difference, tail Gini, CVaR range).
   A framework rather than a method, and one riskfolio-lib already implements
-  well. The right move is a routed passthrough, not a reimplementation.
+  well. A routed passthrough is still the right move over a reimplementation —
+  but routed explicitly: the method has to name its backend, and its absence
+  has to raise rather than quietly substitute a different estimator.
 * **Kelly / logarithmic mean-risk.** `cp.log` makes the program straightforward,
   but the objective changes what "expected return" means throughout the
   reporting, backtest and frontier layers. That is a coherent piece of work, not

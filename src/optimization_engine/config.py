@@ -104,7 +104,7 @@ class EngineConfig:
             :mod:`optimization_engine.constraints`.
         periods_per_year: Number of return observations per year.
         covariance_method: ``sample``, ``ledoit_wolf``, ``oas``,
-            ``shrink`` (Ledoit-Wolf via riskfolio when available),
+            ``shrink`` (an alias for ``ledoit_wolf``),
             ``ewma``, ``semi``, or ``denoised`` (sample covariance filtered
             through the Marchenko-Pastur eigenvalue cutoff).
         ewma_lambda: Decay used when ``covariance_method == "ewma"``.

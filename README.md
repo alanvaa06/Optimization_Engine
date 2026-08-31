@@ -13,7 +13,64 @@ the book is in risk rather than capital, how much of the backtest survives out
 of sample, and how much of *that* survives the number of configurations you
 tried before settling on this one.
 
-![The Optimize tab: compliance banner, concentration diagnostics, allocation and risk decomposition](docs/images/app-optimize.png)
+```bash
+pip install finport-optengine
+```
+
+```python
+from optimization_engine import (
+    EngineConfig,
+    OptimizerSpec,
+    portfolio_diagnostics,
+    prices_to_returns,
+    run_engine,
+    sample_dataset,
+)
+
+returns = prices_to_returns(sample_dataset())   # swap in your own price panel
+run = run_engine(returns, EngineConfig(optimizer=OptimizerSpec(name="risk_parity")))
+
+print(run.result.weights.round(3).to_string())
+
+# The weights are half the answer. The other half is what they rest on:
+diag = portfolio_diagnostics(run.result.weights, run.cov_matrix)
+print(f"\nsolver             {run.result.extras['solver']}")
+print(f"condition number   {run.covariance_diagnostics.condition_number:,.0f}")
+print(f"effective assets   {diag.effective_n:.1f} by capital, "
+      f"{diag.effective_n_risk:.1f} by risk")
+```
+
+```
+US_Equity        0.025
+Intl_Equity      0.023
+EM_Equity        0.019
+Real_Estate      0.019
+Commodities      0.015
+Infra            0.022
+Gold             0.024
+US_Treasuries    0.058
+TIPS             0.070
+IG_Credit        0.053
+HY_Credit        0.036
+EM_Debt          0.041
+Cash             0.595
+
+solver             CLARABEL
+condition number   2,114
+effective assets   2.7 by capital, 13.0 by risk
+```
+
+That last line is the whole argument in one number. The book holds 59.5% cash,
+so by capital it is barely three positions wide — but risk parity equalises
+*risk*, so all thirteen assets contribute. A weights table alone shows the
+first number and hides the second.
+
+The import name is `optimization_engine` and the console script is `optengine`,
+whichever way you install it. The core is numpy, pandas, scipy, cvxpy and
+scikit-learn; plotting, Excel and regression live behind
+[extras](#install).
+
+![The Optimize tab: compliance banner, concentration diagnostics, allocation and risk decomposition](https://raw.githubusercontent.com/alanvaa06/Optimization_Engine/main/docs/images/app-optimize.png)
 
 ## The five questions it answers
 
@@ -26,7 +83,7 @@ allocation actually landed. The sweep range comes from what the constraints
 can reach, so a binding position cap shortens the curve instead of silently
 failing half of it.
 
-![Efficient frontier with minimum-variance, tangency, capital allocation line and the selected portfolio marked](docs/images/frontier.png)
+![Efficient frontier with minimum-variance, tangency, capital allocation line and the selected portfolio marked](https://raw.githubusercontent.com/alanvaa06/Optimization_Engine/main/docs/images/frontier.png)
 
 ### 2. How much of that curve is real?
 
@@ -37,7 +94,7 @@ Differences narrower than that band are not distinguishable from estimation
 noise, which is a useful thing to know before defending a 20bp allocation
 difference in a meeting.
 
-![The same frontier resampled 60 times, drawn as a confidence band around the point estimate](docs/images/frontier-uncertainty.png)
+![The same frontier resampled 60 times, drawn as a confidence band around the point estimate](https://raw.githubusercontent.com/alanvaa06/Optimization_Engine/main/docs/images/frontier-uncertainty.png)
 
 ### 3. Where is the risk, as opposed to the money?
 
@@ -46,7 +103,7 @@ happy to let them diverge. Here a 26% position in EM equity carries **71% of
 the portfolio's risk** — the gap between the two bars is the entire argument
 for risk budgeting, and it is invisible in a weights table.
 
-![Capital weight beside share of risk per asset, showing a 26% position carrying 71% of risk](docs/images/capital-vs-risk.png)
+![Capital weight beside share of risk per asset, showing a 26% position carrying 71% of risk](https://raw.githubusercontent.com/alanvaa06/Optimization_Engine/main/docs/images/capital-vs-risk.png)
 
 ### 4. Would any of this have worked?
 
@@ -58,7 +115,7 @@ cadence and the same 15bps of trading cost on both lines, so the gap is
 overfitting rather than a cost artefact: **Sharpe 0.74 fitted against 0.23
 walk-forward.**
 
-![In-sample and out-of-sample wealth curves diverging over time](docs/images/walk-forward.png)
+![In-sample and out-of-sample wealth curves diverging over time](https://raw.githubusercontent.com/alanvaa06/Optimization_Engine/main/docs/images/walk-forward.png)
 
 ### 5. Is any of that real, or did you try forty things and report the best?
 
@@ -183,7 +240,7 @@ constraint and any breach is reported.
 **Covariance estimators**
 
 `sample`, `ledoit_wolf`, `oas`, `ewma` (RiskMetrics), `semi`,
-`shrink` (riskfolio passthrough when installed), and `denoised`.
+`shrink` (an alias for `ledoit_wolf`), and `denoised`.
 
 Every estimate is symmetrized and PSD-repaired, and comes with diagnostics:
 observations per asset, condition number, smallest eigenvalue, and effective
@@ -311,7 +368,7 @@ with the sample. The shaded bands are relative drawdown: the stretches during
 which the portfolio was behind the index it is measured on, which is what a
 client remembers and what no absolute chart shows.
 
-![Portfolio wealth divided by benchmark wealth, with the periods spent behind the index shaded](docs/images/relative-performance.png)
+![Portfolio wealth divided by benchmark wealth, with the periods spent behind the index shaded](https://raw.githubusercontent.com/alanvaa06/Optimization_Engine/main/docs/images/relative-performance.png)
 
 Annualized figures hide the shape of a record, so the same report tabulates it
 period by period. Here the portfolio beat the index in seven of the nine
@@ -319,7 +376,7 @@ calendar periods, and the two it lost were the first two — a shape that a
 single information ratio summarises away, and that decides whether anyone is
 still invested by the third year.
 
-![Calendar-year returns for the portfolio and its benchmark, with the excess marked](docs/images/period-returns.png)
+![Calendar-year returns for the portfolio and its benchmark, with the excess marked](https://raw.githubusercontent.com/alanvaa06/Optimization_Engine/main/docs/images/period-returns.png)
 
 `active_mean_variance` goes further and optimizes in active space directly:
 maximize `α'x − λ·x'Σx` over `x = w − b`, or maximize expected active return
@@ -613,8 +670,7 @@ The parts most callers do not need are extras:
 | `stats` | statsmodels | Benchmark-relative OLS metrics (beta, regression stats) |
 | `data` | yfinance, pyarrow | The Yahoo provider, and Parquet panels |
 | `ui` | streamlit, ipywidgets, plotly | The Streamlit app |
-| `extras` | riskfolio-lib | Its covariance estimators, where installed |
-| `all` | everything above except `ui`/`extras` | The CLI's worked examples |
+| `all` | everything above except `ui` | The CLI's worked examples |
 
 Reaching a feature whose extra is missing raises with the command that fixes
 it, rather than a bare `ModuleNotFoundError`. To run the CLI end to end:
@@ -626,7 +682,7 @@ pip install "finport-optengine[all]"
 For a source checkout, working on the engine itself:
 
 ```bash
-pip install -e ".[all,ui,extras,dev]"
+pip install -e ".[all,ui,dev]"
 ```
 
 The import name stays `optimization_engine` and the console script stays
@@ -656,7 +712,7 @@ surfaces what could make the next one wrong.
    every asset present. The missing-data policy is an explicit choice, and the
    app logs exactly what it did to the panel.
 
-   ![The Data tab, leading with a data-quality verdict and per-asset coverage](docs/images/app-data.png)
+   ![The Data tab, leading with a data-quality verdict and per-asset coverage](https://raw.githubusercontent.com/alanvaa06/Optimization_Engine/main/docs/images/app-data.png)
 2. **Assets** — per-asset statistics (extended metrics on a toggle) plus a
    drawdown-episode table with peak, trough, recovery and time underwater.
 3. **Assumptions & constraints** — editable expected returns, weight bounds,
@@ -670,7 +726,7 @@ surfaces what could make the next one wrong.
    feasibility check** that names the constraint making the problem
    impossible and what to change, before you ever press solve.
 
-   ![The constraints tab, with the method card and the live feasibility check](docs/images/app-constraints.png)
+   ![The constraints tab, with the method card and the live feasibility check](https://raw.githubusercontent.com/alanvaa06/Optimization_Engine/main/docs/images/app-constraints.png)
 4. **Optimize** — a compliance banner, KPI cards, concentration and
    diversification measures, a **policy-exposure table** that says where the
    book landed on every layer and marks which bucket actually stopped it, a
@@ -1061,7 +1117,7 @@ flagged `SHIFTED_HOLDOUT`.
 
 ## Where the methods come from
 
-[`docs/RESEARCH.md`](docs/RESEARCH.md) is the reading behind these methods: what
+[`docs/RESEARCH.md`](https://github.com/alanvaa06/Optimization_Engine/blob/main/docs/RESEARCH.md) is the reading behind these methods: what
 López de Prado, Cajas, Grinold & Kahn, Meucci, Raffinot and the rest actually
 claim, which of it this engine implements, and — the part usually left out —
 which of it was read and deliberately deferred, with the reason. If you want to
@@ -1069,4 +1125,4 @@ know why there is no EVaR here yet, that is where it says so.
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT — see [LICENSE](https://github.com/alanvaa06/Optimization_Engine/blob/main/LICENSE).
