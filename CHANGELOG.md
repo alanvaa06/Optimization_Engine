@@ -11,6 +11,13 @@ with what to do about it.
 
 ## [Unreleased]
 
+## [0.5.0] — 2026-08-31
+
+A minor rather than a patch: this adds public API surface — an optional
+dependency, a second console script, and a function lifted out of
+`run_engine` — on top of a fix to a pre-flight check that was validating a
+different mandate from the one it preceded.
+
 ### Fixed
 
 - `check` validated a different mandate from the one `optimize` solved. On a
@@ -23,6 +30,11 @@ with what to do about it.
 
 ### Added
 
+- CI runs the MCP suite. The `mcp` extra is in no other job's install — it
+  cannot go in the 3.9-inclusive matrix — so those tests would have
+  skipped everywhere and looked like coverage. The Streamlit job now
+  covers both optional-extra surfaces and is named for it, and asserts
+  the `optengine-mcp` console script lands on PATH.
 - An MCP server, `optengine-mcp`, behind the `mcp` extra (Python 3.10+).
   Five tools — `list_optimizers`, `describe_optimizer`, `check_mandate`,
   `optimize`, `backtest` — returning the same payloads as `--json`, from the
@@ -184,6 +196,7 @@ providers, with per-identifier provenance), the stateless backtest core with
 its cost model and trial counting, the walk-forward and final-holdout audit
 path, and the constraint-layer editor in the Streamlit app.
 
-[Unreleased]: https://github.com/alanvaa06/optimization_engine/compare/v0.4.1...HEAD
+[Unreleased]: https://github.com/alanvaa06/optimization_engine/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/alanvaa06/optimization_engine/compare/v0.4.1...v0.5.0
 [0.4.1]: https://github.com/alanvaa06/optimization_engine/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/alanvaa06/optimization_engine/releases/tag/v0.4.0
