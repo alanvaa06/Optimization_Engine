@@ -69,6 +69,14 @@ def gate_returns(
 
     Truncation rather than a flag: code cannot accidentally read rows that
     were never handed to it.
+
+    Args:
+        returns: The full history.
+        holdout_after: The boundary date. Rows at or before it are visible;
+            everything after is the holdout.
+
+    Returns:
+        A view of ``returns`` ending at the boundary inclusive.
     """
     boundary = pd.Timestamp(holdout_after)
     return returns.loc[returns.index <= boundary]
@@ -77,7 +85,15 @@ def gate_returns(
 def holdout_segment(
     returns: pd.DataFrame, holdout_after: pd.Timestamp | str
 ) -> pd.DataFrame:
-    """The segment after the boundary — the part nothing may have seen."""
+    """The segment after the boundary — the part nothing may have seen.
+
+    Args:
+        returns: The full history.
+        holdout_after: The boundary date, exclusive.
+
+    Returns:
+        A view of ``returns`` beginning after the boundary.
+    """
     boundary = pd.Timestamp(holdout_after)
     return returns.loc[returns.index > boundary]
 
@@ -86,6 +102,11 @@ def assert_within_holdout(
     returns: pd.DataFrame, holdout_after: pd.Timestamp | str, name: str = "returns"
 ) -> None:
     """Raise if any row sits past the boundary.
+
+    Args:
+        returns: The frame to check.
+        holdout_after: The boundary date. Rows at or before it are fine.
+        name: What to call the frame in the error message.
 
     Raises:
         HoldoutViolationError: If the frame carries post-boundary rows.
@@ -110,7 +131,17 @@ def _fingerprint(payload: dict[str, Any]) -> str:
 
 
 def read_audit_log(audit_path: Path | str = DEFAULT_AUDIT_PATH) -> list[dict[str, Any]]:
-    """Every recorded visit to the held-out segment, oldest first."""
+    """Every recorded visit to the held-out segment, oldest first.
+
+    Args:
+        audit_path: The log to read. Defaults to the repository's own, which
+            is committed on purpose: a log any one researcher can reset by
+            cloning fresh is a decorative control.
+
+    Returns:
+        One dict per recorded look, or an empty list when the log does not
+        exist yet.
+    """
     path = Path(audit_path)
     if not path.exists():
         return []
@@ -139,9 +170,23 @@ class HoldoutOutcome:
 
     @property
     def is_first_look(self) -> bool:
+        """Whether this is the first evaluation of this strategy on this holdout.
+
+        Returns:
+            ``True`` when no flag was raised. Anything else means the audit log
+            has seen this strategy — or a shifted boundary for it — before.
+        """
         return not self.flags
 
     def describe(self) -> str:
+        """What the audit log makes of this look.
+
+        Returns:
+            On a first look, a reminder that a second look is a second trial. On a
+            repeat, the flags spelled out: whether this exact specification has
+            been evaluated on the holdout before, whether the boundary moved, or
+            both.
+        """
         if self.is_first_look:
             return (
                 "First look at the held-out segment. Whatever it says, it says "

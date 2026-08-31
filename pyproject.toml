@@ -81,6 +81,12 @@ all = [
     "yfinance>=0.2.40",
     "pyarrow>=14.0",
 ]
+# The API reference is rendered from the package's own docstrings by
+# ``scripts/build_api_docs.py``. Nothing the library imports needs pdoc; only
+# that script and the workflow that publishes its output do, which is why this
+# is an extra and not a dev dependency — a contributor running the tests has no
+# reason to install a documentation renderer.
+docs = ["pdoc>=14.0"]
 dev = ["pytest>=7.4", "pytest-cov>=4.1", "ruff>=0.5"]
 
 [project.scripts]

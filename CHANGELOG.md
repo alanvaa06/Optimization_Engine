@@ -11,6 +11,44 @@ with what to do about it.
 
 ## [Unreleased]
 
+Documentation only. No behaviour changed, no signature moved, and the test
+suite is untouched — but the reference the library never had now exists, and
+CI fails if it stops building.
+
+### Added
+
+- **A generated API reference.** `scripts/build_api_docs.py` renders every
+  public module with pdoc and a new `docs` extra installs it. A `Docs`
+  workflow builds it on every pull request and publishes it to GitHub Pages
+  from `main`. The build runs `--strict`, which refuses to skip a module it
+  cannot import: a missing extra now fails the job rather than quietly
+  dropping `mcp_server` from the published pages. Modules are discovered by
+  walking the package, so a new one is documented the day it lands.
+- **`docs/ERRORS.md`** — the refusal contract, written down. All twenty-one
+  exception types grouped by what they mean (your inputs are wrong; your
+  mandate is impossible; the world got in the way), the full `IngestError`
+  hierarchy with what the service does about each subclass, the CLI's exit
+  codes and the one case where `--json` changes them, and a closing section on
+  the failures that are *reported* rather than raised — degraded cost models,
+  skipped identifiers, post-solve constraint breaches, data-quality findings.
+  Linked from the README, `AGENTS.md` and `llms.txt`.
+
+### Changed
+
+- **Docstring coverage went from 74.6% to 100%** across the 677 public
+  definitions: 166 that had none now do. The parameter documentation moved
+  further — 86 functions documented their arguments before, 379 do now — and
+  it carries units where a number has any: `cost_bps` per side, `execution_lag`
+  in bars, `alpha` as a tail probability rather than a confidence level, VaR
+  levels in percent rather than as fractions.
+- **Every public function that raises now declares what and when.** There were
+  364 `raise` statements behind 67 `Raises:` sections; the gap is closed. The
+  same for returns: what a function hands back, in what units, and what it
+  does with the values it could not compute.
+- `AGENTS.md` states that docstrings are the API reference's only source, and
+  therefore part of the public surface rather than a courtesy.
+
+
 ## [0.5.1] — 2026-08-31
 
 A patch: one bug, in the part of `--json` that only a failing run reaches.

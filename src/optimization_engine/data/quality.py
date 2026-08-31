@@ -39,6 +39,13 @@ class DataIssue:
     suggestion: str
 
     def describe(self) -> str:
+        """The issue and its fix, on one line.
+
+        Returns:
+            Something like ``"EM_Equity: 34 missing observations → align the panel
+            or shorten the window"``, prefixed with the asset when the issue is
+            scoped to one.
+        """
         where = f"{self.asset}: " if self.asset else ""
         return f"{where}{self.message} → {self.suggestion}"
 
@@ -67,21 +74,36 @@ class DataQualityReport:
 
     @property
     def errors(self) -> tuple[DataIssue, ...]:
+        """The issues serious enough to stop an optimization, in the order found."""
         return tuple(i for i in self.issues if i.severity == "error")
 
     @property
     def warnings(self) -> tuple[DataIssue, ...]:
+        """The issues worth reading before trusting the numbers, but not fatal."""
         return tuple(i for i in self.issues if i.severity == "warning")
 
     @property
     def is_clean(self) -> bool:
+        """Whether the panel raised nothing at all — no errors and no warnings."""
         return not self.errors and not self.warnings
 
     @property
     def is_usable(self) -> bool:
+        """Whether the panel can be optimized on.
+
+        Returns:
+            ``True`` when there are no errors. Warnings do not block a run: the
+            CLI proceeds and prints them, and only ``--strict`` turns an error
+            into a refusal.
+        """
         return not self.errors
 
     def describe(self) -> str:
+        """Every issue found, one bulleted line each.
+
+        Returns:
+            A multi-line string, or a statement that nothing was found.
+        """
         if not self.issues:
             return "No data-quality issues found."
         return "\n".join(f"• {i.describe()}" for i in self.issues)

@@ -1369,6 +1369,18 @@ def _capture(args: argparse.Namespace, payload: dict[str, object]) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
+    """Parse the arguments and dispatch to the requested subcommand.
+
+    Args:
+        argv: Arguments to parse, defaulting to ``sys.argv[1:]``.
+
+    Returns:
+        A process exit code. ``0`` on success; ``1`` when the command ran and
+        the answer is negative — an infeasible mandate from ``check``, an
+        incomplete panel from ``ingest``, or, under ``--json``, a command that
+        raised; ``2`` when the command could not run at all. See
+        ``docs/ERRORS.md`` for the full contract.
+    """
     parser = _build_parser()
     args = parser.parse_args(argv)
     if args.command == "optimize":

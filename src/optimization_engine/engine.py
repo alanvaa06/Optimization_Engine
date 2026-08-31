@@ -74,6 +74,21 @@ def apply_fx_conversion(
 
     No-op when every asset is already quoted in the base currency, or
     when ``config.currencies`` is empty.
+
+    Args:
+        prices: Price panel, dates down the index and one column per asset.
+        config: Supplies ``currencies`` (``asset -> ISO code``) and
+            ``base_currency``.
+        fx_rates: Pre-fetched X→base rates. When ``None`` and a conversion is
+            needed, they are fetched from FRED over the panel's range.
+
+    Returns:
+        The panel valued in the base currency, or ``prices`` unchanged when
+        nothing needed converting.
+
+    Raises:
+        FXError: If a rate for one of the panel's currencies is unavailable, or
+            the price index is not a ``DatetimeIndex``.
     """
     if not config.currencies:
         return prices
@@ -153,6 +168,12 @@ class EngineRun:
         control is risk, and the two diverge sharply — a 30% fixed-income
         sleeve rarely carries 30% of the risk. Defaults to the first layer.
 
+        Args:
+            layer: Which layer to decompose, by name. ``None`` takes the first.
+
+        Returns:
+            One risk share per bucket, summing to 1.
+
         Raises:
             ValueError: When the run has no layers, or none by that name.
         """
@@ -180,6 +201,15 @@ class EngineRun:
         that several positions are the same bet. Not computed on every solve
         because the minimum-torsion rotation is an iterative fixed point and
         the engine should not pay for it unless asked.
+
+        Args:
+            model: The rotation used to build uncorrelated factors —
+                ``"minimum_torsion"`` (the default, Meucci's) or ``"pca"``.
+
+        Returns:
+            A :class:`~optimization_engine.analytics.diversification.DiversificationReport`
+            with the effective number of bets, the variance share of each factor,
+            and the largest single bet.
         """
         from optimization_engine.analytics.diversification import (
             diversification_distribution,
@@ -206,6 +236,7 @@ class EngineRun:
 
     @property
     def benchmark_label(self) -> str | None:
+        """What the benchmark is called, or ``None`` when none was chosen."""
         return None if self.benchmark is None else self.benchmark.label
 
     def _benchmark_weights(self) -> pd.Series:
@@ -253,6 +284,24 @@ class EngineRun:
         benchmark. A low number says the constraints, not the forecasts, are
         determining the portfolio — which is a fixable problem, and a
         different one from having poor forecasts.
+
+        Args:
+            method: Which definition to use. ``"optimal"`` (Grinold & Kahn) is
+                the risk-metric correlation between the active weights held
+                and the unconstrained optimal ones, so correlated positions
+                expressing the same bet are not counted twice.
+                ``"risk_adjusted"`` (Clarke, de Silva & Thorley) is the plain
+                cross-sectional correlation of ``α_i/σ_i`` against
+                ``Δw_i·σ_i``.
+
+        Returns:
+            The transfer coefficient, in ``[-1, 1]``. Around 0.3-0.5 is normal for
+            a long-only mandate; below 0.2 means the constraints are writing the
+            portfolio.
+
+        Raises:
+            ValueError: If no benchmark was set, so there are no active weights to
+                measure.
         """
         from optimization_engine.analytics.active import transfer_coefficient
 
@@ -272,6 +321,14 @@ class EngineRun:
         **in-sample** — the weights were chosen knowing these returns — and it
         ignores drift and trading costs. Use :meth:`backtest` for an honest
         replay and :meth:`walk_forward` for an out-of-sample track record.
+
+        Args:
+            benchmark_returns: A benchmark stream to include as a second column.
+                ``None`` returns the portfolio alone.
+
+        Returns:
+            A frame with a ``portfolio`` column, and a ``benchmark`` column when
+            one was supplied.
         """
         port = (self.returns * self.result.weights.reindex(self.returns.columns).fillna(0.0)).sum(axis=1)
         out = pd.DataFrame({"portfolio": port})
@@ -291,6 +348,16 @@ class EngineRun:
         Still in-sample: the optimizer saw this history. What it adds over
         :meth:`backtest_returns` is that the weights actually drift between
         rebalances and trading is charged for.
+
+        Args:
+            frequency: How often the book is rebalanced back to target.
+            transaction_cost_bps: Round-trip cost charged on the traded notional,
+                in basis points.
+
+        Returns:
+            A :class:`~optimization_engine.analytics.backtest.BacktestResult` with
+            the net return stream, the turnover and cost paths, and the rebalance
+            dates.
         """
         return backtest_weights(
             self.returns,
@@ -467,6 +534,23 @@ class EngineRun:
         which is the cheapest thing to produce and the least informative — the
         tearsheet says so in its caveats rather than leaving it to the reader.
         Pass a walk-forward run for a number worth quoting.
+
+        Args:
+            run: The run to describe. ``None`` builds an in-sample replay of this
+                run's own weights.
+            riskfree_rate: Per-period risk-free rate for the ratio metrics.
+                Defaults to the config's.
+            n_trials: How many configurations were tried before settling on this
+                one, for the deflated Sharpe. Do not guess it — run a sweep and
+                let it count itself.
+            trial_sharpes: The Sharpe ratios of those trials, which sharpen the
+                deflation.
+            overfitting: A pre-computed overfitting report to attach.
+
+        Returns:
+            A :class:`~optimization_engine.backtest.Tearsheet` carrying the run,
+            its cost analysis, the selection-bias diagnostics, and the caveats
+            that qualify them.
         """
         rf = self.config.optimizer.risk_free_rate if riskfree_rate is None else riskfree_rate
         return build_tearsheet(
@@ -512,12 +596,36 @@ class EngineRun:
         step = rebalance_every or max(ppy // 4, 1)
 
         def evaluate(cell_config: EngineConfig) -> pd.Series:
+            """Walk one grid cell forward and return its out-of-sample stream.
+
+            Expected returns are cleared on the copied config so every cell is
+            re-estimated inside each window rather than reading the run's own
+            full-sample estimate — which would be the look-ahead the sweep exists to
+            measure around.
+
+            Args:
+                cell_config: The configuration for this cell of the grid.
+
+            Returns:
+                The cell's walk-forward return stream.
+            """
             import copy
 
             cell = copy.deepcopy(cell_config)
             cell.expected_returns = {}
 
             def solve(window_returns: pd.DataFrame) -> pd.Series:
+                """Solve one window and return its target weights.
+
+                Feasibility analysis is skipped: a cell whose mandate is infeasible fails
+                as a solve, is recorded as a failed cell, and still counts as a trial.
+
+                Args:
+                    window_returns: The returns visible in this window.
+
+                Returns:
+                    The solved weights.
+                """
                 return run_engine(
                     window_returns, cell, check_feasibility=False
                 ).result.weights
@@ -555,6 +663,18 @@ class EngineRun:
             base_config.expected_returns = {}
 
         def solve(window: pd.DataFrame) -> pd.Series:
+            """Re-solve this run's config on one window.
+
+            Feasibility analysis is skipped: inside a walk-forward, a window whose
+            mandate is momentarily infeasible should fail as a solve rather than stop
+            the run.
+
+            Args:
+                window: The returns visible in this window.
+
+            Returns:
+                The solved target weights.
+            """
             return run_engine(window, base_config, check_feasibility=False).result.weights
 
         return solve
@@ -562,7 +682,17 @@ class EngineRun:
     def in_vs_out_of_sample(
         self, walk_forward_result: WalkForwardResult, riskfree_rate: float = 0.0
     ) -> pd.DataFrame:
-        """Side-by-side fitted vs walk-forward statistics, with the gap."""
+        """Side-by-side fitted vs walk-forward statistics, with the gap.
+
+        Args:
+            walk_forward_result: The out-of-sample run to compare against this
+                run's own in-sample replay.
+            riskfree_rate: Per-period risk-free rate for the ratio metrics.
+
+        Returns:
+            One row per statistic, a column per sample, and a ``Degradation``
+            column holding the in-sample figure minus the out-of-sample one.
+        """
         oos = walk_forward_result.returns
         in_sample = self.backtest_returns()["portfolio"].reindex(oos.index)
         return compare_in_and_out_of_sample(
@@ -574,6 +704,17 @@ class EngineRun:
     def absolute_summary(
         self, riskfree_rate: float = 0.0, extended: bool = False
     ) -> pd.DataFrame:
+        """Standard performance statistics for the run's own return stream.
+
+        Args:
+            riskfree_rate: Per-period risk-free rate used by the ratio metrics.
+            extended: Include the fuller set — higher moments, drawdown detail,
+                tail statistics — rather than the headline figures alone.
+
+        Returns:
+            A one-row-per-series summary frame, annualized on the config's
+            ``periods_per_year``.
+        """
         bt = self.backtest_returns()
         return summary_stats(
             bt,
@@ -665,6 +806,21 @@ class EngineRun:
         )
 
     def relative_summary(self, benchmark_returns: pd.Series) -> pd.DataFrame:
+        """Benchmark-relative statistics for the run's return stream.
+
+        Args:
+            benchmark_returns: The benchmark's return stream, aligned to the
+                portfolio's own dates.
+
+        Returns:
+            A summary frame of the relative metrics — active return, tracking
+            error, information ratio and the regression statistics — annualized on
+            the config's ``periods_per_year``.
+
+        Raises:
+            MissingDependencyError: If the regression metrics are reached without
+                statsmodels. Install it with ``finport-optengine[stats]``.
+        """
         bt = self.backtest_returns(benchmark_returns)
         return summary_relative(
             bt[["portfolio"]],
@@ -743,10 +899,20 @@ def resolve_expected_returns(
     solve succeed — or the reverse.
 
     Precedence: an explicit vector, then ``config.expected_returns``, then
-    an estimate from the return history using the configured method. The
-    result is always reindexed onto ``returns.columns``, so an asset the
-    config forgot contributes zero rather than a NaN that propagates
-    silently through the objective.
+    an estimate from the return history using the configured method.
+
+    Args:
+        config: Supplies ``expected_returns`` and, failing that, the estimator
+            to derive them with.
+        returns: The return history to estimate from, and the authority on the
+            universe.
+        cov: The covariance, needed by the CAPM and shrinkage estimators.
+        expected_returns: An explicit vector, which wins over everything else.
+
+    Returns:
+        Annualized expected returns, always reindexed onto
+        ``returns.columns`` — so an asset the config forgot contributes zero
+        rather than a NaN that propagates silently through the objective.
     """
     if expected_returns is None and config.expected_returns:
         expected_returns = pd.Series(config.expected_returns)

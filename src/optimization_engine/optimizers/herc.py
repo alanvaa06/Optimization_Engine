@@ -92,6 +92,28 @@ class HERCOptimizer(BaseOptimizer):
         returns: pd.DataFrame | None = None,
         **kwargs,
     ) -> None:
+        """Configure the tree, the cluster count and the risk measure.
+
+        Args:
+            *args: Passed to :class:`~optimization_engine.optimizers.base.BaseOptimizer`.
+            linkage_method: Linkage for the correlation tree. Defaults to
+                ``"ward"``, which splits at the tree's own branches more cleanly
+                than HRP's single linkage.
+            n_clusters: Fix the number of clusters. ``None`` selects it from the
+                tree.
+            max_clusters: Upper bound when the count is selected rather than fixed.
+            risk_measure: What risk is allocated against — ``"variance"`` by
+                default, or a downside measure such as ``"cvar"`` or ``"cdar"``.
+            alpha: Tail probability for the downside measures, in ``(0, 0.5)``.
+                ``0.05`` is the worst 5%.
+            returns: Periodic return history. Required by the downside measures,
+                which are estimated from the path rather than from a covariance.
+            **kwargs: Passed to the base class.
+
+        Raises:
+            ValueError: On an unknown risk measure, a downside measure with no
+                ``returns`` frame, or an ``alpha`` outside ``(0, 0.5)``.
+        """
         super().__init__(*args, **kwargs)
         if risk_measure not in HERC_RISK_MEASURES:
             raise ValueError(
@@ -159,14 +181,37 @@ class HERCOptimizer(BaseOptimizer):
         root = to_tree(link)
 
         def leaves(node) -> list[str]:
+            """The asset names under one node of the tree, in pre-order.
+
+            Args:
+                node: A node of the SciPy cluster tree.
+
+            Returns:
+                Its leaf assets.
+            """
             return [index_to_asset[i] for i in node.pre_order(lambda x: x.id)]
 
         def clusters_below(node) -> set[int]:
+            """Which cluster labels are represented under one node.
+
+            Args:
+                node: A node of the SciPy cluster tree.
+
+            Returns:
+                The distinct cluster labels among its leaves. A node with exactly one
+                is where the recursion stops splitting.
+            """
             return {labels[a] for a in leaves(node)}
 
         weights: dict[int, float] = {}
 
         def recurse(node, budget: float) -> None:
+            """Split ``budget`` down the tree until each cluster holds its share.
+
+            Args:
+                node: The node to split at.
+                budget: The share of the book this subtree carries, as a fraction.
+            """
             below = clusters_below(node)
             if len(below) == 1:
                 label = next(iter(below))

@@ -1,0 +1,73 @@
+name: Docs
+
+# The API reference is generated, never authored: `scripts/build_api_docs.py`
+# renders it from the package's own docstrings. That makes it cheap to keep
+# honest and expensive to forget, so it is built on every pull request and
+# published only from `main`.
+#
+# The build runs with `--strict`, which refuses to skip a module it cannot
+# import. Without it a missing extra would quietly drop `mcp_server` from the
+# published reference and the job would still be green — the exact failure
+# mode a generated reference is supposed to eliminate.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: docs-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build the API reference
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          # 3.12 rather than the package's 3.9 floor because `--strict`
+          # documents every public module, and `mcp_server` needs the MCP
+          # SDK, which needs 3.10 or newer.
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[all,ui,mcp,docs]"
+      - name: Render
+        run: python scripts/build_api_docs.py --output site/api --strict
+      # pdoc writes one page per module, so an empty or near-empty render is a
+      # silent failure that still exits 0. The package has ~80 public modules;
+      # anything under half of that means discovery broke.
+      - name: The reference is not empty
+        run: |
+          pages=$(find site/api -name '*.html' | wc -l)
+          echo "rendered ${pages} pages"
+          test "${pages}" -ge 40
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+  deploy:
+    name: Publish to GitHub Pages
+    # Pull requests build the reference but never publish it.
+    if: ${{ github.event_name != 'pull_request' }}
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    permissions:
+      pages: write
+      id-token: write
+    steps:
+      - id: deploy
+        uses: actions/deploy-pages@v4

@@ -53,6 +53,13 @@ _REGISTRY: dict[str, type[BaseOptimizer]] = {
 
 
 def available_optimizers() -> list[str]:
+    """Every registered method name, sorted.
+
+    Returns:
+        The names accepted by :func:`optimizer_factory` and by
+        ``optengine describe``. This is what ``optengine list-optimizers``
+        prints.
+    """
     return sorted(_REGISTRY.keys())
 
 
@@ -149,9 +156,15 @@ def validate_benchmark_constraints(
     and the LP that would otherwise hit it first reports it as a solver
     problem.
 
+    Args:
+        spec: The optimizer spec naming the method.
+        constraints: The mandate carrying the benchmark and its budgets.
+
     Raises:
-        ConfigurationError: When the method needs a benchmark and has none, or
-            when a limit is set with no benchmark weights to measure against.
+        ConfigurationError: When the method needs a benchmark and has none,
+            when a tracking-error or active-share limit is set with no
+            benchmark weights to measure against, or when the method does not
+            support such limits at all.
     """
     req = requirements_for(spec.name)
     has_limits = (
@@ -231,7 +244,15 @@ def effective_expected_returns(
     targets Black-Litterman cannot reach — the feasibility report says
     "feasible" and the solve then comes back infeasible.
 
-    Returns ``None`` when the method needs no expected returns at all.
+    Args:
+        config: Supplies the method and its configured expected returns.
+        cov_matrix: Asset covariance, needed to build the Black-Litterman
+            posterior.
+        expected_returns: An explicit vector, which wins over the config's.
+
+    Returns:
+        The vector the solve will see, or ``None`` when the method needs no
+        expected returns at all.
     """
     if expected_returns is None and config.expected_returns:
         expected_returns = pd.Series(config.expected_returns)
@@ -273,7 +294,31 @@ def optimizer_factory(
     returns: pd.DataFrame | None = None,
     **overrides: Any,
 ) -> BaseOptimizer:
-    """Build an optimizer instance from an :class:`EngineConfig`."""
+    """Build an optimizer instance from an :class:`EngineConfig`.
+
+    Args:
+        config: Supplies the method name, its extra inputs and the whole
+            constraint set.
+        cov_matrix: Asset covariance, indexed and columned by asset. Defines
+            the universe unless the method reads it from ``returns``.
+        expected_returns: Per-asset expected returns. Required by the
+            mean-variance family; ignored by the risk-only methods.
+        returns: Periodic return history. Required by the path-dependent
+            methods — CVaR, CDaR, and HERC under a downside risk measure.
+        **overrides: Per-method keyword arguments, applied over whatever the
+            config sets.
+
+    Returns:
+        A constructed, ready-to-solve optimizer.
+
+    Raises:
+        ValueError: If ``config.optimizer.name`` is not a registered method.
+        ConfigurationError: If the method needs expected returns, a covariance
+            or a returns frame that was not supplied; if a benchmark-relative
+            method has no benchmark weights; if a tracking-error or
+            active-share budget was set without benchmark weights; or if a
+            Black-Litterman view is malformed.
+    """
     spec: OptimizerSpec = config.optimizer
     name = spec.name.lower()
     if name not in _REGISTRY:

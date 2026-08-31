@@ -16,6 +16,22 @@ BoundsMode = Literal["hard", "soft_iterated", "constrained"]
 
 @dataclass(frozen=True)
 class ExtraInput:
+    """One extra input a method needs beyond returns and a covariance matrix.
+
+    Declarative so that the CLI, the MCP server and the Streamlit app can all
+    render the same prompt without any of them hard-coding a method's
+    particulars.
+
+    Attributes:
+        key: The config field this fills.
+        label: Human-readable name, shown next to the input.
+        kind: What sort of value it is, which decides the widget and the
+            parsing.
+        required: Whether the solve refuses without it.
+        help: One line explaining what the value means.
+        default: Pre-filled value, or ``None`` for no default.
+        choices: The allowed values when the input is a closed set.
+    """
     key: str
     label: str
     kind: ExtraKind
@@ -63,6 +79,12 @@ class MethodRequirements:
 
     @property
     def display_name(self) -> str:
+        """The method's name as a person should read it.
+
+        Returns:
+            The declared label when there is one, and otherwise the registered
+            name title-cased with its underscores removed.
+        """
         return self.label or self.name.replace("_", " ").title()
 
     @property
@@ -528,7 +550,16 @@ REQUIREMENTS: dict[str, MethodRequirements] = {
 def requirements_for(name: str) -> MethodRequirements:
     """Return the :class:`MethodRequirements` for an optimizer name.
 
-    Raises ``KeyError`` with the list of known names when ``name`` is unknown.
+    Args:
+        name: A registered optimizer name.
+
+    Returns:
+        What that method needs, supports and assumes. This is what
+        ``optengine describe`` prints and what the UI renders next to the
+        method picker.
+
+    Raises:
+        KeyError: If ``name`` is unknown. The message lists the known names.
     """
     try:
         return REQUIREMENTS[name]

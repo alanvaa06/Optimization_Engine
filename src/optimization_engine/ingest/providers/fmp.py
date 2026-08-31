@@ -62,6 +62,12 @@ class FinancialModelingPrep(PriceProvider):
 
     @property
     def capabilities(self) -> ProviderCapabilities:
+        """Adjusted OHLCV plus true VWAP, one symbol per request, key required.
+
+        Returns:
+            Capabilities covering equities, ETFs, indices, FX, crypto and
+            commodities at a daily interval, rate-limited to 300 requests a minute.
+        """
         return ProviderCapabilities(
             fields=frozenset(
                 {F.OPEN, F.HIGH, F.LOW, F.CLOSE, F.CLOSE_RAW, F.VOLUME, F.VWAP}
@@ -85,6 +91,24 @@ class FinancialModelingPrep(PriceProvider):
         )
 
     def fetch_one(self, identifier: str, request: IngestRequest) -> PricePanel:
+        """Fetch one symbol's adjusted daily history.
+
+        The full payload is always requested. FMP's line-series response is
+        smaller but carries only the *unadjusted* close, which would silently
+        change what the engine optimizes on.
+
+        Args:
+            identifier: The FMP symbol.
+            request: The run's window and requested fields.
+
+        Returns:
+            A single-column panel carrying adjusted OHLCV, the raw close and VWAP.
+
+        Raises:
+            IdentifierNotFoundError: FMP has no history for this symbol.
+            ProviderCredentialsError: The key is missing or rejected.
+            ProviderResponseError: The payload could not be parsed.
+        """
         symbol = identifier.strip()
         payload = self._get_json(
             f"{_BASE_URL}/{_quote(symbol)}",
@@ -119,7 +143,14 @@ class FinancialModelingPrep(PriceProvider):
 
 
 def classify(symbol: str) -> F.InstrumentKind:
-    """Infer an instrument kind from FMP's symbol conventions."""
+    """Infer an instrument kind from FMP's symbol conventions.
+
+    Args:
+        symbol: An FMP symbol.
+
+    Returns:
+        The inferred kind, or ``UNKNOWN`` when the symbol says nothing.
+    """
     cleaned = symbol.strip().upper()
     if cleaned.startswith("^"):
         return F.InstrumentKind.INDEX

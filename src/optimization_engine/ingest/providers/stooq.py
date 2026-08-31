@@ -60,6 +60,13 @@ class Stooq(PriceProvider):
 
     @property
     def capabilities(self) -> ProviderCapabilities:
+        """OHLCV, keyless, one symbol per request.
+
+        Returns:
+            Capabilities covering indices, equities, ETFs, FX and commodities.
+            Note the close is split-adjusted but *not* dividend-adjusted, so it is
+            a price return rather than a total return.
+        """
         return ProviderCapabilities(
             fields=frozenset({F.OPEN, F.HIGH, F.LOW, F.CLOSE, F.VOLUME}),
             intervals=frozenset(_INTERVAL_CODES),
@@ -79,6 +86,20 @@ class Stooq(PriceProvider):
         )
 
     def fetch_one(self, identifier: str, request: IngestRequest) -> PricePanel:
+        """Fetch one symbol's CSV history.
+
+        Args:
+            identifier: The Stooq symbol. Lower-cased for the request.
+            request: The run's window and interval.
+
+        Returns:
+            A single-column OHLCV panel. Indices come back without volume, which
+            is a fact about the instrument rather than a gap in the data.
+
+        Raises:
+            IdentifierNotFoundError: Stooq has no history for this symbol.
+            ProviderResponseError: The CSV could not be parsed.
+        """
         symbol = identifier.strip()
         kind = classify(symbol)
         body = self._get_text(
@@ -177,8 +198,14 @@ def classify(symbol: str) -> F.InstrumentKind:
     """Guess an instrument kind from a Stooq symbol.
 
     Stooq publishes no metadata endpoint, so the symbol itself is the only
-    signal: a leading ``^`` is always an index, and a six-letter all-alpha
-    symbol is one of its FX crosses.
+    signal.
+
+    Args:
+        symbol: A Stooq symbol.
+
+    Returns:
+        ``INDEX`` for a leading ``^``, ``FX`` for a six-letter all-alpha
+        symbol (one of its crosses), and ``UNKNOWN`` otherwise.
     """
     cleaned = symbol.strip().upper()
     if cleaned.startswith("^"):

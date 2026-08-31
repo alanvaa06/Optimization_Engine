@@ -46,6 +46,19 @@ class ActiveMeanVarianceOptimizer(BaseOptimizer):
     bounds_mode = "hard"
 
     def __init__(self, *args, risk_aversion: float = 1.0, **kwargs) -> None:
+        """Set the active risk-aversion coefficient.
+
+        Args:
+            *args: Passed to :class:`~optimization_engine.optimizers.base.BaseOptimizer`.
+            risk_aversion: Aversion to *active* risk — the coefficient on
+                ``(w − b)'Σ(w − b)``. At ``b = 0`` the problem reduces exactly to
+                the absolute one.
+            **kwargs: Passed to the base class.
+
+        Raises:
+            ValueError: If ``risk_aversion`` is negative, which would reward
+                active risk and leave the problem unbounded.
+        """
         super().__init__(*args, **kwargs)
         self.risk_aversion = float(risk_aversion)
         if self.risk_aversion < 0:

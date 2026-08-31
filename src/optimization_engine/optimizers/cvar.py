@@ -62,6 +62,24 @@ class CVaROptimizer(BaseOptimizer):
         periods_per_year: int = 252,
         **kwargs,
     ) -> None:
+        """Bind the return history the tail is measured from.
+
+        Args:
+            returns: Periodic return history, one column per asset. Required: CVaR
+                is a property of the empirical distribution, not of a covariance.
+            *args: Passed to :class:`~optimization_engine.optimizers.base.BaseOptimizer`.
+            alpha: Tail probability, in ``(0, 0.5)``. Pass ``0.05`` for the 95%
+                CVaR — not ``0.95``.
+            target_return: Optional minimum *annualized* expected return.
+            periods_per_year: Annualization basis for the reported CVaR and VaR,
+                and for converting historical means when no ``expected_returns``
+                is supplied.
+            **kwargs: Passed to the base class.
+
+        Raises:
+            ValueError: If ``returns`` is missing or empty, or ``alpha`` lies
+                outside ``(0, 0.5)``.
+        """
         super().__init__(*args, **kwargs)
         if returns is None or returns.empty:
             raise ValueError("CVaR optimizer requires a returns DataFrame")
@@ -77,6 +95,12 @@ class CVaROptimizer(BaseOptimizer):
 
     @property
     def assets(self) -> list[str]:  # type: ignore[override]
+        """The universe, taken from the return history's columns.
+
+        Overrides the base class, which reads the covariance or the expected
+        returns: here the return frame is the required input and the authority on
+        what the universe is.
+        """
         return list(self.returns.columns)
 
     def _solve(self) -> np.ndarray:

@@ -41,7 +41,21 @@ def load_prices(
 ) -> pd.DataFrame:
     """Load a price panel from an Excel or CSV file.
 
-    The resulting DataFrame has a `DatetimeIndex` and one column per asset.
+    Args:
+        path: The file to read. The reader follows the extension.
+        sheet_name: Worksheet to read from an Excel workbook. Ignored for CSV.
+        index_col: Which column holds the dates.
+        date_format: An explicit ``strftime`` pattern for parsing the index.
+            ``None`` lets pandas infer it.
+
+    Returns:
+        Prices with a ``DatetimeIndex``, sorted ascending, one column per
+        asset, with entirely-empty rows dropped.
+
+    Raises:
+        ValueError: If the extension is neither a spreadsheet nor a CSV.
+        MissingDependencyError: If an ``.xlsx`` is read without openpyxl.
+            Install it with ``finport-optengine[excel]``.
     """
     p = Path(path)
     suf = p.suffix.lower()
@@ -62,6 +76,20 @@ def load_prices(
 
 
 def prices_to_returns(prices: pd.DataFrame, log: bool = False) -> pd.DataFrame:
+    """Convert a price panel to periodic returns.
+
+    Args:
+        prices: Prices indexed by date, one column per asset.
+        log: Return log differences instead of simple percentage changes.
+            Log returns aggregate additively across time, which is convenient
+            for estimation; simple returns aggregate across assets, which is
+            what a portfolio needs. The engine optimizes on simple returns.
+
+    Returns:
+        A frame one row shorter than ``prices``, with rows that are entirely
+        missing dropped. Individual gaps are left as NaN for the alignment
+        step to deal with explicitly.
+    """
     if log:
         return np.log(prices / prices.shift(1)).dropna(how="all")
     return prices.pct_change().dropna(how="all")
@@ -77,6 +105,17 @@ def sample_dataset(
     Generates correlated daily log-returns from a multivariate normal with
     a hand-tuned covariance structure across asset classes, then exponentiates
     to a price series starting at 100.
+
+    Args:
+        n_periods: How many business days to generate. Defaults to eight
+            years.
+        seed: Seed for the generator. The same seed gives the same panel.
+        assets: Which of the built-in asset names to include. ``None`` gives
+            the full multi-asset universe.
+
+    Returns:
+        Prices indexed by business day, one column per asset, all starting
+        at 100.
     """
     rng = np.random.default_rng(seed)
 

@@ -1226,6 +1226,17 @@ failed cells as rows, so its trial count stays honest; and that a second visit
 to the same holdout is flagged `REPEATED` while a boundary that moved is
 flagged `SHIFTED_HOLDOUT`.
 
+## Reference
+
+The narrative above says what the engine is for. Three documents say what it
+*does*, function by function:
+
+| | |
+| --- | --- |
+| **API reference** | Every one of the 142 exported names with its signature, parameters, units and errors — generated from the docstrings by `scripts/build_api_docs.py`, so it cannot drift from the code. Build it locally with `pip install "finport-optengine[docs]"` then `python scripts/build_api_docs.py`; CI publishes it to GitHub Pages on every push to `main`. |
+| [`docs/ERRORS.md`](https://github.com/alanvaa06/Optimization_Engine/blob/main/docs/ERRORS.md) | The refusal contract: all twenty-one exception types, which to catch, which are recoverable, the CLI's exit codes, and the failures that are *reported* rather than raised — degraded cost models, skipped identifiers, post-solve constraint breaches. |
+| [`AGENTS.md`](https://github.com/alanvaa06/Optimization_Engine/blob/main/AGENTS.md) | The API map and the `--json` CLI contract, written for a caller who wants the shortest correct program. |
+
 ## Where the methods come from
 
 [`docs/RESEARCH.md`](https://github.com/alanvaa06/Optimization_Engine/blob/main/docs/RESEARCH.md) is the reading behind these methods: what

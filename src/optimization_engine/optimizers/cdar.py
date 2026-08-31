@@ -85,6 +85,25 @@ class CDaROptimizer(BaseOptimizer):
         periods_per_year: int = 252,
         **kwargs,
     ) -> None:
+        """Bind the return history the drawdown path is accumulated from.
+
+        Args:
+            returns: Periodic return history, one column per asset. Required, and
+                it must have no gaps: CDaR accumulates an equity curve, so a
+                missing value silently shifts every later drawdown.
+            *args: Passed to :class:`~optimization_engine.optimizers.base.BaseOptimizer`.
+            alpha: Drawdown tail probability, in ``(0, 1]``. Pass ``0.05`` for the
+                worst 5% of the path; ``1`` gives the average drawdown.
+            target_return: Optional minimum *annualized* expected return.
+            periods_per_year: Annualization basis for the reported figures, and
+                for converting historical means when no ``expected_returns`` is
+                supplied.
+            **kwargs: Passed to the base class.
+
+        Raises:
+            ValueError: If ``returns`` is missing, empty or contains NaNs, or
+                ``alpha`` lies outside ``(0, 1]``.
+        """
         super().__init__(*args, **kwargs)
         if returns is None or returns.empty:
             raise ValueError("CDaR optimizer requires a returns DataFrame")
@@ -106,6 +125,12 @@ class CDaROptimizer(BaseOptimizer):
 
     @property
     def assets(self) -> list[str]:  # type: ignore[override]
+        """The universe, taken from the return history's columns.
+
+        Overrides the base class, which reads the covariance or the expected
+        returns: here the return frame is the required input and the authority on
+        what the universe is.
+        """
         return list(self.returns.columns)
 
     def _solve(self) -> np.ndarray:

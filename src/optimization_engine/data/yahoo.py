@@ -164,6 +164,15 @@ def extract_field(raw: pd.DataFrame, field: str, tickers: list[str]) -> pd.DataF
     wrong silently transposes a panel. The ingest layer needs the same
     normalization for every field of a single multi-field download, so the
     logic is exposed here rather than reimplemented there.
+
+    Args:
+        raw: The frame ``yf.download`` returned, in whichever layout.
+        field: Which field to pull out, e.g. ``"Close"`` or ``"Volume"``.
+        tickers: The tickers requested, used to name the output columns.
+
+    Returns:
+        A frame indexed by date with one column per ticker, whatever layout
+        the input arrived in.
     """
     return _extract_field(raw, field, tickers)
 

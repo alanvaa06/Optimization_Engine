@@ -33,9 +33,16 @@ class ConstraintViolation:
 
     @property
     def magnitude(self) -> float:
+        """How far past the limit the allocation went, in weight terms."""
         return abs(self.actual - self.limit)
 
     def describe(self) -> str:
+        """One line: what was breached, by how much, against which limit.
+
+        Returns:
+            Something like ``"Equity bucket: 62.4000% vs limit 60.0000% (off by
+            2.4000%)"``.
+        """
         return (
             f"{self.label}: {self.actual:.4%} vs limit {self.limit:.4%} "
             f"(off by {self.magnitude:.4%})"
@@ -156,7 +163,14 @@ def _benchmark_violations(
 
 
 def herfindahl_index(weights: pd.Series | np.ndarray) -> float:
-    """Sum of squared weights. ``1/N`` when equally weighted, ``1`` at a corner."""
+    """Sum of squared weights. ``1/N`` when equally weighted, ``1`` at a corner.
+
+    Args:
+        weights: Portfolio weights, as fractions of the book.
+
+    Returns:
+        The concentration index, in ``[1/N, 1]``.
+    """
     w = np.asarray(weights, dtype=float)
     return float(np.sum(w**2))
 
@@ -166,6 +180,14 @@ def effective_n(weights: pd.Series | np.ndarray) -> float:
 
     A 10-asset portfolio with 90% in one name has an effective N near 1.2,
     not 10 — this is the number to look at before calling a book diversified.
+
+    Args:
+        weights: Portfolio weights, as fractions of the book.
+
+    Returns:
+        The effective number of positions, between ``1`` and the number of
+        assets. It counts *capital*, not risk; for the risk-side answer see
+        :func:`~optimization_engine.analytics.diversification.effective_number_of_bets`.
     """
     hhi = herfindahl_index(weights)
     return float(1.0 / hhi) if hhi > 0 else float("nan")
@@ -176,6 +198,13 @@ def diversification_ratio(weights: pd.Series, cov_matrix: pd.DataFrame) -> float
 
     ``1.0`` means correlations bought you nothing; higher is better. This is
     the objective the max-diversification optimizer maximizes.
+
+    Args:
+        weights: Portfolio weights, as fractions of the book.
+        cov_matrix: Asset covariance over the same universe.
+
+    Returns:
+        The ratio, at least ``1.0`` for a long-only book.
     """
     assets = list(weights.index)
     sigma = cov_matrix.reindex(assets, axis=0).reindex(assets, axis=1).values
@@ -190,6 +219,15 @@ def effective_n_risk(weights: pd.Series, cov_matrix: pd.DataFrame) -> float:
 
     Weight diversification and risk diversification are different things — a
     60/40 book is diversified by weight and concentrated in equity risk.
+
+    Args:
+        weights: Portfolio weights, as fractions of the book.
+        cov_matrix: Asset covariance over the same universe.
+
+    Returns:
+        A number between 1 and the asset count. It still measures assets, not
+        independent factors — for that see
+        :func:`~optimization_engine.analytics.diversification.effective_number_of_bets`.
     """
     rc = risk_contributions(weights, cov_matrix)
     return effective_n(rc.values)
@@ -198,7 +236,17 @@ def effective_n_risk(weights: pd.Series, cov_matrix: pd.DataFrame) -> float:
 def risk_contributions(
     weights: pd.Series, cov_matrix: pd.DataFrame
 ) -> pd.Series:
-    """Per-asset share of total portfolio variance (sums to 1)."""
+    """Per-asset share of total portfolio variance (sums to 1).
+
+    Args:
+        weights: Portfolio weights, as fractions of the book.
+        cov_matrix: Asset covariance over the same universe.
+
+    Returns:
+        One share per asset, summing to 1. The Euler decomposition splits
+        volatility and variance in the same proportions, so the share reads
+        correctly either way.
+    """
     assets = list(weights.index)
     sigma = cov_matrix.reindex(assets, axis=0).reindex(assets, axis=1).values
     w = weights.values.astype(float)
@@ -213,17 +261,24 @@ def risk_decomposition(
 ) -> pd.DataFrame:
     """Full Euler risk decomposition of portfolio volatility.
 
-    Columns:
+    Reporting contributions in volatility units (not just shares) is what lets
+    an analyst say "this sleeve costs me 4.2% of vol", which is the sentence
+    a risk committee actually needs.
+
+    Args:
+        weights: Portfolio weights, as fractions of the book.
+        cov_matrix: Asset covariance. Its periodicity sets the units of every
+            volatility figure returned.
+
+    Returns:
+        A frame indexed by asset with:
+
         ``weight``            — the allocation.
         ``marginal_risk``     — ∂σ_p/∂w_i, the volatility added by one more unit.
         ``contribution``      — w_i · ∂σ_p/∂w_i, in annualized volatility units.
                                 These sum exactly to portfolio volatility.
         ``share_of_risk``     — contribution as a fraction of portfolio volatility.
         ``standalone_vol``    — the asset's own volatility, for reference.
-
-    Reporting contributions in volatility units (not just shares) is what lets
-    an analyst say "this sleeve costs me 4.2% of vol", which is the sentence
-    a risk committee actually needs.
     """
     assets = list(weights.index)
     sigma = cov_matrix.reindex(assets, axis=0).reindex(assets, axis=1).values
@@ -274,9 +329,21 @@ class PortfolioDiagnostics:
 
     @property
     def is_compliant(self) -> bool:
+        """Whether the allocation breaches no constraint.
+
+        Returns:
+            ``True`` when :attr:`violations` is empty.
+        """
         return not self.violations
 
     def to_dict(self) -> dict[str, object]:
+        """These diagnostics as a flat, JSON-serializable mapping.
+
+        Returns:
+            Every concentration and exposure figure as a plain number, plus the
+            violations rendered as human-readable strings. This is what reaches
+            the CLI's ``--json`` payload and the report workbook.
+        """
         return {
             "n_positions": self.n_positions,
             "gross_exposure": self.gross_exposure,
@@ -299,7 +366,22 @@ def portfolio_diagnostics(
     constraints: PortfolioConstraints | None = None,
     active_tolerance: float = 1e-4,
 ) -> PortfolioDiagnostics:
-    """Summarize an allocation's concentration, exposure and compliance."""
+    """Summarize an allocation's concentration, exposure and compliance.
+
+    Args:
+        weights: The solved weights, as fractions of the book.
+        cov_matrix: Asset covariance. Without it the risk-side figures —
+            risk-effective N and the diversification ratio — cannot be
+            computed.
+        constraints: The mandate to check compliance against. Without it no
+            violations are reported, which is not the same as compliance.
+        active_tolerance: Weight below which a position is treated as flat
+            rather than held, for counting positions.
+
+    Returns:
+        A :class:`PortfolioDiagnostics` with the concentration and exposure
+        figures and any constraint violations found.
+    """
     w = weights.astype(float)
     longs = float(w[w > 0].sum())
     shorts = float(w[w < 0].sum())

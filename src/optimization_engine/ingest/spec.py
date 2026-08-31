@@ -103,6 +103,18 @@ class IngestRequest:
     metadata: Mapping[str, str] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
+        """Normalize the request and reject one no provider could serve.
+
+        Identifiers are cleaned, the provider name is lower-cased and the field
+        list is put into the canonical vocabulary, so two requests that mean the
+        same thing hash the same. The window is then resolved: an absent ``start``
+        is derived from ``period`` (defaulting to five years) counted back from
+        ``end``, which itself defaults to today.
+
+        Raises:
+            ProviderConfigurationError: On a missing provider name, an unsupported
+                interval or period, or a window whose start is not before its end.
+        """
         object.__setattr__(self, "identifiers", _clean_identifiers(self.identifiers))
         object.__setattr__(self, "provider", str(self.provider).strip().lower())
         object.__setattr__(self, "fields", F.normalize_fields(self.fields))
@@ -160,10 +172,23 @@ class IngestRequest:
 
     @property
     def wants_volume(self) -> bool:
+        """Whether this request asks for traded volume.
+
+        Worth checking before routing: a provider that never publishes volume
+        rejects such a request up front rather than returning a panel silently
+        missing the field.
+        """
         return F.VOLUME in self.fields
 
     def for_identifiers(self, identifiers: Iterable[str]) -> IngestRequest:
-        """The same request, narrowed to a subset of the universe."""
+        """The same request, narrowed to a subset of the universe.
+
+        Args:
+            identifiers: The subset to keep.
+
+        Returns:
+            A new request with everything else unchanged.
+        """
         return replace(self, identifiers=tuple(identifiers))
 
     def for_provider(self, provider: str) -> IngestRequest:
@@ -171,6 +196,16 @@ class IngestRequest:
 
         This is the whole point of the homogenized vocabulary: switching
         providers is one call, and nothing downstream can tell.
+
+        Args:
+            provider: The provider to route to.
+
+        Returns:
+            A new, revalidated request.
+
+        Raises:
+            ProviderConfigurationError: If the new provider cannot serve this
+                request's interval or period.
         """
         return replace(self, provider=provider)
 
@@ -208,7 +243,21 @@ class IngestRequest:
 
     @classmethod
     def from_dict(cls, data: Mapping[str, object]) -> IngestRequest:
-        """Rebuild a request from :meth:`to_dict` or a config file section."""
+        """Rebuild a request from :meth:`to_dict` or a config file section.
+
+        Args:
+            data: The mapping to read. Unknown keys are refused rather than
+                ignored, so a typo in a config is a failure at load rather than a
+                setting that silently did nothing.
+
+        Returns:
+            A validated :class:`IngestRequest`.
+
+        Raises:
+            ProviderConfigurationError: On an unknown option, a missing provider
+                name, an unsupported interval or period, or a window whose start
+                is not before its end.
+        """
         known = {
             "provider", "identifiers", "start", "end", "period", "interval",
             "fields", "currency", "require_volume", "max_workers",

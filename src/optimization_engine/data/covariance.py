@@ -146,6 +146,20 @@ def covariance_diagnostics(
     The checks are the ones that actually bite in portfolio construction:
     too few observations per asset, near-singularity (which makes
     mean-variance weights explode), and non-PSD matrices.
+
+    Args:
+        cov: The estimated covariance, indexed and columned by asset.
+        n_observations: How many periods it was estimated from. This is the
+            *common* sample — the rows every asset has at once — not the
+            length of the longest column.
+        method: The estimator that produced it, used to phrase the advice.
+        ewma_lambda: The decay used, when the estimator was EWMA. It sets the
+            effective sample size, which is shorter than the nominal one.
+
+    Returns:
+        A :class:`CovarianceDiagnostics` carrying the condition number, the
+        observations-per-asset ratio, whether the matrix is PSD, and the
+        findings phrased for a reader.
     """
     values = np.asarray(cov.values, dtype=float)
     n_assets = values.shape[0]
@@ -379,6 +393,14 @@ def covariance_from_config(returns: pd.DataFrame, config) -> pd.DataFrame:
     same choices about estimator, annualization, decay and denoising. Doing
     that inline five times is how a run ends up bootstrapping a different
     matrix than it optimized. This is the single place those choices live.
+
+    Args:
+        returns: Periodic returns, one column per asset.
+        config: The configuration supplying the estimator, the annualization
+            basis, the EWMA decay and the denoising settings.
+
+    Returns:
+        The annualized covariance, indexed and columned by asset.
     """
     return covariance_matrix(
         returns,
@@ -492,8 +514,27 @@ def expected_returns_from_history(
     * ``shrunk_mean`` — ``mean`` pulled toward the minimum-variance
       portfolio's return via :func:`james_stein_shrinkage`.
 
+    Args:
+        returns: Periodic returns, one column per asset.
+        method: Which of the four estimators above to use.
+        periods_per_year: Annualization basis for the result.
+        span: EWMA span in periods. Only used by ``ema``.
+        market_return: The market's expected return, for ``capm``. Estimated
+            from the market portfolio when omitted.
+        risk_free_rate: Annualized risk-free rate, used by ``capm`` and by
+            the shrinkage target.
+        market_weights: The market portfolio for ``capm``. Defaults to equal
+            weights, which is an assumption rather than a neutral choice.
+        cov_matrix: A pre-computed covariance, needed by ``capm`` and
+            ``shrunk_mean``. Estimated from ``returns`` when omitted.
+
+    Returns:
+        Annualized expected returns, one per column of ``returns``.
+
     Raises:
-        ValueError: On an unknown ``method`` or empty ``returns``.
+        ValueError: On an unknown ``method``, empty ``returns``, CAPM market
+            weights summing to zero, or a CAPM market portfolio with zero
+            variance, which leaves the betas undefined.
     """
     if returns is None or returns.empty:
         raise ValueError("Cannot estimate expected returns from empty data.")

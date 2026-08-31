@@ -78,12 +78,28 @@ class LocalFile(PriceProvider):
         api_key: str | None = None,
         timeout: float | None = None,
     ) -> None:
+        """Bind the provider to one file on disk.
+
+        Args:
+            path: The CSV, Excel or Parquet file to read. May be ``None`` here and
+                supplied later, but a fetch without it is refused.
+            sheet_name: Worksheet to read from an Excel workbook. Ignored for the
+                other formats.
+            api_key: Unused; accepted so every provider constructs the same way.
+            timeout: Unused; this provider makes no network call.
+        """
         super().__init__(api_key=api_key, timeout=timeout)
         self._path = Path(path) if path is not None else None
         self._sheet_name = sheet_name
 
     @property
     def capabilities(self) -> ProviderCapabilities:
+        """Every market field, no key, no network, any symbol the file names.
+
+        Returns:
+            Capabilities advertising offline batch reads. Instrument kind is
+            ``UNKNOWN``: a file says nothing about what its columns are.
+        """
         return ProviderCapabilities(
             fields=frozenset(F.MARKET_FIELDS),
             intervals=frozenset({"1d", "1wk", "1mo"}),
@@ -97,11 +113,42 @@ class LocalFile(PriceProvider):
         )
 
     def fetch_one(self, identifier: str, request: IngestRequest) -> PricePanel:
+        """One identifier, by way of :meth:`fetch_batch`.
+
+        The file is read whole either way, so there is nothing to save by
+        fetching a single column.
+
+        Args:
+            identifier: The engine-side name.
+            request: The run's window, interval and requested fields.
+
+        Returns:
+            A single-column panel. See :meth:`fetch_batch` for what can be raised.
+        """
         return self.fetch_batch((identifier,), request)
 
     def fetch_batch(
         self, identifiers: tuple[str, ...], request: IngestRequest
     ) -> PricePanel:
+        """Read the file and return the requested identifiers as a panel.
+
+        Both layouts are accepted: wide (dates down, one column per asset) and
+        long (a date column, an identifier column, and OHLCV columns). The
+        layout is detected from the column names rather than declared.
+
+        Args:
+            identifiers: Engine-side names to pull out of the file.
+            request: The run's window and requested fields. The window trims the
+                file's own history; it never extends it.
+
+        Returns:
+            A validated panel over whichever of ``identifiers`` the file carries.
+
+        Raises:
+            ProviderConfigurationError: If no path was set, the path is not a
+                file, or the extension is not one of ``.csv``, ``.xlsx``,
+                ``.xls``, ``.xlsm`` or ``.parquet``.
+        """
         if self._path is None:
             raise ProviderConfigurationError(
                 "The file provider needs a path: LocalFile(path=...) or "
@@ -186,6 +233,17 @@ def _from_long(
     by_lower = {str(c).strip().lower(): c for c in raw.columns}
 
     def pivot(column: object) -> pd.DataFrame:
+        """Pivot one long-format column into a date x identifier frame.
+
+        Args:
+            column: The source column to pivot.
+
+        Returns:
+            A frame indexed by date with one column per identifier. Values are
+            coerced to numeric, so a non-numeric cell becomes NaN rather than
+            poisoning the column's dtype, and duplicate ``(date, identifier)``
+            rows keep the last.
+        """
         values = pd.to_numeric(frame[column], errors="coerce")
         pivoted = (
             pd.DataFrame({"__date__": frame["__date__"], "__id__": frame["__id__"], "v": values})

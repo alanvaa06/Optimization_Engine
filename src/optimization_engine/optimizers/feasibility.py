@@ -58,14 +58,22 @@ class FeasibilityReport:
 
     @property
     def is_feasible(self) -> bool:
+        """Whether any allocation satisfies every constraint at once.
+
+        Returns:
+            ``True`` when no issue is fatal. Warnings do not make a mandate
+            infeasible — they make it worth reading about first.
+        """
         return not any(i.fatal for i in self.issues)
 
     @property
     def fatal_issues(self) -> tuple[FeasibilityIssue, ...]:
+        """The issues that make the mandate impossible, in the order found."""
         return tuple(i for i in self.issues if i.fatal)
 
     @property
     def warnings(self) -> tuple[FeasibilityIssue, ...]:
+        """The issues worth knowing about that still leave the mandate solvable."""
         return tuple(i for i in self.issues if not i.fatal)
 
     def describe(self) -> str:
@@ -482,6 +490,15 @@ def min_variance_return(
     Frontier targets below this point are *inefficient*: the same volatility
     buys a higher return above the GMV, so plotting them as "efficient" is
     misleading.
+
+    Args:
+        expected_returns: Annualized expected returns, one per asset.
+        cov_matrix: Asset covariance over the same universe.
+        constraints: The mandate the GMV is solved under.
+
+    Returns:
+        The GMV portfolio's expected return, or ``None`` when the solve did
+        not produce a usable answer.
     """
     from optimization_engine.optimizers.mean_variance import MinVarianceOptimizer
 
@@ -648,6 +665,14 @@ class InfeasibleConstraintsError(ValueError):
     """Raised with a full :class:`FeasibilityReport` attached."""
 
     def __init__(self, report: FeasibilityReport) -> None:
+        """Build the error and attach the report that explains it.
+
+        Args:
+            report: The analysis that found the mandate impossible. It stays
+                reachable as ``exc.report``, and its :meth:`~FeasibilityReport.describe`
+                output — which names the binding constraint and the fix — becomes
+                the exception's message.
+        """
         self.report = report
         super().__init__(
             "The constraints cannot be satisfied:\n" + report.describe()

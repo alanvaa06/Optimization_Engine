@@ -28,6 +28,17 @@ def write_excel_report(
     and names are truncated to Excel's 31-character limit. Truncation can
     collide, so a numeric suffix is appended rather than letting one sheet
     silently overwrite another.
+
+    Args:
+        path: Where to write the ``.xlsx``.
+        sheets: ``sheet name -> frame``, in the order they should appear.
+
+    Returns:
+        The path written, as a :class:`~pathlib.Path`.
+
+    Raises:
+        MissingDependencyError: If xlsxwriter is not installed. Install it
+            with ``finport-optengine[excel]``.
     """
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
@@ -54,6 +65,18 @@ def unique_sheet_name(name: str, used: set[str]) -> str:
     Public because the UI writes its own workbook and needs the same
     de-duplication: two names that differ only past character 31 would
     otherwise land on the same sheet and one would be lost.
+
+    Args:
+        name: The desired sheet name. Truncated to Excel's 31-character limit
+            and stripped of the characters Excel rejects.
+        used: Names already taken. Not mutated — add the result yourself.
+
+    Returns:
+        A name that is valid for Excel and not in ``used``, disambiguated with
+        a numeric suffix if needed.
+
+    Raises:
+        ValueError: If no unique name could be found within the length limit.
     """
     base = str(name)[:_SHEET_NAME_LIMIT]
     if base not in used:

@@ -65,6 +65,13 @@ class PositionStats:
     reasons: dict[str, str] = field(default_factory=dict)
 
     def to_frame(self) -> pd.DataFrame:
+        """These statistics as a one-column frame, ready to render or export.
+
+        Returns:
+            A frame indexed by the human-readable statistic name, with a single
+            ``value`` column. ``None`` entries stay ``None``: a win rate that
+            could not be computed is missing, not zero.
+        """
         return pd.DataFrame(
             {
                 "value": {
@@ -104,6 +111,14 @@ def position_episodes(
     Assets are walked in sorted order and episodes in date order, so the same
     run always yields the same list — which is what lets the statistics below
     be part of a reproducible report.
+
+    Args:
+        weights: The realized weight path, dates down the index.
+        returns: The asset return history the episodes are scored against.
+
+    Returns:
+        One :class:`PositionEpisode` per uninterrupted stay in the book,
+        including any still open at the end of the sample.
     """
     aligned = returns.reindex(index=weights.index, columns=weights.columns).fillna(0.0)
     episodes: list[PositionEpisode] = []
@@ -143,7 +158,15 @@ def position_episodes(
 
 
 def episodes_frame(episodes: list[PositionEpisode]) -> pd.DataFrame:
-    """The episodes as a tidy frame, newest-contributing first."""
+    """The episodes as a tidy frame, newest-contributing first.
+
+    Args:
+        episodes: The episodes to tabulate.
+
+    Returns:
+        One row per episode with its asset, entry and exit dates, holding
+        length and contribution.
+    """
     if not episodes:
         return pd.DataFrame(
             columns=[
@@ -156,7 +179,20 @@ def episodes_frame(episodes: list[PositionEpisode]) -> pd.DataFrame:
 
 
 def compute_position_stats(run: RunResult, returns: pd.DataFrame) -> PositionStats:
-    """Round-trip statistics over the run's completed position episodes."""
+    """Round-trip statistics over the run's completed position episodes.
+
+    Args:
+        run: The finished run, whose weight path defines when each position
+            opened and closed.
+        returns: The asset return history the episodes are scored against.
+
+    Returns:
+        Win rate, average win and loss, profit factor, payoff ratio, average
+        holding period and the best and worst positions. Any statistic that
+        could not be computed — no closed positions, no losses to average — is
+        ``None`` rather than zero, with the reason recorded in
+        :attr:`~PositionStats.reasons`.
+    """
     episodes = position_episodes(run.weights, returns)
     closed = [e for e in episodes if e.closed]
     n_open = len(episodes) - len(closed)

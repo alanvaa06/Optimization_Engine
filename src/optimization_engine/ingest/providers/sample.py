@@ -54,11 +54,26 @@ class Sample(PriceProvider):
         api_key: str | None = None,
         timeout: float | None = None,
     ) -> None:
+        """Fix the seed this provider generates from.
+
+        Args:
+            seed: Base seed. Combined with the requested universe, so the same
+                request always produces the same panel and two different universes
+                do not share a path.
+            api_key: Unused; accepted so every provider constructs the same way.
+            timeout: Unused; this provider makes no network call.
+        """
         super().__init__(api_key=api_key, timeout=timeout)
         self._seed = int(seed)
 
     @property
     def capabilities(self) -> ProviderCapabilities:
+        """OHLCV, no key, no network, any symbol.
+
+        Returns:
+            Capabilities advertising offline batch generation for up to 200
+            identifiers at any supported interval.
+        """
         return ProviderCapabilities(
             fields=frozenset({F.OPEN, F.HIGH, F.LOW, F.CLOSE, F.VOLUME}),
             intervals=frozenset(_BARS_PER_YEAR),
@@ -74,11 +89,36 @@ class Sample(PriceProvider):
         )
 
     def fetch_one(self, identifier: str, request: IngestRequest) -> PricePanel:
+        """One identifier, by way of :meth:`fetch_batch`.
+
+        Args:
+            identifier: The name to generate.
+            request: The run's window, interval and requested fields.
+
+        Returns:
+            A single-column panel. See :meth:`fetch_batch` for what can be raised.
+        """
         return self.fetch_batch((identifier,), request)
 
     def fetch_batch(
         self, identifiers: tuple[str, ...], request: IngestRequest
     ) -> PricePanel:
+        """Generate a synthetic panel for the requested universe.
+
+        The series carry a realistic cross-asset correlation structure rather
+        than independent noise, so a covariance estimated from them is
+        ill-conditioned in the way a real one is.
+
+        Args:
+            identifiers: Names to generate. Any string is accepted.
+            request: The run's window and interval, which set the date index.
+
+        Returns:
+            A validated OHLCV panel, identical for identical inputs.
+
+        Raises:
+            IdentifierNotFoundError: If no identifiers were given.
+        """
         if not identifiers:
             raise IdentifierNotFoundError("The sample provider needs an identifier.")
 

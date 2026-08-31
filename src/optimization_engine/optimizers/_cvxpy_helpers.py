@@ -51,9 +51,22 @@ class SolveInfo:
 
     @property
     def is_exact(self) -> bool:
+        """Whether the solver converged properly rather than approximately.
+
+        Returns:
+            ``True`` only for ``"optimal"``. An ``"optimal_inaccurate"`` answer is
+            usable and is accepted, but it is not this.
+        """
         return self.status == "optimal"
 
     def as_dict(self) -> dict[str, object]:
+        """This record as a flat, JSON-serializable mapping.
+
+        Returns:
+            The solver that answered, its status, the wall time in seconds, the
+            objective value, and every solver attempted along the way. Merged into
+            a result's ``extras``, so it reaches the ``--json`` payload.
+        """
         return {
             "solver": self.solver,
             "solver_status": self.status,
@@ -67,6 +80,16 @@ class SolverFailure(RuntimeError):
     """No solver could return a usable solution for the problem as posed."""
 
     def __init__(self, status: str, attempts: tuple[str, ...], detail: str = "") -> None:
+        """Build the failure, interpreting the status where it can.
+
+        Args:
+            status: The last solver status. ``"infeasible"`` and ``"unbounded"``
+                get a message explaining what to change; anything else is
+                reported as-is.
+            attempts: Every solver tried, in order. Appended to the message and
+                kept on the exception as ``exc.attempts``.
+            detail: Extra context appended verbatim.
+        """
         self.status = status
         self.attempts = attempts
         message = f"No solver produced a solution (last status: {status!r})."
@@ -212,7 +235,16 @@ def solve_problem(
 def bounds_arrays(
     assets: list[str], constraints: PortfolioConstraints
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Per-asset lower/upper weight bounds as aligned arrays."""
+    """Per-asset lower/upper weight bounds as aligned arrays.
+
+    Args:
+        assets: The universe, in the order the solve indexes it.
+        constraints: The mandate whose bounds to read.
+
+    Returns:
+        A ``(lower, upper)`` pair of arrays, both aligned to ``assets``, in
+        weight units.
+    """
     lb = np.array([constraints.get_bounds(a)[0] for a in assets])
     ub = np.array([constraints.get_bounds(a)[1] for a in assets])
     return lb, ub
@@ -226,6 +258,14 @@ def group_index_map(
     Covers the flat ``groups`` mapping only. Kept because callers outside this
     package use it; every optimizer in the engine now goes through
     :func:`layer_constraints`, which sees the whole layered policy.
+
+    Args:
+        assets: The universe, in the order the solve indexes it.
+        constraints: The mandate whose ``groups`` to read.
+
+    Returns:
+        ``group -> positions into assets``, covering only the groups that
+        carry a bound.
     """
     grouped: dict[str, list[int]] = {}
     if not (constraints.groups and constraints.group_bounds):
@@ -249,6 +289,16 @@ def layer_constraints(
     for the homogeneous ``w = y/κ`` ones. See
     :func:`optimization_engine.constraints.layer_cvxpy_constraints` for why a
     percent-of-parent limit needs no rescaling in either.
+
+    Args:
+        weights: The CVXPY weight variable, or the ray variable ``y``.
+        assets: The universe, in the order the solve indexes it.
+        constraints: The mandate whose layers to translate.
+        scale: The homogenizing variable ``κ``, or ``None`` in weight space.
+
+    Returns:
+        CVXPY constraints, one pair per bounded bucket. Empty when nothing is
+        constrained above the per-asset level.
     """
     return layer_cvxpy_constraints(weights, assets, constraints.layers, scale=scale)
 
@@ -310,7 +360,17 @@ def benchmark_constraints(
 
     Both are convex in ``w``: tracking error is a quadratic form in the active
     weights and active share is an L1 norm of them, so neither costs the solve
-    its convexity. Returns an empty list when no benchmark is set.
+    its convexity.
+
+    Args:
+        weights: The CVXPY weight variable.
+        assets: The universe, in the order the solve indexes it.
+        constraints: The mandate carrying the benchmark and its budgets.
+        cov_matrix: Asset covariance, needed to measure tracking error. Its
+            periodicity sets the units of ``max_tracking_error``.
+
+    Returns:
+        CVXPY constraints, or an empty list when no benchmark is set.
 
     Raises:
         ValueError: When a tracking-error budget is set without a covariance
@@ -362,6 +422,12 @@ def psd_sqrt(sigma: np.ndarray) -> np.ndarray:
     detoned or shrunk matrix can carry eigenvalues at ``-1e-18``. Clipping
     them to zero and rebuilding from the eigendecomposition gives the nearest
     PSD square root instead of an exception.
+
+    Args:
+        sigma: A symmetric, positive semi-definite matrix.
+
+    Returns:
+        A symmetric matrix ``A`` with ``A @ A == sigma`` up to the clipping.
     """
     values, vectors = np.linalg.eigh(np.asarray(sigma, dtype=float))
     return vectors @ np.diag(np.sqrt(np.clip(values, 0.0, None))) @ vectors.T

@@ -12,6 +12,15 @@ pip install finport-optengine          # core: solve, backtest, analyse
 pip install "finport-optengine[all]"   # + plotting, Excel, regression, data
 ```
 
+Two places to look when this file does not answer the question. The **API
+reference** — generated from the docstrings, so every exported name carries
+its signature, parameters, units and errors — is published to GitHub Pages
+from `main`, and builds locally with `pip install "finport-optengine[docs]"`
+then `python scripts/build_api_docs.py`. **[`docs/ERRORS.md`](docs/ERRORS.md)**
+is the refusal contract: which of the twenty-one exception types to catch,
+which are recoverable, the CLI's exit codes, and — the part that catches
+people — the failures that are *reported* rather than raised.
+
 ## The shortest correct program
 
 ```python
@@ -150,4 +159,14 @@ and the suite still passes.
 
 CI runs lint, the suite on Python 3.9–3.12, the Streamlit app tests, a
 core-install job that asserts no optional dependency leaked into the core,
-and a CLI smoke test. `docs/RELEASING.md` covers publishing.
+and a CLI smoke test. A separate docs workflow renders the API reference with
+`--strict`, which refuses to skip a module it cannot import — so a missing
+extra fails the build instead of quietly dropping a page.
+`docs/RELEASING.md` covers publishing.
+
+Docstrings are the API reference's only source, which makes them part of the
+public surface rather than a courtesy. Every public function, class and method
+carries one; every function with parameters documents them, with units where a
+number has any (`cost_bps` per side, `execution_lag` in bars, `alpha` as a tail
+probability); and every function that raises declares what and when. Adding a
+public name without those is adding a hole in the published reference.

@@ -1,0 +1,289 @@
+# Errors, and what to do about them
+
+The engine's whole argument is that it refuses rather than fails obscurely.
+That only helps if the refusal is legible, so this is the contract: every
+exception the library raises on purpose, what causes it, whether it is
+recoverable, and what to catch.
+
+There are twenty-one exception classes. You almost never want to catch all of
+them, because they mean three different things:
+
+| It means | Do this | Examples |
+| --- | --- | --- |
+| **Your inputs are wrong** — a config, a universe, a constraint set | Fix the input. Retrying is pointless. | `SpecValidationError`, `LayerConfigurationError`, `BenchmarkError`, `ConfigurationError`, `SweepValidationError` |
+| **Your mandate is impossible** — the constraints have no solution | Relax something. The exception says which. | `InfeasibleConstraintsError`, `InfeasibleBoundsError`, `SolverFailure` |
+| **The world got in the way** — network, credentials, a vendor's bad day | Retry, or fix the environment. | `ProviderTransientError`, `ProviderCredentialsError`, `MissingDependencyError` |
+
+Five error types are exported from the package root — `IngestError`,
+`InfeasibleConstraintsError`, `YahooFinanceError`, `FREDError` and `FXError` —
+because they are what a caller writing a `try` block realistically reaches for.
+The rest are importable from the module that raises them.
+
+---
+
+## Data ingestion
+
+Every ingest failure derives from `IngestError`, so one `except` catches the
+lot:
+
+```python
+from optimization_engine import IngestError, IngestRequest, ingest
+
+try:
+    result = ingest.ingest(IngestRequest(identifiers=["SPY"], provider="tiingo"))
+except IngestError as exc:
+    ...
+```
+
+Catch the subclasses only when you intend to respond differently. The service
+layer already does, which is why the taxonomy exists:
+
+```
+IngestError (RuntimeError)
+├── ProviderNotFoundError        the provider name is not registered
+├── ProviderConfigurationError   the provider cannot serve what was asked
+├── ProviderCredentialsError     the API key is missing, malformed or rejected
+├── ProviderTransientError       timeout, reset, 5xx, throttling
+├── ProviderResponseError        it answered, the payload made no sense
+├── IdentifierNotFoundError      no data for this one identifier
+└── PanelValidationError         the panel failed a structural or economic check
+```
+
+| Error | Recoverable? | Scope | What the service does |
+| --- | --- | --- | --- |
+| `ProviderNotFoundError` | No — fix the name | The request | Raises. Check `optengine providers`. |
+| `ProviderConfigurationError` | No — fix the request | The request | Raises **before any network call**: the interval, field or symbol grammar was rejected up front. |
+| `ProviderCredentialsError` | Only by setting the key | The whole run | Aborts immediately. Every other identifier would fail identically, so retrying the rest is wasted time. |
+| `ProviderTransientError` | Yes | One fetch | Retried automatically. It surfaces only after the retries are spent. |
+| `ProviderResponseError` | Sometimes | One identifier | Recorded against the identifier; the run continues. |
+
+An exception that is *not* an `IngestError` — a bug in a provider adapter —
+does not take the run down either. It is logged with its full traceback and
+reported against the identifier as its **type name only**. That is deliberate:
+an unclassified exception is by definition one whose message nobody has vetted,
+and these messages travel to a log, to the CLI's stderr and to the browser,
+while a provider puts its API key in a request header.
+| `IdentifierNotFoundError` | No — the universe is wrong | One identifier | Recorded and skipped. The run finishes with the rest of the universe. |
+| `PanelValidationError` | No — the data is wrong | The panel | Raises. A panel that fails a sanity check is worse than no panel. |
+
+**The important consequence:** a run that skips identifiers still *succeeds*.
+Eleven of twelve assets arriving is not a success, and you should not have to
+count columns to find out. Check the result rather than relying on the absence
+of an exception:
+
+```python
+result = ingest.ingest(request)
+if not result.is_complete:          # the CLI exits 1 on exactly this
+    print(result.panel.coverage())  # per-identifier: what loaded, from where, over what span
+```
+
+### The legacy loaders
+
+`data/yahoo.py`, `data/fred.py` and `data/fx.py` predate the ingest layer and
+keep their own error types. They are flat `RuntimeError` subclasses with no
+taxonomy — a missing dependency, a bad ticker and a network failure all arrive
+as the same class, distinguishable only by message.
+
+| Error | Raised by | Also covers |
+| --- | --- | --- |
+| `YahooFinanceError` | `load_prices_yahoo` | A missing `yfinance` install, an empty ticker list, an unknown ticker, an empty response |
+| `FREDError` | `load_fred_series`, `load_risk_free_rate` | A malformed series id (only `A-Z`, `0-9`, `_` pass), an unreachable FRED, an empty series |
+| `FXError` | `fetch_fx_to_base`, `convert_prices_to_base` | An unsupported currency (see `supported_currencies()`), a missing cross rate, a conversion that would drop every row |
+
+Prefer the `ingest` layer for new code: it reports per-identifier provenance
+and routes on the error type. These three stay for the paths that already use
+them.
+
+---
+
+## Configuration and specs
+
+These are all raised **before** anything is estimated or solved, which is the
+point: an invalid mandate should cost you a millisecond, not a walk-forward.
+
+| Error | Raised by | Causes |
+| --- | --- | --- |
+| `SpecValidationError` | `CostSpec` and `BacktestSpec` construction | A negative cost component; impact enabled with a non-positive participation; an unknown rebalance frequency; a negative `execution_lag` (it "would trade on a decision not yet taken"); `periods_per_year < 1`; a non-positive `initial_capital`; volume-priced impact on a fund too small to have a capacity problem |
+| `SweepValidationError` | `SweepSpec` construction, `run_sweep`, `sweep_from_optimizers` | No parameters at all; a parameter with an empty value list; a non-positive `max_cells`; a dotted path that names nothing on the base configuration; a grid expanding past `max_cells` (200 by default, low on purpose, and itself under a hard cap) |
+| `LayerConfigurationError` | `ConstraintLayer`, `layer_from_mapping`, `effective_layers` | An unknown `basis`; a layer expressing limits as a share of its parent while naming no parent; a named parent layer that does not exist; buckets that sit in more than one parent bucket, so "30% of the parent" has no single meaning; a layer entry that is neither a mapping nor a `ConstraintLayer` |
+| `BenchmarkError` | `BenchmarkSpec` construction, `resolve_benchmark` | An unknown `kind` or `rebalance` rule; `single_asset` with no asset, or one outside the universe; `custom_weights` with no vector, or naming assets outside the universe; weights summing to zero under `normalize`; an empty universe |
+| `ConfigurationError` | `optimizer_factory` | The method requires expected returns, a covariance matrix or a returns frame and got none; a benchmark-relative method with no benchmark **weights**; a tracking-error or active-share budget set without benchmark weights; a malformed Black-Litterman view |
+| `HoldoutViolationError` | `assert_within_holdout`, on every gated path | A frame handed to a gated run carries a row past the holdout boundary. A guardrail against look-ahead, not a bug in your data |
+
+`SpecValidationError`, `SweepValidationError`, `LayerConfigurationError`,
+`BenchmarkError` and `ConfigurationError` subclass `ValueError`;
+`HoldoutViolationError` subclasses `RuntimeError`.
+
+Two adjacent cases raise plain builtins rather than a named type: bounds with
+`lb > ub` element-wise is a `ValueError`, and so is a holdout boundary that
+leaves no held-out segment to evaluate.
+
+### On `ConfigurationError`
+
+It lives in `optimization_engine.optimizers`, not the package root, and it is
+the one you will hit first when trying a new method:
+
+```python
+from optimization_engine.optimizers import ConfigurationError
+```
+
+`optengine describe <name>` prints what each method requires before you find
+out the hard way. A related trap that is *not* an exception: a mean-variance
+solve given a **flat** expected-return vector carries no cross-sectional view.
+The engine says so rather than returning a `NaN` you discover three steps
+later.
+
+---
+
+## Infeasible mandates
+
+The difference between these three matters.
+
+**`InfeasibleConstraintsError`** is the good one. It is raised by the
+pre-flight analysis, before a solver is ever called, and it carries a full
+`FeasibilityReport` on the exception object:
+
+```python
+from optimization_engine.optimizers.feasibility import InfeasibleConstraintsError
+
+try:
+    run = run_engine(returns, config, raise_on_infeasible=True)
+except InfeasibleConstraintsError as exc:
+    print(exc.report.describe())   # names the binding constraint and the fix
+```
+
+Note `raise_on_infeasible`. It defaults to `False`, in which case the engine
+reports the problem in `run.warnings` and proceeds. Pass `True` — the CLI's
+`--strict` — when you would rather stop. `optengine check` runs the same
+analysis without solving and exits `1` if the mandate is not ready.
+
+**`InfeasibleBoundsError`** is narrower and comes from the projection step
+rather than the mandate analysis. Three ways in: the minima sum above 1 or the
+maxima sum below it, so the bounds and the unit budget contradict each other
+outright; the projection runs out of slack on one side and cannot absorb the
+residual; or the layered projection finds no allocation satisfying the weight
+bounds, the budget and the bucket budgets at once — that last one wraps the
+underlying `SolverFailure` and quotes it.
+
+**`SolverFailure`** means the pre-flight passed and the solve still did not
+produce a usable answer. It carries two attributes worth reading:
+
+```python
+from optimization_engine.optimizers._cvxpy_helpers import SolverFailure
+
+try:
+    ...
+except SolverFailure as exc:
+    exc.status     # the last solver status: 'infeasible', 'unbounded', ...
+    exc.attempts   # every solver tried, in order
+```
+
+The message already interprets the common statuses — `infeasible` means no
+allocation satisfies every constraint at once, `unbounded` means the objective
+improves without limit and you are missing a bound or a budget. The engine
+walks a solver fallback chain before giving up, and an `optimal_inaccurate`
+answer is not accepted until the rest of the chain has been tried, so a
+`SolverFailure` means every solver declined, not just the first.
+
+The most common cause that looks like a solver bug and is not: a
+tracking-error or active-share budget. A benchmark holding an asset your
+bounds cap below its index weight sets a *floor* on tracking error that no
+allocation can go under. Raise the limit or relax the bound.
+
+---
+
+## Missing optional dependencies
+
+The core install is small on purpose. Reaching a feature whose extra is absent
+raises `MissingDependencyError`, which subclasses `ImportError` — so
+`except ImportError` around an optional feature keeps working — and whose
+message is the install command that fixes it:
+
+```
+plotly.express is required for plotting, and is not installed.
+Install it with: pip install 'finport-optengine[viz]'
+```
+
+| Extra | Gates |
+| --- | --- |
+| `viz` | Every figure in `reporting.plots` |
+| `excel` | Reading and writing `.xlsx` |
+| `stats` | Benchmark-relative OLS metrics (beta, regression stats) |
+| `data` | The Yahoo provider, and Parquet panels |
+| `mcp` | The MCP server (needs Python 3.10+) |
+| `ui` | The Streamlit app |
+
+Importing the module never raises; reaching the code path does. That is what
+lets `import optimization_engine.reporting.plots` succeed on a core install and
+`plot_correlation_heatmap(...)` fail with something useful.
+
+---
+
+## Exit codes
+
+The CLI does not leak tracebacks. Every expected failure is caught, printed to
+stderr, and turned into a code:
+
+| Code | Meaning |
+| --- | --- |
+| `0` | Success |
+| `1` | The command ran and the answer is "no" — `check` found the mandate infeasible or the data unusable, `ingest` completed but the panel is incomplete |
+| `2` | The command could not run — bad config, unresolvable benchmark, data error under `--strict`, infeasible constraints, solver failure, provider error |
+
+The distinction is worth honouring in a script: `1` means the engine worked and
+is telling you something, `2` means it never got that far.
+
+`--json` keeps those codes for anything the command *returns*, with one
+addition: an exception that escapes a command is caught, its traceback printed
+to stderr, and the run exits `1` rather than dying with a traceback on an empty
+stdout. So in JSON mode `1` also covers "the command raised".
+
+The payload is unconditional either way. `optimize`, `backtest`, `check` and
+`describe` put exactly one parseable document on stdout — narration is
+redirected to stderr for the duration — and a run that fails before producing a
+result still emits one:
+
+```json
+{
+  "schema_version": "...",
+  "command": "optimize",
+  "error": "SpecValidationError: execution_lag cannot be negative; got -1.",
+  "exit_code": 1
+}
+```
+
+A caller parsing stdout never has to tell "no JSON" apart from "JSON I could
+not read". Note that a run which raised reports the failure *even if it had
+already captured a payload*: emitting that payload under a non-zero exit would
+describe a result the command did not finish producing.
+
+---
+
+## What does *not* raise
+
+Some things are reported instead, and are easy to miss if you only guard with
+`try`:
+
+- **Constraint breaches after a solve.** A solver can return an answer that
+  violates a constraint within tolerance. This is reported in the run's
+  diagnostics, never silently accepted — and never raised either.
+- **Data-quality problems.** Gaps, stale feeds, suspected unadjusted splits and
+  thin samples come back in `analyze_prices(...).errors` and `.warnings`. Only
+  `--strict` turns an error into a refusal.
+- **Degraded cost models.** A universe with no volume — an index panel, say —
+  cannot price market impact from participation. The run does not fail; impact
+  falls back to a fixed participation rate and every trade that did so is named
+  in the run's degradation notes.
+- **Skipped identifiers.** Covered above: check `result.is_complete`.
+
+The pattern throughout is the same. A refusal is for something the engine
+cannot proceed past. Everything else is reported, attached to the result that
+depends on it, and left for you to decide about.
+
+---
+
+## See also
+
+- [AGENTS.md](../AGENTS.md) — the API map and the `--json` CLI contract
+- [README](../README.md#install) — what each extra pulls in
+- The API reference — every `Raises:` section, generated from the docstrings

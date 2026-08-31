@@ -78,6 +78,7 @@ class IdentifierOutcome:
 
     @property
     def ok(self) -> bool:
+        """Whether this identifier's data arrived."""
         return self.status == STATUS_OK
 
 
@@ -116,10 +117,17 @@ class IngestResult:
 
     @property
     def loaded(self) -> tuple[str, ...]:
+        """Identifiers that arrived, in request order."""
         return tuple(o.identifier for o in self.outcomes if o.ok)
 
     @property
     def failed(self) -> tuple[IdentifierOutcome, ...]:
+        """The outcomes that did not arrive, each carrying its own reason.
+
+        Returns:
+            Full :class:`IdentifierOutcome` records rather than bare names, so a
+            caller can tell a missing ticker from a provider that timed out.
+        """
         return tuple(o for o in self.outcomes if not o.ok)
 
     @property

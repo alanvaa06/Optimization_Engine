@@ -76,6 +76,12 @@ class Tearsheet:
         return frames
 
     def describe(self) -> str:
+        """The whole tearsheet as text: run, costs, selection bias, caveats.
+
+        Returns:
+            One line per section, newline-joined. The caveats are part of the
+            output rather than an appendix — an in-sample run says so here.
+        """
         lines = [self.run.describe(), self.tca.describe()]
         if self.deflated_sharpe is not None:
             lines.append(self.deflated_sharpe.describe())

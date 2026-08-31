@@ -75,6 +75,14 @@ def series_color(i: int, label: object = None) -> str:
 
     The folded "Other" band and anything past the categorical slots take the
     neutral: a hue is only ever spent on a series that means one thing.
+
+    Args:
+        i: Zero-based series index.
+        label: The series' name. ``"Other"`` always takes the neutral,
+            whatever its index.
+
+    Returns:
+        A CSS colour string.
     """
     if label is not None and str(label).startswith(OTHER_LABEL_PREFIX):
         return OTHER_COLOR
@@ -314,7 +322,20 @@ def plot_efficient_frontier(
 def plot_portfolio_composition(
     weights: pd.DataFrame, title: str = "Portfolio Composition", as_percent: bool = True
 ) -> go.Figure:
-    """Stacked weights, one bar per column of ``weights``."""
+    """Stacked weights, one bar per column of ``weights``.
+
+    Args:
+        weights: Assets down the index, one column per portfolio to compare.
+        title: Figure title.
+        as_percent: Label the axis in percent rather than as fractions.
+
+    Returns:
+        A Plotly figure.
+
+    Raises:
+        MissingDependencyError: If plotly is not installed. Install it with
+            ``finport-optengine[viz]``.
+    """
     folded = fold_to_slots(weights)
     df = folded.T.copy()
     if as_percent:
@@ -353,6 +374,19 @@ def plot_weights_bar(
 
     Seeing which positions are pinned to a cap is the fastest way to tell
     whether the constraints or the optimizer produced the answer.
+
+    Args:
+        weights: One weight per asset, as fractions of the book.
+        title: Figure title.
+        bounds: A frame indexed by asset with ``min`` and ``max`` columns.
+            When given, the bounds are drawn behind the bars.
+
+    Returns:
+        A Plotly figure.
+
+    Raises:
+        MissingDependencyError: If plotly is not installed. Install it with
+            ``finport-optengine[viz]``.
     """
     w = weights.sort_values()
     colors = [PALETTE[0] if v >= 0 else PALETTE[7] for v in w.values]
@@ -389,7 +423,19 @@ def plot_weights_bar(
 
 
 def plot_risk_contributions(rc: pd.DataFrame, title: str = "Risk Contributions") -> go.Figure:
-    """Grouped bars of risk shares (or any per-asset frame)."""
+    """Grouped bars of risk shares (or any per-asset frame).
+
+    Args:
+        rc: Assets down the index, one column per series to compare.
+        title: Figure title.
+
+    Returns:
+        A Plotly figure.
+
+    Raises:
+        MissingDependencyError: If plotly is not installed. Install it with
+            ``finport-optengine[viz]``.
+    """
     df = rc * 100.0
     fig = px.bar(df, barmode="group", title=title, color_discrete_sequence=PALETTE)
     fig.update_layout(yaxis_title="% of risk", xaxis_title="Asset", **_LAYOUT)
@@ -403,6 +449,18 @@ def plot_weight_vs_risk(
 
     The gap between the two bars is the whole argument for risk parity: a
     position can be small in capital and large in risk.
+
+    Args:
+        decomposition: A risk decomposition frame, as returned by
+            :func:`~optimization_engine.optimizers.diagnostics.risk_decomposition`.
+        title: Figure title.
+
+    Returns:
+        A Plotly figure.
+
+    Raises:
+        MissingDependencyError: If plotly is not installed. Install it with
+            ``finport-optengine[viz]``.
     """
     df = decomposition.sort_values("share_of_risk", ascending=False)
     fig = go.Figure()
@@ -428,7 +486,19 @@ def plot_weight_vs_risk(
 
 
 def plot_wealth_index(returns: pd.DataFrame, title: str = "Wealth Index") -> go.Figure:
-    """Cumulative growth of 1 unit."""
+    """Cumulative growth of 1 unit.
+
+    Args:
+        returns: Periodic returns, one column per series to compare.
+        title: Figure title.
+
+    Returns:
+        A Plotly figure.
+
+    Raises:
+        MissingDependencyError: If plotly is not installed. Install it with
+            ``finport-optengine[viz]``.
+    """
     wealth = (1 + returns).cumprod()
     fig = px.line(wealth, title=title, color_discrete_sequence=PALETTE)
     fig.update_layout(
@@ -439,7 +509,19 @@ def plot_wealth_index(returns: pd.DataFrame, title: str = "Wealth Index") -> go.
 
 
 def plot_correlation_heatmap(corr: pd.DataFrame, title: str = "Correlation Matrix") -> go.Figure:
-    """Correlation matrix with values annotated for small universes."""
+    """Correlation matrix with values annotated for small universes.
+
+    Args:
+        corr: A square correlation matrix.
+        title: Figure title.
+
+    Returns:
+        A Plotly figure.
+
+    Raises:
+        MissingDependencyError: If plotly is not installed. Install it with
+            ``finport-optengine[viz]``.
+    """
     fig = px.imshow(
         corr.values,
         x=corr.columns,
@@ -459,7 +541,19 @@ def plot_correlation_heatmap(corr: pd.DataFrame, title: str = "Correlation Matri
 
 
 def plot_drawdown(returns: pd.Series | pd.DataFrame, title: str = "Drawdown") -> go.Figure:
-    """Underwater chart."""
+    """Underwater chart.
+
+    Args:
+        returns: Periodic returns, or a frame of them.
+        title: Figure title.
+
+    Returns:
+        A Plotly figure.
+
+    Raises:
+        MissingDependencyError: If plotly is not installed. Install it with
+            ``finport-optengine[viz]``.
+    """
     if isinstance(returns, pd.Series):
         returns = returns.to_frame()
     wealth = (1 + returns).cumprod()
@@ -485,6 +579,18 @@ def plot_rolling_metrics(
     and an annualized-return series happen to occupy similar numeric ranges,
     so on one plot they trace nearly the same path and read as a duplicate
     line rather than two different measurements.
+
+    Args:
+        rolling: The frame from
+            :func:`~optimization_engine.analytics.performance.rolling_metrics`.
+        title: Figure title.
+
+    Returns:
+        A Plotly figure.
+
+    Raises:
+        MissingDependencyError: If plotly is not installed. Install it with
+            ``finport-optengine[viz]``.
     """
     from plotly.subplots import make_subplots
 
@@ -538,6 +644,18 @@ def plot_walk_forward_comparison(
     """Fitted and walk-forward wealth curves on one axis.
 
     The distance between the lines is how much of the backtest was hindsight.
+
+    Args:
+        in_sample: The in-sample return stream.
+        out_of_sample: The walk-forward stream from the same process.
+        title: Figure title.
+
+    Returns:
+        A Plotly figure.
+
+    Raises:
+        MissingDependencyError: If plotly is not installed. Install it with
+            ``finport-optengine[viz]``.
     """
     fig = go.Figure()
     for name, series, color, dash in (
@@ -562,7 +680,19 @@ def plot_walk_forward_comparison(
 def plot_weight_evolution(
     weights: pd.DataFrame, title: str = "Weights through time"
 ) -> go.Figure:
-    """Stacked area of held weights over a backtest."""
+    """Stacked area of held weights over a backtest.
+
+    Args:
+        weights: Dates down the index, one column per asset.
+        title: Figure title.
+
+    Returns:
+        A Plotly figure.
+
+    Raises:
+        MissingDependencyError: If plotly is not installed. Install it with
+            ``finport-optengine[viz]``.
+    """
     folded = fold_to_slots(weights, axis=1)
     fig = go.Figure()
     for i, col in enumerate(folded.columns):
@@ -592,6 +722,20 @@ def plot_return_distribution(
 
     Seeing where the tail cut falls relative to the actual histogram is what
     makes a CVaR number mean something.
+
+    Args:
+        returns: A periodic return stream.
+        var: Value at Risk as a positive fraction, drawn as a vertical line.
+            ``None`` omits it.
+        cvar: Conditional VaR as a positive fraction, drawn likewise.
+        title: Figure title.
+
+    Returns:
+        A Plotly figure.
+
+    Raises:
+        MissingDependencyError: If plotly is not installed. Install it with
+            ``finport-optengine[viz]``.
     """
     fig = go.Figure()
     fig.add_trace(
@@ -628,6 +772,18 @@ def plot_frontier_uncertainty(
     The point estimate is drawn on top of the quantile band from resampled
     histories. Where the band is wide, two portfolios that look different on
     the point-estimate curve are not distinguishable given the data.
+
+    Args:
+        uncertainty: A
+            :class:`~optimization_engine.resampling.FrontierUncertainty`.
+        title: Figure title.
+
+    Returns:
+        A Plotly figure.
+
+    Raises:
+        MissingDependencyError: If plotly is not installed. Install it with
+            ``finport-optengine[viz]``.
     """
     q = uncertainty.quantiles
     x = list(q.index)
@@ -704,6 +860,17 @@ def plot_weight_dispersion(
 
     A large bar means the optimizer's conviction in that position comes from
     the particular sample it was handed, not from the asset.
+
+    Args:
+        dispersion: One standard deviation per asset, in weight units.
+        title: Figure title.
+
+    Returns:
+        A Plotly figure.
+
+    Raises:
+        MissingDependencyError: If plotly is not installed. Install it with
+            ``finport-optengine[viz]``.
     """
     d = dispersion.sort_values()
     fig = go.Figure(
@@ -744,6 +911,18 @@ def plot_relative_wealth(
     Plotting the ratio rather than the cumulative sum of excess returns is
     deliberate: compounding a difference of returns as though it were a return
     overstates the gap, and the error grows with the sample.
+
+    Args:
+        portfolio: The portfolio's return stream.
+        benchmark: The benchmark's, over the same dates.
+        title: Figure title.
+
+    Returns:
+        A Plotly figure.
+
+    Raises:
+        MissingDependencyError: If plotly is not installed. Install it with
+            ``finport-optengine[viz]``.
     """
     common = portfolio.dropna().index.intersection(benchmark.dropna().index)
     p = portfolio.loc[common]
@@ -789,6 +968,19 @@ def plot_period_returns(
     average is a description of anything. The excess is a marker rather than a
     third bar so the eye compares portfolio against benchmark first, which is
     the comparison the chart exists to make.
+
+    Args:
+        periods: The frame from
+            :func:`~optimization_engine.analytics.report.period_returns`.
+        title: Figure title.
+        excess_column: Which column holds the excess return.
+
+    Returns:
+        A Plotly figure.
+
+    Raises:
+        MissingDependencyError: If plotly is not installed. Install it with
+            ``finport-optengine[viz]``.
     """
     if periods is None or periods.empty:
         return go.Figure()
@@ -832,6 +1024,18 @@ def plot_rolling_relative(
     Stacked panels for the same reason as :func:`plot_rolling_metrics`: an
     information ratio and a beta occupy similar numeric ranges and would read
     as one duplicated line on a shared axis.
+
+    Args:
+        rolling: The frame from
+            :func:`~optimization_engine.analytics.report.rolling_relative`.
+        title: Figure title.
+
+    Returns:
+        A Plotly figure.
+
+    Raises:
+        MissingDependencyError: If plotly is not installed. Install it with
+            ``finport-optengine[viz]``.
     """
     from plotly.subplots import make_subplots
 

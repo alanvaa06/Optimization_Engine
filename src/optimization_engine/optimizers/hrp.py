@@ -100,6 +100,17 @@ class HRPOptimizer(BaseOptimizer):
     bounds_mode = "soft_iterated"
 
     def __init__(self, *args, linkage_method: str = "single", **kwargs) -> None:
+        """Choose the linkage the correlation tree is built with.
+
+        Args:
+            *args: Passed to :class:`~optimization_engine.optimizers.base.BaseOptimizer`.
+            linkage_method: ``"single"`` (the default, and López de Prado's own),
+                ``"average"``, ``"complete"`` or ``"ward"``.
+            **kwargs: Passed to the base class.
+
+        Raises:
+            ValueError: If ``linkage_method`` is not one of those four.
+        """
         super().__init__(*args, **kwargs)
         if linkage_method not in LINKAGE_METHODS:
             raise ValueError(

@@ -64,6 +64,13 @@ class SeriesMeta:
     exchange: str | None = None
 
     def describe(self) -> str:
+        """One line naming the instrument, its kind, and where it came from.
+
+        Returns:
+            Something like ``"S&P 500 (index · USD · NYSE) via stooq"``. The
+            display name is used when the provider supplied one, and the
+            engine-side identifier otherwise.
+        """
         label = self.name or self.identifier
         venue = f" · {self.exchange}" if self.exchange else ""
         ccy = f" · {self.currency}" if self.currency else ""
@@ -164,21 +171,43 @@ class PricePanel:
         *,
         validate: bool = True,
     ) -> PricePanel:
-        """Wrap a plain close-price frame as a close-only panel."""
+        """Wrap a plain close-price frame as a close-only panel.
+
+        Args:
+            prices: Prices indexed by date, one column per identifier.
+            meta: Per-identifier provenance. Absent identifiers get none.
+            validate: Run the structural and economic checks.
+
+        Returns:
+            A close-only :class:`PricePanel`.
+
+        Raises:
+            PanelValidationError: If ``validate`` is set and the frame fails a
+                check — a non-datetime or unsorted index, or non-positive
+                prices.
+        """
         return cls.from_frames({F.CLOSE: prices}, meta, validate=validate)
 
     # -- accessors --------------------------------------------------------
 
     @property
     def identifiers(self) -> tuple[str, ...]:
+        """Engine-side names carried by this panel, in column order."""
         return tuple(self.frames[F.CLOSE].columns)
 
     @property
     def available_fields(self) -> tuple[str, ...]:
+        """Which market fields this panel actually carries.
+
+        Returns:
+            The subset of the field vocabulary present in :attr:`frames`, in the
+            vocabulary's own order. Always includes ``CLOSE``.
+        """
         return tuple(f for f in F.MARKET_FIELDS if f in self.frames)
 
     @property
     def index(self) -> pd.DatetimeIndex:
+        """The panel's date index, shared by every field frame."""
         return pd.DatetimeIndex(self.frames[F.CLOSE].index)
 
     def prices(self) -> pd.DataFrame:
@@ -186,7 +215,16 @@ class PricePanel:
         return self.frames[F.CLOSE].copy()
 
     def frame(self, name: str) -> pd.DataFrame | None:
-        """One field's frame, or ``None`` when the panel does not carry it."""
+        """One field's frame, or ``None`` when the panel does not carry it.
+
+        Args:
+            name: A field from
+                :mod:`~optimization_engine.ingest.fields`, e.g. ``VOLUME``.
+
+        Returns:
+            A copy of that field's frame, or ``None``. A copy rather than a view,
+            so a caller cannot mutate the panel by accident.
+        """
         found = self.frames.get(name)
         return None if found is None else found.copy()
 
@@ -204,9 +242,21 @@ class PricePanel:
 
     @property
     def has_volume(self) -> bool:
+        """Whether any identifier reports traded volume.
+
+        ``False`` is a fact about the universe, not a gap in it: an index panel
+        never carries volume, and the cost model prices impact differently rather
+        than failing.
+        """
         return self.volumes() is not None
 
     def kinds(self) -> dict[str, F.InstrumentKind]:
+        """Instrument kind per identifier.
+
+        Returns:
+            ``identifier -> InstrumentKind``, covering every column. An identifier
+            with no metadata maps to ``UNKNOWN`` rather than being left out.
+        """
         return {
             identifier: self.meta[identifier].kind
             if identifier in self.meta
@@ -257,6 +307,12 @@ class PricePanel:
     def select(self, identifiers: Iterable[str]) -> PricePanel:
         """A panel restricted to ``identifiers``, preserving their order.
 
+        Args:
+            identifiers: The subset to keep, in the order the result should carry.
+
+        Returns:
+            A new panel over that subset, with its metadata narrowed to match.
+
         Raises:
             PanelValidationError: If an identifier is not in the panel.
         """
@@ -279,12 +335,17 @@ class PricePanel:
         present in only one side are kept, with NaN for the identifiers the
         other side supplied.
 
-        On an identifier collision ``other`` wins **outright**: its column
-        replaces the left one rather than filling the left one's gaps. Filling
-        gaps would splice two providers' price levels into a single series —
-        one vendor's 100 next to another's 10 — producing return spikes that
-        never happened, under a provenance record naming one source. A series
-        comes from one provider or the other.
+        Args:
+            other: The panel to merge in. On an identifier collision it wins
+                **outright**: its column replaces the left one rather than filling
+                the left one's gaps. Filling gaps would splice two providers'
+                price levels into a single series — one vendor's 100 next to
+                another's 10 — producing return spikes that never happened, under
+                a provenance record naming one source. A series comes from one
+                provider or the other.
+
+        Returns:
+            A new panel over the union of both universes and both date ranges.
         """
         names = [f for f in F.MARKET_FIELDS if f in self.frames or f in other.frames]
         index = self.index.union(other.index).sort_values()
@@ -308,6 +369,15 @@ class PricePanel:
         return PricePanel.from_frames(merged, {**self.meta, **other.meta})
 
     def with_meta(self, meta: Mapping[str, SeriesMeta]) -> PricePanel:
+        """A copy of this panel with additional or replaced series metadata.
+
+        Args:
+            meta: ``identifier -> SeriesMeta`` entries to merge in. Existing keys
+                are overwritten; the frames are untouched.
+
+        Returns:
+            A new :class:`PricePanel`. The original is unchanged.
+        """
         return replace(self, meta={**self.meta, **dict(meta)})
 
     # -- validation -------------------------------------------------------
