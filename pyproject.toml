@@ -27,6 +27,14 @@ dependencies = [
     "pandas>=2.0",
     "scipy>=1.10",
     "cvxpy>=1.4",
+    # Named rather than left to cvxpy because SOLVER_FALLBACK reaches for SCS
+    # by name, and 3.3.0's wheel ships an incomplete Intel oneMKL bundle:
+    # importing it and solving aborts the interpreter with "Cannot load
+    # libmkl_avx512.so.3 or libmkl_def.so.3" — a process death, not an
+    # exception, so no fallback can catch it and no traceback says why.
+    # Reproduced on GitHub's runners and in a local container; 3.2.11 is fine.
+    # Drop the exclusion once a fixed release is out.
+    "scs>=3.2,!=3.3.0",
     "pyyaml>=6.0",
     # In the core because it backs the *default* covariance estimator:
     # ``covariance_matrix`` shrinks with Ledoit-Wolf unless told otherwise.
