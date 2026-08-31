@@ -30,6 +30,11 @@ different mandate from the one it preceded.
 
 ### Added
 
+- CI runs the MCP suite. The `mcp` extra is in no other job's install — it
+  cannot go in the 3.9-inclusive matrix — so those tests would have
+  skipped everywhere and looked like coverage. The Streamlit job now
+  covers both optional-extra surfaces and is named for it, and asserts
+  the `optengine-mcp` console script lands on PATH.
 - An MCP server, `optengine-mcp`, behind the `mcp` extra (Python 3.10+).
   Five tools — `list_optimizers`, `describe_optimizer`, `check_mandate`,
   `optimize`, `backtest` — returning the same payloads as `--json`, from the

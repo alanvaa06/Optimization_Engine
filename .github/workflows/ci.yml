@@ -56,33 +56,42 @@ jobs:
         # so nothing here depends on a network round-trip.
         run: pytest -q --durations=10
 
-  ui:
-    name: App tests (Streamlit)
+  extras:
+    name: Optional extras (Streamlit, MCP)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          # One version, not the matrix: Streamlit is an optional extra whose
-          # own floor moves faster than this project's, and what these tests
-          # cover is the page script's wiring rather than anything
-          # version-dependent.
+          # One version, not the matrix, for two reasons that happen to
+          # agree. Streamlit is an optional extra whose own floor moves
+          # faster than this project's, and what its tests cover is the page
+          # script's wiring rather than anything version-dependent. The MCP
+          # SDK needs Python 3.10, so it cannot go in a matrix that includes
+          # 3.9 at all.
           python-version: "3.12"
           cache: pip
           cache-dependency-path: pyproject.toml
       - name: Install
         run: |
           python -m pip install --upgrade pip
-          pip install -e ".[all,dev,ui]"
-      # Drives the real page through Streamlit's AppTest harness. Without this
-      # job the app tests would skip silently everywhere, since the matrix
-      # above installs no UI extra.
+          pip install -e ".[all,dev,ui,mcp]"
+      # Both suites skip silently everywhere else — the matrix installs
+      # neither extra — so without this job they would look like coverage
+      # and be nothing of the kind.
       #
-      # Globbed rather than listed: an enumerated list silently stops covering
-      # the file somebody adds next, and a test nothing runs is worse than no
-      # test, because it looks like coverage.
+      # The app tests are globbed rather than listed, because an enumerated
+      # list silently stops covering the file somebody adds next. The MCP
+      # file is named because there is one of it.
       - name: Test
-        run: pytest -q tests/test_app_*.py tests/test_ui_state.py
+        run: pytest -q tests/test_app_*.py tests/test_ui_state.py tests/test_mcp_server.py
+      # The suites above import the SDK directly. This asserts the packaging
+      # is right too: the extra installs, and the console script the README
+      # tells people to run actually exists on PATH.
+      - name: The MCP console script is installed
+        run: |
+          python -c "import mcp.server.mcpserver"
+          command -v optengine-mcp
 
   core:
     name: Core install (no extras)
