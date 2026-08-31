@@ -86,23 +86,49 @@ class BacktestResult:
 
     @property
     def total_turnover(self) -> float:
+        """Sum of one-way turnover over the whole backtest, as a fraction of NAV."""
         return float(self.turnover.sum())
 
     @property
     def total_cost(self) -> float:
+        """Every cost charged over the whole backtest, as a fraction of NAV."""
         return float(self.costs.sum())
 
     @property
     def annualized_turnover(self) -> float:
+        """Turnover per year — the number a trading desk actually budgets.
+
+        Returns:
+            Total turnover divided by the run's length in years, or ``nan`` for a
+            run too short to annualize.
+        """
         periods_per_year = int(self.metadata.get("periods_per_year", 252))
         years = len(self.returns) / periods_per_year
         return float(self.turnover.sum() / years) if years > 0 else float("nan")
 
     def wealth(self, starting: float = 1.0) -> pd.Series:
+        """The net-of-cost equity curve.
+
+        Args:
+            starting: Value at the first period. Defaults to ``1.0``, which makes
+                the series read as a growth multiple.
+
+        Returns:
+            A series indexed like :attr:`returns`, compounding them from
+            ``starting``.
+        """
         return starting * (1 + self.returns).cumprod()
 
     def summary(self, periods_per_year: int | None = None, riskfree_rate: float = 0.0):
-        """Standard performance summary of the net-of-cost return stream."""
+        """Standard performance summary of the net-of-cost return stream.
+
+        Args:
+            periods_per_year: Annualization basis. Defaults to the result's own.
+            riskfree_rate: Per-period risk-free rate for the ratio metrics.
+
+        Returns:
+            A one-row-per-statistic summary frame.
+        """
         from optimization_engine.analytics.performance import summary_stats
 
         ppy = periods_per_year or int(self.metadata.get("periods_per_year", 252))
@@ -114,7 +140,14 @@ class BacktestResult:
         )
 
     def cost_drag(self, periods_per_year: int | None = None) -> float:
-        """Annualized return given up to transaction costs."""
+        """Annualized return given up to transaction costs.
+
+        Args:
+            periods_per_year: Annualization basis. Defaults to the result's own.
+
+        Returns:
+            The gross annualized return minus the net one, as a fraction.
+        """
         from optimization_engine.analytics.performance import annualize_returns
 
         ppy = periods_per_year or int(self.metadata.get("periods_per_year", 252))
@@ -225,6 +258,7 @@ class WalkForwardResult:
 
     @property
     def returns(self) -> pd.Series:
+        """The out-of-sample return stream, taken from the underlying backtest."""
         return self.backtest.returns
 
     @property
@@ -348,6 +382,19 @@ def compare_in_and_out_of_sample(
 
     The gap between the two columns is the honest measure of how much of the
     backtest was optimization and how much was hindsight.
+
+    Args:
+        in_sample: The in-sample return stream — weights chosen knowing these
+            returns.
+        out_of_sample: The walk-forward stream, from the same process run
+            without hindsight.
+        periods_per_year: Annualization basis for both.
+        riskfree_rate: Per-period risk-free rate used by the ratio metrics.
+
+    Returns:
+        A frame with one row per statistic and a column per sample —
+        ``"In-sample (fitted)"`` and ``"Out-of-sample (walk-forward)"`` —
+        plus a ``"Degradation"`` column holding the first minus the second.
     """
     from optimization_engine.analytics.performance import summary_stats
 

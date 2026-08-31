@@ -163,10 +163,23 @@ def load_risk_free_rate(
     start: str | pd.Timestamp | None = None,
     end: str | pd.Timestamp | None = None,
 ) -> pd.Series:
-    """Helper: fetch a single rate series and return it as decimals.
+    """Fetch a single rate series and return it as decimals.
 
-    FRED publishes rates in percent; we divide by 100 so they can be used
-    directly in the engine (e.g. ``0.045`` for a 4.5% yield).
+    FRED publishes rates in percent; this divides by 100 so they can be used
+    directly in the engine — ``0.045`` for a 4.5% yield.
+
+    Args:
+        series_id: The FRED series, e.g. ``"DGS10"`` for the 10-year Treasury
+            constant-maturity yield.
+        start: First date to fetch. ``None`` takes the series' own start.
+        end: Last date to fetch. ``None`` takes today.
+
+    Returns:
+        The rate as a decimal fraction, indexed by date.
+
+    Raises:
+        FREDError: On a malformed series id, an unreachable FRED, or a series
+            that came back empty.
     """
     df = load_fred_series([series_id], start=start, end=end)
     return df[series_id] / 100.0

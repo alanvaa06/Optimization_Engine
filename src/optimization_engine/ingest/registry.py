@@ -46,6 +46,7 @@ class ProviderEntry:
 
     @property
     def requires_key(self) -> bool:
+        """Whether this provider needs an API key to be usable."""
         return self.capabilities.requires_key
 
 
@@ -111,6 +112,12 @@ def register_provider(
 def resolve_name(name: str) -> str:
     """Map a name or alias onto a registered provider name.
 
+    Args:
+        name: A provider name or one of its aliases. Case-insensitive.
+
+    Returns:
+        The canonical registered name.
+
     Raises:
         ProviderNotFoundError: With the closest match, when there is one.
     """
@@ -155,7 +162,19 @@ def available_providers() -> tuple[str, ...]:
 
 
 def provider_entry(name: str) -> ProviderEntry:
-    """The registry entry for a name, without instantiating the provider."""
+    """The registry entry for a name, without instantiating the provider.
+
+    Args:
+        name: A provider name or alias.
+
+    Returns:
+        Its :class:`ProviderEntry`, carrying the description and capabilities.
+        Useful for ``optengine providers``, which reports what each source can
+        do without constructing any of them.
+
+    Raises:
+        ProviderNotFoundError: If the name resolves to nothing.
+    """
     return _REGISTRY[resolve_name(name)]
 
 

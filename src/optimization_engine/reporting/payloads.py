@@ -74,6 +74,14 @@ def portfolio_diagnostics_payload(diagnostics: Any) -> dict[str, Any] | None:
     ``effective_n`` against ``effective_n_risk`` is the pair worth reading
     together: the first counts positions by capital, the second by risk
     contribution, and the gap between them is what a weights table hides.
+
+    Args:
+        diagnostics: A
+            :class:`~optimization_engine.optimizers.diagnostics.PortfolioDiagnostics`,
+            or ``None``.
+
+    Returns:
+        A JSON-serializable dict, or ``None`` when nothing was supplied.
     """
     if diagnostics is None:
         return None
@@ -99,6 +107,14 @@ def covariance_diagnostics_payload(diagnostics: Any) -> dict[str, Any] | None:
     ``observations_per_asset`` below roughly 10 and a large
     ``condition_number`` together mean the optimiser is fitting noise, which
     no amount of solver precision fixes.
+
+    Args:
+        diagnostics: A
+            :class:`~optimization_engine.data.covariance.CovarianceDiagnostics`,
+            or ``None``.
+
+    Returns:
+        A JSON-serializable dict, or ``None`` when nothing was supplied.
     """
     if diagnostics is None:
         return None
@@ -119,6 +135,14 @@ def feasibility_payload(report: Any) -> dict[str, Any] | None:
 
     ``feasible`` is lifted to the top of the object so a consumer can branch
     on one boolean instead of interpreting an issue list.
+
+    Args:
+        report: A
+            :class:`~optimization_engine.optimizers.feasibility.FeasibilityReport`,
+            or ``None``.
+
+    Returns:
+        A JSON-serializable dict, or ``None`` when nothing was supplied.
     """
     if report is None:
         return None
@@ -291,6 +315,14 @@ def describe_payload(req: Any) -> dict[str, Any]:
     out whether the method it wants can express the mandate at all — a
     turnover budget handed to a method with ``supports_turnover`` false is
     silently ignored, not rejected.
+
+    Args:
+        req: A
+            :class:`~optimization_engine.optimizers.requirements.MethodRequirements`.
+
+    Returns:
+        A JSON-serializable dict of what the method requires, supports and
+        assumes.
     """
     inputs = {
         "expected_returns": bool(req.requires_mu),

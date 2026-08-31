@@ -31,6 +31,12 @@ LINKAGE_METHODS = ("single", "average", "complete", "ward")
 def correlation_from_covariance(cov: pd.DataFrame) -> pd.DataFrame:
     """Correlation matrix, with a clear error for degenerate assets.
 
+    Args:
+        cov: A covariance matrix, indexed and columned by asset.
+
+    Returns:
+        The correlation matrix over the same universe.
+
     Raises:
         ValueError: If any asset has zero variance, which leaves its
             correlation — and therefore its distance to everything else —
@@ -55,6 +61,12 @@ def correlation_distance(corr: pd.DataFrame) -> np.ndarray:
     This is a true metric (it satisfies the triangle inequality), which
     ordinary ``1 − ρ`` is not; hierarchical clustering on a non-metric
     dissimilarity can produce inversions in the dendrogram.
+
+    Args:
+        corr: A correlation matrix.
+
+    Returns:
+        A square distance matrix in ``[0, 1]``, zero on the diagonal.
     """
     values = np.asarray(corr.values, dtype=float)
     dist = np.sqrt(np.clip((1.0 - values) / 2.0, 0.0, None))
@@ -64,6 +76,13 @@ def correlation_distance(corr: pd.DataFrame) -> np.ndarray:
 
 def build_linkage(distance: np.ndarray, method: str = "ward") -> np.ndarray:
     """Hierarchical linkage from a square correlation-distance matrix.
+
+    Args:
+        distance: A square correlation-distance matrix.
+        method: ``"single"``, ``"average"``, ``"complete"`` or ``"ward"``.
+
+    Returns:
+        A SciPy linkage matrix.
 
     Raises:
         ValueError: On an unknown linkage rule.
@@ -134,6 +153,17 @@ def optimal_clusters(
     distance = correlation_distance(corr)
 
     def assess(k: int) -> tuple[float, float, np.ndarray]:
+        """Score one candidate cluster count.
+
+        Args:
+            k: Number of clusters to cut the tree into.
+
+        Returns:
+            ``(score, mean_silhouette, labels)``. The score is the ONC criterion —
+            the mean silhouette per unit of its own dispersion — so a clustering
+            that is good *and* consistent beats one that is good only on average.
+            A cut that collapses to a single cluster scores ``-inf``.
+        """
         labels = fcluster(link, t=k, criterion="maxclust")
         if len(np.unique(labels)) < 2:
             return float("-inf"), float("nan"), labels
@@ -180,6 +210,13 @@ def inverse_variance_weights(cov: pd.DataFrame, items: list[str]) -> pd.Series:
     This is the allocation HRP and HERC use where they do not recurse
     further — it ignores the off-diagonal terms, which is exactly the point
     within a cluster whose members are correlated by construction.
+
+    Args:
+        cov: The full covariance matrix.
+        items: The cluster's members.
+
+    Returns:
+        Weights over ``items``, summing to 1.
     """
     variance = np.diag(cov.loc[items, items].values)
     inverse = 1.0 / np.where(variance > 0, variance, np.inf)
@@ -190,6 +227,15 @@ def inverse_variance_weights(cov: pd.DataFrame, items: list[str]) -> pd.Series:
 
 
 def cluster_variance(cov: pd.DataFrame, items: list[str]) -> float:
-    """Variance of a cluster held at its own inverse-variance weights."""
+    """Variance of a cluster held at its own inverse-variance weights.
+
+    Args:
+        cov: The full covariance matrix.
+        items: The cluster's members.
+
+    Returns:
+        The cluster's variance, in the covariance's own units. This is what
+        the tree's bisection step compares two branches on.
+    """
     weights = inverse_variance_weights(cov, items).values
     return float(weights @ cov.loc[items, items].values @ weights)

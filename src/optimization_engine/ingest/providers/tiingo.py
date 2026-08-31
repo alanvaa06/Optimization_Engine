@@ -53,6 +53,12 @@ class Tiingo(PriceProvider):
 
     @property
     def capabilities(self) -> ProviderCapabilities:
+        """Adjusted OHLCV plus the raw close, key required, one symbol per call.
+
+        Returns:
+            Capabilities covering equities and ETFs, rate-limited to 50 requests a
+            minute. The token travels in a header, never in the URL.
+        """
         return ProviderCapabilities(
             fields=frozenset({F.OPEN, F.HIGH, F.LOW, F.CLOSE, F.CLOSE_RAW, F.VOLUME}),
             intervals=frozenset(_FREQUENCIES),
@@ -65,6 +71,20 @@ class Tiingo(PriceProvider):
         )
 
     def fetch_one(self, identifier: str, request: IngestRequest) -> PricePanel:
+        """Fetch one symbol's adjusted end-of-day history.
+
+        Args:
+            identifier: The Tiingo ticker. Lower-cased for the request.
+            request: The run's window and interval.
+
+        Returns:
+            A single-column panel carrying adjusted OHLCV and the raw close.
+
+        Raises:
+            IdentifierNotFoundError: Tiingo has no history for this ticker.
+            ProviderCredentialsError: The token is missing or rejected.
+            ProviderResponseError: The payload could not be parsed.
+        """
         symbol = identifier.strip()
         payload = self._get_json(
             f"{_BASE_URL}/{symbol.lower()}/prices",

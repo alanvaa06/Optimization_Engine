@@ -130,6 +130,14 @@ def pca_torsion(cov_matrix: pd.DataFrame) -> pd.DataFrame:
     Signs are fixed so each component's largest loading is positive, which
     stops the factors flipping arbitrarily between samples and makes the
     diversification distribution comparable across runs.
+
+    Args:
+        cov_matrix: Asset covariance, indexed and columned by asset.
+
+    Returns:
+        The rotation matrix, assets down the index and one column per factor.
+        Unlike the minimum-torsion rotation, its factors are uncorrelated but
+        need not resemble the assets they came from.
     """
     assets = list(cov_matrix.columns)
     sigma = np.asarray(cov_matrix.values, dtype=float)
@@ -172,6 +180,13 @@ class DiversificationReport:
     largest_bet: float
 
     def describe(self) -> str:
+        """How many independent bets the book really holds, and where they sit.
+
+        Returns:
+            A sentence giving the effective number of bets against the maximum
+            available, the factor model used, and the share of variance carried by
+            the single largest bet.
+        """
         top = self.distribution.index[0]
         return (
             f"{self.effective_number_of_bets:.2f} effective bets out of "
@@ -253,7 +268,18 @@ def effective_number_of_bets(
     cov_matrix: pd.DataFrame,
     model: str = "minimum_torsion",
 ) -> float:
-    """Just the number, for callers that do not need the distribution."""
+    """Just the number, for callers that do not need the distribution.
+
+    Args:
+        weights: Portfolio weights, as fractions of the book.
+        cov_matrix: Asset covariance over the same universe.
+        model: The rotation used to build uncorrelated factors —
+            ``"minimum_torsion"`` (the default, Meucci's) or ``"pca"``.
+
+    Returns:
+        The effective number of independent bets, between ``1`` and the number
+        of assets.
+    """
     return diversification_distribution(
         weights, cov_matrix, model=model
     ).effective_number_of_bets
@@ -269,6 +295,10 @@ def compare_diversification(
     also distinct risks; far apart means it holds many positions that share
     one driver, which is the situation every concentration measure computed
     asset-by-asset will miss.
+
+    Args:
+        weights: Portfolio weights, as fractions of the book.
+        cov_matrix: Asset covariance over the same universe.
 
     Returns:
         A frame indexed by model with the effective number of bets, its share

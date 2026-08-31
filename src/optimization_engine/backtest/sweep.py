@@ -70,6 +70,14 @@ class SweepSpec:
     max_cells: int = 200
 
     def __post_init__(self) -> None:
+        """Validate the grid before anything is run.
+
+        Raises:
+            SweepValidationError: If there are no parameters, if any parameter has
+                an empty value list, if ``max_cells`` is not positive, or if it
+                exceeds the hard cap — which is not raisable, because a grid that
+                large is a selection-bias problem rather than a compute one.
+        """
         if not self.params:
             raise SweepValidationError("A sweep needs at least one parameter.")
         for path, values in self.params.items():
@@ -84,6 +92,13 @@ class SweepSpec:
             )
 
     def cell_count(self) -> int:
+        """How many configurations the grid expands to.
+
+        Returns:
+            The product of the value-list lengths. Compare against
+            :attr:`max_cells` before running: this is also the trial count that
+            feeds the deflated Sharpe ratio.
+        """
         count = 1
         for values in self.params.values():
             count *= len(values)
@@ -138,6 +153,17 @@ def expand_grid(base_config: EngineConfig, sweep: SweepSpec) -> list[GridCell]:
     Deterministic order: paths sorted lexicographically, values in the order
     given, the last path varying fastest. A cell whose overrides fail
     validation is still a cell — it carries its ``build_error`` forward.
+
+    Args:
+        base_config: The configuration the grid perturbs.
+        sweep: The grid.
+
+    Returns:
+        One :class:`GridCell` per configuration, in the order above.
+
+    Raises:
+        SweepValidationError: If a path names nothing on the base
+            configuration, or the grid expands past ``max_cells``.
     """
     document = _config_document(base_config)
     for path in sweep.params:
@@ -211,6 +237,16 @@ class SweepResults:
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
+        """Assert the full-grid invariant.
+
+        Every cell is a row, including the ones that failed to build or solve.
+        Dropping failures would silently shrink the trial count that the
+        selection-bias diagnostics are computed from, which is the one number a
+        sweep exists to report honestly.
+
+        Raises:
+            ValueError: If the frame has a different number of rows than cells.
+        """
         if len(self.frame) != self.n_cells:
             raise ValueError(
                 f"Full-grid invariant violated: {len(self.frame)} rows for "
@@ -219,10 +255,15 @@ class SweepResults:
 
     @property
     def n_ok(self) -> int:
+        """How many cells evaluated successfully."""
         return int((self.frame["status"] == "ok").sum())
 
     @property
     def n_failed(self) -> int:
+        """How many cells failed to build or solve.
+
+        These still count as trials: they were configurations you tried.
+        """
         return self.n_cells - self.n_ok
 
     def return_matrix(self) -> pd.DataFrame:
@@ -255,6 +296,18 @@ class SweepResults:
         The grid *is* the trial count. Deflating against it is the difference
         between "this configuration had a Sharpe of 1.4" and "this
         configuration had a Sharpe of 1.4 after we tried forty-eight of them".
+
+        Args:
+            cell_id: Which cell to deflate. Must be one that evaluated.
+
+        Returns:
+            A :class:`~optimization_engine.analytics.selection.DeflatedSharpe`,
+            with the trial count and the grid's own Sharpe distribution taken from
+            these results rather than supplied by the caller.
+
+        Raises:
+            KeyError: If the cell has no return stream — it failed to build or to
+                solve. The message carries its status.
         """
         from optimization_engine.analytics.selection import deflated_sharpe_ratio
 
@@ -273,9 +326,19 @@ class SweepResults:
     def overfitting_report(self, n_partitions: int = 16):
         """CSCV across the grid: does the in-sample winner survive out of sample?
 
+        Args:
+            n_partitions: How many balanced blocks to split the sample into.
+                More partitions give more splits and a finer estimate, at the
+                cost of shorter blocks.
+
+        Returns:
+            An :class:`~optimization_engine.analytics.selection.OverfittingReport`
+            with the probability of backtest overfitting and the slope of
+            out-of-sample performance on in-sample.
+
         Raises:
-            ValueError: If fewer than two cells produced a return stream —
-                there is no selection to diagnose.
+            ValueError: If fewer than two cells produced a return stream — there
+                is no selection to diagnose.
         """
         from optimization_engine.analytics.selection import (
             probability_of_backtest_overfitting,
@@ -294,6 +357,12 @@ class SweepResults:
         return "unknown" if row.empty else str(row.iloc[0]["status"])
 
     def describe(self) -> str:
+        """One line: the grid's size, its parameters, and how many cells survived.
+
+        Returns:
+            Something like ``"12 cells over ['optimizer.name']: 11 evaluated,
+            1 failed."``
+        """
         return (
             f"{self.n_cells} cells over {sorted(self.sweep.params)}: "
             f"{self.n_ok} evaluated, {self.n_failed} failed."
@@ -321,6 +390,11 @@ def run_sweep(
 
     Returns:
         Every cell, evaluated or failed. See :class:`SweepResults`.
+
+    Raises:
+        SweepValidationError: If a grid path names nothing on the base
+            configuration, or the grid expands past ``max_cells``.
+        ValueError: If ``evaluate`` returns an empty stream for a cell.
     """
     cells = expand_grid(base_config, sweep)
     total = len(cells)
@@ -368,7 +442,19 @@ def run_sweep(
 def sweep_from_optimizers(
     names: list[str], extra: dict[str, list[ParamScalar]] | None = None
 ) -> SweepSpec:
-    """The common case: try these optimizers, optionally crossed with more."""
+    """The common case: try these optimizers, optionally crossed with more.
+
+    Args:
+        names: Optimizer names to sweep over, as ``optimizer.name`` values.
+        extra: Further dotted config paths to cross with them, e.g.
+            ``{"covariance_method": ["sample", "ledoit_wolf"]}``.
+
+    Returns:
+        A :class:`SweepSpec` over the product of everything given.
+
+    Raises:
+        SweepValidationError: If ``names`` is empty, or any value list is.
+    """
     params: dict[str, list[ParamScalar]] = {"optimizer.name": list(names)}
     params.update(extra or {})
     return SweepSpec(params=params)

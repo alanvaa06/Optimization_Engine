@@ -56,6 +56,13 @@ class Yahoo(PriceProvider):
 
     @property
     def capabilities(self) -> ProviderCapabilities:
+        """Total-return OHLCV, keyless, whole universe in one request.
+
+        Returns:
+            Capabilities covering equities, ETFs, indices, FX, crypto and
+            commodities. The API is unofficial, so treat availability as
+            best-effort rather than as a service level.
+        """
         return ProviderCapabilities(
             fields=frozenset(
                 {F.OPEN, F.HIGH, F.LOW, F.CLOSE, F.CLOSE_RAW, F.VOLUME}
@@ -78,6 +85,15 @@ class Yahoo(PriceProvider):
         )
 
     def fetch_one(self, identifier: str, request: IngestRequest) -> PricePanel:
+        """One identifier, by way of :meth:`fetch_batch`.
+
+        Args:
+            identifier: The Yahoo ticker.
+            request: The run's window, interval and requested fields.
+
+        Returns:
+            A single-column panel. See :meth:`fetch_batch` for what can be raised.
+        """
         return self.fetch_batch((identifier,), request)
 
     def fetch_batch(
@@ -87,6 +103,24 @@ class Yahoo(PriceProvider):
         # runs on upper-cased symbols and the columns are renamed to the
         # requested identifiers at the end. Anything else silently drops a
         # lower-case ticker as an unknown column.
+        """Fetch the whole universe in a single download.
+
+        Symbols are upper-cased for the request and the columns renamed back to
+        the requested identifiers afterwards, because yfinance echoes tickers
+        upper-cased and anything else silently drops a lower-case ticker as an
+        unknown column.
+
+        Args:
+            identifiers: Yahoo tickers.
+            request: The run's window, interval and requested fields.
+
+        Returns:
+            A panel over whichever identifiers came back with data.
+
+        Raises:
+            IdentifierNotFoundError: If no identifier returned any history.
+            ProviderResponseError: If the response could not be understood.
+        """
         requested_by_symbol = {i.strip().upper(): i for i in identifiers}
         symbols = list(requested_by_symbol)
         adjusted_fields = [f for f in request.fields if f in _ADJUSTED_COLUMNS]
@@ -182,6 +216,12 @@ def classify(symbol: str) -> F.InstrumentKind:
     price endpoint. The suffix grammar is unambiguous for exactly the kinds
     that change behaviour downstream — indices and rates — so the lookup is
     not worth its cost.
+
+    Args:
+        symbol: A Yahoo ticker.
+
+    Returns:
+        The inferred kind, or ``UNKNOWN`` when the symbol says nothing.
     """
     cleaned = symbol.strip().upper()
     if cleaned.startswith("^"):

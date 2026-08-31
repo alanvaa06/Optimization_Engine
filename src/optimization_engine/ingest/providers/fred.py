@@ -62,6 +62,13 @@ class Fred(PriceProvider):
 
     @property
     def capabilities(self) -> ProviderCapabilities:
+        """Close only, keyless, batched up to 25 series.
+
+        Returns:
+            Capabilities advertising ``CLOSE`` and nothing else. FRED publishes a
+            single level per date, and claiming OHLC or volume here would let a
+            request pass preflight and come back short a column.
+        """
         return ProviderCapabilities(
             # Deliberately close-only: FRED publishes a single level per date.
             # Advertising OHLC or volume here would let a request pass
@@ -77,6 +84,15 @@ class Fred(PriceProvider):
         )
 
     def fetch_one(self, identifier: str, request: IngestRequest) -> PricePanel:
+        """One series, by way of :meth:`fetch_batch`.
+
+        Args:
+            identifier: The FRED series id.
+            request: The run's window, interval and requested fields.
+
+        Returns:
+            A single-column panel. See :meth:`fetch_batch` for what can be raised.
+        """
         return self.fetch_batch((identifier,), request)
 
     def fetch_batch(
@@ -84,6 +100,26 @@ class Fred(PriceProvider):
     ) -> PricePanel:
         # FRED series ids are upper-case; the column keeps whatever the caller
         # asked for, so the panel matches the requested universe exactly.
+        """Fetch several FRED series as one panel.
+
+        Series ids are upper-cased for the request and the columns are renamed
+        back to whatever the caller asked for, so the panel matches the requested
+        universe exactly. Interest-rate series are rejected rather than returned:
+        a rate is not a price, and compounding one as if it were produces a
+        plausible-looking curve that means nothing.
+
+        Args:
+            identifiers: FRED series ids.
+            request: The run's window and interval.
+
+        Returns:
+            A close-only panel over the requested series.
+
+        Raises:
+            ProviderConfigurationError: If any identifier is an interest-rate
+                series.
+            IdentifierNotFoundError: If FRED has no observations for a series.
+        """
         requested_by_id = {s.strip().upper(): s for s in identifiers}
         series_ids = list(requested_by_id)
         rejected = [s for s in series_ids if is_rate_series(s)]
@@ -139,9 +175,14 @@ class Fred(PriceProvider):
 def is_rate_series(series_id: str) -> bool:
     """Whether a FRED series id names a yield or policy rate.
 
-    Prefix matching alone would sweep in legitimate index series that happen
-    to start with the same letters, so the check requires either an exact hit
-    on a known rate series or a rate prefix followed by a maturity code.
+    Args:
+        series_id: A FRED series id, case-insensitive.
+
+    Returns:
+        ``True`` for a rate. Prefix matching alone would sweep in legitimate
+        index series that happen to start with the same letters, so the check
+        requires either an exact hit on a known rate series or a rate prefix
+        followed by a maturity code.
     """
     cleaned = series_id.strip().upper()
     if cleaned in _RATE_SERIES:
@@ -156,6 +197,16 @@ def is_rate_series(series_id: str) -> bool:
 
 
 def classify(series_id: str) -> F.InstrumentKind:
+    """What kind of instrument a FRED series id names.
+
+    Args:
+        series_id: A FRED series id, case-insensitive.
+
+    Returns:
+        ``INDEX`` for the known equity and volatility indices, ``FX`` for the
+        ``DEX`` exchange-rate family, ``RATE`` for anything matching the
+        interest-rate prefixes, and ``UNKNOWN`` otherwise.
+    """
     cleaned = series_id.strip().upper()
     if cleaned in _INDEX_SERIES:
         return F.InstrumentKind.INDEX

@@ -46,6 +46,17 @@ class RiskParityOptimizer(BaseOptimizer):
     bounds_mode = "constrained"
 
     def __init__(self, *args, risk_budget: dict[str, float] | None = None, **kwargs) -> None:
+        """Set the risk budget the solve will target.
+
+        Args:
+            *args: Passed to :class:`~optimization_engine.optimizers.base.BaseOptimizer`.
+            risk_budget: ``asset -> target share of total risk``. Shares are
+                normalized, so they need not sum to one. ``None`` means equal risk
+                contribution. Every asset needs a strictly positive share: the
+                log-barrier formulation has no answer for a zero one, so drop such
+                an asset from the universe instead.
+            **kwargs: Passed to the base class.
+        """
         super().__init__(*args, **kwargs)
         self.risk_budget = risk_budget
 
@@ -154,7 +165,16 @@ class RiskParityOptimizer(BaseOptimizer):
             )
 
     def risk_contributions(self, weights: np.ndarray | pd.Series) -> pd.Series:
-        """Per-asset share of total portfolio variance for a weight vector."""
+        """Per-asset share of total portfolio variance for a weight vector.
+
+        Args:
+            weights: The weights to decompose, as fractions of the book.
+
+        Returns:
+            One share per asset, summing to 1. Compare against the target risk
+            budget to see how closely parity was actually reached — bounds and
+            bucket budgets can make an exact one unreachable.
+        """
         sigma = self._sigma_matrix()
         w = np.asarray(weights).flatten()
         total = float(w @ sigma @ w)

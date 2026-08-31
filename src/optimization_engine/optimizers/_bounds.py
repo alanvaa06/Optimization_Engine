@@ -34,8 +34,20 @@ def project_to_bounds_iterated(
     Clips into the box, then spreads the leftover budget across whatever
     slack remains, repeating until both invariants hold.
 
+    Args:
+        w: The vector to project.
+        lb: Per-asset lower bounds, aligned to ``w``.
+        ub: Per-asset upper bounds, aligned to ``w``.
+        max_iter: How many clip-and-redistribute passes to attempt.
+        atol: How close to the unit budget counts as converged.
+
+    Returns:
+        A vector inside the box summing to 1.
+
     Raises:
-        InfeasibleBoundsError: When ``sum(lb) > 1`` or ``sum(ub) < 1``.
+        ValueError: If ``lb`` exceeds ``ub`` element-wise.
+        InfeasibleBoundsError: When ``sum(lb) > 1`` or ``sum(ub) < 1``, or the
+            redistribution runs out of slack on one side.
     """
     w = np.asarray(w, dtype=float).copy()
     lb = np.asarray(lb, dtype=float)

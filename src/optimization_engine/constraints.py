@@ -98,6 +98,18 @@ class ConstraintLayer:
     parent: str | None = None
 
     def __post_init__(self) -> None:
+        """Normalize the layer and reject one no solve could use.
+
+        Assignments are stringified and pruned of the empty placeholders a
+        spreadsheet or a UI leaves behind — a blank cell, or an em dash — so an
+        asset nobody assigned is genuinely uncovered rather than assigned to a
+        bucket named ``"—"``.
+
+        Raises:
+            LayerConfigurationError: On an unknown ``basis``, or a layer that
+                expresses its limits as a share of its parent while naming no
+                parent layer.
+        """
         self.name = str(self.name).strip()
         self.basis = str(self.basis).lower().strip()
         if self.basis not in BASES:
@@ -142,7 +154,14 @@ class ConstraintLayer:
         return out
 
     def members(self, assets: Sequence[str]) -> dict[str, list[str]]:
-        """``bucket -> member assets``, restricted to ``assets``."""
+        """``bucket -> member assets``, restricted to ``assets``.
+
+        Args:
+            assets: The universe to restrict to.
+
+        Returns:
+            One entry per bucket that has at least one member in ``assets``.
+        """
         out: dict[str, list[str]] = {}
         for asset in assets:
             bucket = self.assignments.get(str(asset))
@@ -151,7 +170,15 @@ class ConstraintLayer:
         return out
 
     def member_indices(self, assets: Sequence[str]) -> dict[str, list[int]]:
-        """``bucket -> positions in ``assets``, for the constrained buckets only."""
+        """``bucket -> positions in ``assets``, for the constrained buckets only.
+
+        Args:
+            assets: The universe, in the order the solve indexes it.
+
+        Returns:
+            Positions into ``assets``, one entry per bucket that carries a limit.
+            Buckets without limits are left out: they generate no constraint.
+        """
         out: dict[str, list[int]] = {}
         for i, asset in enumerate(assets):
             bucket = self.assignments.get(str(asset))
@@ -160,7 +187,16 @@ class ConstraintLayer:
         return out
 
     def covers_all(self, assets: Sequence[str]) -> bool:
-        """Whether every asset is assigned to a *constrained* bucket."""
+        """Whether every asset is assigned to a *constrained* bucket.
+
+        Args:
+            assets: The universe to check.
+
+        Returns:
+            ``True`` when no asset escapes this layer's limits. A layer that does
+            not cover everything is still valid — the uncovered assets are simply
+            unconstrained by it.
+        """
         return all(
             self.assignments.get(str(a)) in self.limits for a in assets
         )
@@ -168,6 +204,12 @@ class ConstraintLayer:
     # -- serialization ------------------------------------------------------
 
     def to_dict(self) -> dict[str, Any]:
+        """The layer as a plain, YAML-serializable dict.
+
+        Returns:
+            Its name, assignments, limits as ``[lo, hi]`` lists, basis and parent.
+            Round-trips through :meth:`from_dict`.
+        """
         return {
             "name": self.name,
             "assignments": dict(self.assignments),
@@ -178,6 +220,20 @@ class ConstraintLayer:
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> ConstraintLayer:
+        """Build a layer from a mapping, accepting the older spellings.
+
+        ``limits`` may also arrive as ``bounds``, and ``assignments`` as
+        ``groups``, so a config written against an earlier version still loads.
+
+        Args:
+            data: The mapping to read.
+
+        Returns:
+            A validated :class:`ConstraintLayer`.
+
+        Raises:
+            LayerConfigurationError: If the result is malformed.
+        """
         limits_raw = data.get("limits") or data.get("bounds") or {}
         limits = {
             str(b): (float(v[0]), float(v[1])) for b, v in dict(limits_raw).items()
@@ -197,7 +253,19 @@ class ConstraintLayer:
 
 
 def coerce_layers(raw: Iterable[Any] | None) -> tuple[ConstraintLayer, ...]:
-    """Accept layers as objects or as the mappings a YAML config round-trips."""
+    """Accept layers as objects or as the mappings a YAML config round-trips.
+
+    Args:
+        raw: Layers as :class:`ConstraintLayer` objects, as mappings, or a
+            mix. ``None`` yields an empty tuple.
+
+    Returns:
+        The layers, in order.
+
+    Raises:
+        LayerConfigurationError: If an entry is neither a mapping nor a
+            :class:`ConstraintLayer`, or a mapping entry is malformed.
+    """
     if not raw:
         return ()
     out: list[ConstraintLayer] = []
@@ -224,6 +292,15 @@ def legacy_group_layer(
     Keeps every existing config, script and saved scenario working: the single
     grouping they already express becomes the first layer, and anything the
     user adds stacks on top of it.
+
+    Args:
+        groups: ``asset -> group`` mapping, or ``None``.
+        group_bounds: ``group -> (min, max)`` or ``group -> max``, as
+            fractions of the book, or ``None``.
+        name: What to call the resulting layer.
+
+    Returns:
+        The layer, or ``None`` when there is nothing to wrap.
     """
     if not groups or not group_bounds:
         return None
@@ -238,7 +315,15 @@ def legacy_group_layer(
 def resolve_parent(
     layer: ConstraintLayer, layers: Sequence[ConstraintLayer]
 ) -> ConstraintLayer | None:
-    """The layer ``layer.parent`` names, or ``None`` when it names nothing real."""
+    """The layer ``layer.parent`` names, or ``None`` when it names nothing real.
+
+    Args:
+        layer: The layer whose parent to find.
+        layers: The whole policy to look in.
+
+    Returns:
+        The named parent layer, or ``None`` if no layer carries that name.
+    """
     if not layer.parent:
         return None
     for candidate in layers:
@@ -254,11 +339,18 @@ def parent_bucket_map(
 ) -> tuple[dict[str, str], dict[str, list[str]]]:
     """Derive ``child bucket -> parent bucket`` from the two layers' assignments.
 
-    Returns the mapping plus the ambiguous cases: any child bucket whose
-    members straddle more than one parent bucket, listed with the parents they
-    straddle. Ambiguity is a real modelling error — "40% of the parent" has no
-    meaning when the members sit in two different parents — so it is returned
-    rather than silently resolved by majority.
+    Args:
+        layer: The child layer, whose buckets are being mapped.
+        parent: The layer its limits are expressed as a share of.
+        assets: Restrict the mapping to this universe. ``None`` uses every
+            asset the two layers assign.
+
+    Returns:
+        A ``(mapping, ambiguous)`` pair. ``ambiguous`` lists any child bucket
+        whose members straddle more than one parent bucket, with the parents
+        they straddle. Ambiguity is a real modelling error — "40% of the
+        parent" has no meaning when the members sit in two different parents —
+        so it is returned rather than silently resolved by majority.
     """
     universe = list(assets) if assets is not None else sorted(layer.assignments)
     seen: dict[str, list[str]] = {}
@@ -286,6 +378,18 @@ def effective_layers(constraints_or_config: Any) -> tuple[ConstraintLayer, ...]:
     qualify — so the solver, the projection, the diagnostics and the
     feasibility report all read the policy from one place and cannot disagree
     about what it says.
+
+    Args:
+        constraints_or_config: Any object with ``groups`` and ``group_bounds``,
+            and optionally ``constraint_layers``.
+
+    Returns:
+        Every active layer, with the legacy ``groups``/``group_bounds`` pair
+        rendered as a layer and placed first.
+
+    Raises:
+        LayerConfigurationError: If a layer names a parent that does not
+            exist, or has buckets spanning more than one parent bucket.
     """
     obj = constraints_or_config
     layers: list[ConstraintLayer] = []
@@ -300,7 +404,15 @@ def effective_layers(constraints_or_config: Any) -> tuple[ConstraintLayer, ...]:
 
 
 def has_layer_constraints(constraints_or_config: Any) -> bool:
-    """Whether anything at all is constrained above the per-asset level."""
+    """Whether anything at all is constrained above the per-asset level.
+
+    Args:
+        constraints_or_config: Any object with ``groups`` and ``group_bounds``,
+            and optionally ``constraint_layers``.
+
+    Returns:
+        ``True`` when at least one layer carries an active limit.
+    """
     return any(lyr.is_active for lyr in effective_layers(constraints_or_config))
 
 
@@ -454,11 +566,17 @@ def layer_exposures(
     a relative layer — "40% of a 55% equity sleeve" is a 22% cap on the book,
     and that is the number an allocator compares against the weights.
 
-    Columns:
-        ``layer``, ``bucket``, ``basis``, ``parent``, ``weight``,
-        ``min``, ``max`` (as specified), ``effective_min``, ``effective_max``
-        (as portfolio shares), ``headroom`` (distance to the cap, negative
-        when breached) and ``binding``.
+    Args:
+        weights: Portfolio weights, as fractions of the book.
+        layers: The policy to measure against, normally from
+            :func:`effective_layers`.
+
+    Returns:
+        A frame with one row per bucket and the columns ``layer``, ``bucket``,
+        ``basis``, ``parent``, ``weight``, ``min`` and ``max`` (as specified),
+        ``effective_min`` and ``effective_max`` (as portfolio shares),
+        ``headroom`` (distance to the cap, negative when breached) and
+        ``binding``.
     """
     rows: list[dict[str, Any]] = []
     layer_list = list(layers)
@@ -527,6 +645,17 @@ def layer_breaches(
     Kept free of the diagnostics module's types so this module stays importable
     on its own; :mod:`optimization_engine.optimizers.diagnostics` wraps the
     tuples into :class:`ConstraintViolation` objects.
+
+    Args:
+        weights: The solved weights, as fractions of the book.
+        layers: The policy to check, normally from :func:`effective_layers`.
+        tolerance: How far past a limit an allocation may sit before it counts
+            as a breach, in weight units. Absorbs solver noise.
+
+    Returns:
+        One tuple per breach: the bucket's label, which side was breached, the
+        limit as a portfolio share, and the realized exposure. Empty when the
+        allocation is compliant.
     """
     out: list[tuple[str, str, float, float]] = []
     exposures = layer_exposures(weights, layers)
@@ -558,6 +687,23 @@ def layer_from_mapping(
     A bare number is read as a cap with a zero floor, which is how allocation
     policies are usually written ("no more than 60% equity") and saves the
     caller from typing the floor they did not mean to set.
+
+    Args:
+        name: The layer's label, unique within a policy.
+        assignments: ``asset -> bucket``. Assets left out are not covered by
+            this layer, which is deliberate rather than an error.
+        limits: ``bucket -> (min, max)`` or ``bucket -> max``, as fractions.
+        basis: Whether the limits are shares of the whole book or of the
+            parent bucket.
+        parent: The layer the limits are relative to. Required when ``basis``
+            is the parent one.
+
+    Returns:
+        The :class:`ConstraintLayer`.
+
+    Raises:
+        LayerConfigurationError: On an unknown ``basis``, or a parent-relative
+            layer naming no parent.
     """
     parsed: dict[str, tuple[float, float]] = {}
     for bucket, value in dict(limits).items():
@@ -591,6 +737,22 @@ def currency_layer(
     The split is by the currency each series is *quoted in*, which is the
     exposure an allocator with a local liability actually cares about — it is
     unaffected by the base currency the engine happens to report in.
+
+    Args:
+        name: The layer's label.
+        currencies: ``asset -> ISO currency code``.
+        base_currency: The ISO code that counts as local.
+        local_max: Cap on the local bucket, as a fraction of the book.
+            ``None`` leaves it uncapped.
+        foreign_max: Cap on everything else, as a fraction of the book.
+        local_min: Floor on the local bucket, as a fraction of the book.
+        foreign_min: Floor on the foreign bucket.
+        local_label: What to call the local bucket. Defaults to the base
+            currency's own code.
+        foreign_label: What to call the foreign bucket.
+
+    Returns:
+        A two-bucket :class:`ConstraintLayer` over the whole book.
     """
     base = str(base_currency).upper()
     local_label = local_label or f"Local FX ({base})"

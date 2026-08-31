@@ -92,6 +92,26 @@ class _SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
     """
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):
+        """Follow a redirect, refusing the two that would leak the key.
+
+        Args:
+            req: The original request.
+            fp: The response body.
+            code: The redirect status code.
+            msg: The status message.
+            headers: The response headers.
+            newurl: Where the server wants to send us.
+
+        Returns:
+            The redirected request, with every credential header stripped when the
+            new host differs from the original. Header names are matched
+            case-insensitively, because urllib stores them capitalized and
+            removing them by the caller's own spelling silently misses.
+
+        Raises:
+            urllib.error.HTTPError: If the redirect targets a non-https scheme,
+                which would put the key on the wire in clear.
+        """
         parsed = urllib.parse.urlsplit(newurl)
         if parsed.scheme != "https":
             raise urllib.error.HTTPError(
@@ -156,10 +176,20 @@ class ProviderCapabilities:
 
     @property
     def serves_volume(self) -> bool:
+        """Whether this provider publishes traded volume at all."""
         return F.VOLUME in self.fields
 
     def missing_fields(self, requested: tuple[str, ...]) -> tuple[str, ...]:
-        """Requested fields this provider cannot serve, in request order."""
+        """Requested fields this provider cannot serve, in request order.
+
+        Args:
+            requested: The fields a request asks for.
+
+        Returns:
+            The subset this provider does not publish. Empty means the request is
+            servable — which is what :meth:`PriceProvider.preflight` checks before
+            any network call.
+        """
         return tuple(f for f in requested if f not in self.fields)
 
 
@@ -184,6 +214,14 @@ class PriceProvider(abc.ABC):
     _opener_lock: typing.ClassVar[threading.Lock] = threading.Lock()
 
     def __init__(self, *, api_key: str | None = None, timeout: float | None = None) -> None:
+        """Store the credentials and timeout this instance will fetch with.
+
+        Args:
+            api_key: The provider's key, or ``None`` for a keyless source. It is
+                held privately and travels in a header, never in a URL, and is
+                never logged or raised in an exception.
+            timeout: Per-request timeout in seconds. Defaults to the class's own.
+        """
         self._api_key = api_key
         self._timeout = float(timeout) if timeout is not None else self._TIMEOUT_SECONDS
 
@@ -221,6 +259,20 @@ class PriceProvider(abc.ABC):
         for every provider and optimal for none — providers whose API takes a
         symbol list override this and set
         :attr:`ProviderCapabilities.supports_batch`.
+
+        Args:
+            identifiers: Provider-side symbols, already translated by the catalog.
+            request: The run's window, interval and requested fields.
+
+        Returns:
+            A panel over every identifier that returned data.
+
+        Raises:
+            ProviderConfigurationError: If ``identifiers`` is empty.
+            IdentifierNotFoundError: Propagated from :meth:`fetch_one`.
+            ProviderCredentialsError: Propagated from :meth:`fetch_one`.
+            ProviderTransientError: Propagated from :meth:`fetch_one`.
+            ProviderResponseError: Propagated from :meth:`fetch_one`.
         """
         panel: PricePanel | None = None
         for identifier in identifiers:
@@ -243,6 +295,9 @@ class PriceProvider(abc.ABC):
 
     def preflight(self, request: IngestRequest) -> None:
         """Reject a request this provider cannot serve, before any network call.
+
+        Args:
+            request: The request to check against :attr:`capabilities`.
 
         Raises:
             ProviderConfigurationError: The interval or a requested field is

@@ -85,6 +85,13 @@ class CacheEntry:
 
     @property
     def age_label(self) -> str:
+        """How old this entry is, in the largest unit that stays readable.
+
+        Returns:
+            ``"just now"`` under a minute, then minutes, hours, and days. Meant for
+            a provider panel or a CLI line, not for arithmetic — use
+            :attr:`age_seconds` for that.
+        """
         minutes = self.age_seconds / 60.0
         if minutes < 1:
             return "just now"
@@ -107,19 +114,39 @@ class PanelCache:
     """
 
     def __init__(self, directory: str | Path, ttl_seconds: int = 24 * 60 * 60) -> None:
+        """Point the cache at a directory.
+
+        Args:
+            directory: Where entries are written. Created on first write, not here.
+            ttl_seconds: How long an entry stays fresh. Anything older is a miss.
+                Defaults to 24 hours.
+        """
         self.directory = Path(directory)
         self.ttl_seconds = int(ttl_seconds)
 
     def path_for(self, key: str) -> Path:
+        """Where the entry for a fingerprint lives.
+
+        Args:
+            key: A request fingerprint.
+
+        Returns:
+            The Zip file's path, whether or not it exists.
+        """
         return self.directory / f"{key}{_SUFFIX}"
 
     def load(self, key: str) -> tuple[PricePanel, CacheEntry] | None:
         """Return a cached panel, or ``None`` on any miss.
 
-        A miss includes: no entry, an entry older than the TTL, one written by
-        a different format version, and any read failure at all. Nothing here
-        raises — a broken cache must degrade to a fetch, never to a stack
-        trace, because the fetch is always available and always correct.
+        Args:
+            key: The request fingerprint.
+
+        Returns:
+            A ``(panel, entry)`` pair, or ``None``. A miss includes: no entry, an
+            entry older than the TTL, one written by a different format version,
+            and any read failure at all. Nothing here raises — a broken cache must
+            degrade to a fetch, never to a stack trace, because the fetch is
+            always available and always correct.
         """
         path = self.path_for(key)
         if not path.is_file():
@@ -184,8 +211,14 @@ class PanelCache:
         lets two runs fetch the same request concurrently without either of
         them failing and without a reader ever seeing a partial entry.
 
-        Failures are logged and swallowed: a read-only directory or a full
-        disk should slow the next run down, not fail this one.
+        Args:
+            key: The request fingerprint to file it under.
+            panel: The panel to write.
+
+        Returns:
+            ``True`` on success. Failures are logged and swallowed: a read-only
+            directory or a full disk should slow the next run down, not fail this
+            one.
         """
         target = self.path_for(key)
         handle, staging = -1, ""

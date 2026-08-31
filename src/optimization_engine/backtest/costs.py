@@ -101,6 +101,7 @@ class CostQuote:
 
     @property
     def total(self) -> float:
+        """Commission plus slippage, as a fraction of NAV."""
         return float(self.commission) + float(self.slippage)
 
 
@@ -128,7 +129,19 @@ class CostModel(Protocol):
     def charge(
         self, *, asset: str, traded_weight: float, context: MarketContext
     ) -> CostQuote:
-        """Cost of trading ``traded_weight`` of NAV in ``asset``."""
+        """Cost of trading ``traded_weight`` of NAV in ``asset``.
+
+        Args:
+            asset: The asset being traded.
+            traded_weight: Change in its weight, as a fraction of NAV. Signed;
+                implementations charge on the magnitude.
+            context: Trailing volatility and participation for this asset on this
+                decision date. Either may be ``None``.
+
+        Returns:
+            A :class:`CostQuote`, in fractions of NAV, with ``degraded_reason``
+            set whenever a component could not be computed.
+        """
         ...
 
 
@@ -137,14 +150,26 @@ class ZeroCost:
     """Free trading. Honest only as a deliberate upper bound on performance."""
 
     def volatility_lookback(self) -> int:
+        """Always ``0``: free trading needs no context."""
         return 0
 
     def participation_lookback(self) -> int:
+        """Always ``0``: free trading needs no volume panel."""
         return 0
 
     def charge(
         self, *, asset: str, traded_weight: float, context: MarketContext
     ) -> CostQuote:
+        """An empty quote. Nothing is ever charged.
+
+        Args:
+            asset: Ignored.
+            traded_weight: Ignored.
+            context: Ignored.
+
+        Returns:
+            A :class:`CostQuote` of zero commission and zero slippage.
+        """
         return CostQuote()
 
 
@@ -156,14 +181,29 @@ class LinearCost:
     slippage_bps: float = 0.0
 
     def volatility_lookback(self) -> int:
+        """Always ``0``: a linear charge needs no volatility estimate."""
         return 0
 
     def participation_lookback(self) -> int:
+        """Always ``0``: a linear charge does not price from volume."""
         return 0
 
     def charge(
         self, *, asset: str, traded_weight: float, context: MarketContext
     ) -> CostQuote:
+        """Commission and spread, both linear in the traded notional.
+
+        Args:
+            asset: Ignored. Rates here are universe-wide.
+            traded_weight: Change in the asset's weight, as a fraction of NAV.
+                Signed; only its magnitude is charged.
+            context: Ignored.
+
+        Returns:
+            A :class:`CostQuote` whose commission is
+            ``|traded_weight| · commission_bps / 10⁴`` and whose slippage is the
+            same expression in ``slippage_bps`` — both fractions of NAV.
+        """
         traded = abs(float(traded_weight))
         return CostQuote(
             commission=traded * self.commission_bps / _BPS,
@@ -194,14 +234,48 @@ class SquareRootImpactCost:
     adv_lookback: int = 21
 
     def volatility_lookback(self) -> int:
+        """Trailing periods of returns needed to estimate ``sigma``.
+
+        Returns:
+            :attr:`lookback`, in periods.
+        """
         return int(self.lookback)
 
     def participation_lookback(self) -> int:
+        """Trailing periods of traded volume needed, or ``0``.
+
+        Returns:
+            :attr:`adv_lookback` when participation is read from volume, and ``0``
+            under the fixed-rate source — which is what lets the runner skip the
+            volume machinery for a universe that has none.
+        """
         return int(self.adv_lookback) if self.participation_source == "adv" else 0
 
     def charge(
         self, *, asset: str, traded_weight: float, context: MarketContext
     ) -> CostQuote:
+        """Linear costs plus square-root impact, in fractions of NAV.
+
+        Impact is ``eta · sigma · sqrt(traded / participation)`` applied to the
+        traded notional, so it grows with the square root of participation:
+        doubling a trade costs more than twice as much.
+
+        Degradation is reported, never silent. A missing volatility estimate
+        drops impact to zero and says so; an ADV-priced model with no volume for
+        this asset falls back to the fixed rate and says that too. Either way the
+        reason travels on the quote and into the run's degradation notes.
+
+        Args:
+            asset: Name, used only to make the degradation message specific.
+            traded_weight: Change in the asset's weight, as a fraction of NAV.
+                Signed; only its magnitude is charged.
+            context: Trailing volatility and participation for this asset on this
+                decision date. Either may be ``None``.
+
+        Returns:
+            A :class:`CostQuote` with impact folded into ``slippage``, and
+            ``degraded_reason`` set whenever a component was dropped or fell back.
+        """
         traded = abs(float(traded_weight))
         commission = traded * self.commission_bps / _BPS
         slippage = traded * self.slippage_bps / _BPS
@@ -268,7 +342,18 @@ class SquareRootImpactCost:
 
 
 def build_cost_model(costs: CostSpec) -> CostModel:
-    """Resolve a :class:`CostSpec` to the cheapest model that can express it."""
+    """Resolve a :class:`CostSpec` to the cheapest model that can express it.
+
+    Args:
+        costs: The spec to realize.
+
+    Returns:
+        :class:`ZeroCost` for a free spec, :class:`LinearCost` when there is no
+        impact term, and :class:`SquareRootImpactCost` otherwise. Picking the
+        simplest is not only faster — the cheaper models declare a zero
+        lookback, which is what lets the runner skip the trailing-window
+        machinery entirely.
+    """
     if costs.is_free:
         return ZeroCost()
     if not costs.has_impact:
@@ -294,9 +379,17 @@ def trailing_volatilities(
     """Per-asset trailing volatility as of each date, using only the past.
 
     The window ending at ``t`` excludes ``t`` itself: a trade decided on
-    ``t`` cannot be priced off that day's own return. Cells with fewer than
-    ``min_observations`` are ``NaN``, which the models read as "unknown" and
-    degrade on rather than guess.
+    ``t`` cannot be priced off that day's own return.
+
+    Args:
+        returns: Periodic returns, one column per asset.
+        lookback: Window length in periods.
+        min_observations: Below this many observations the cell is left NaN.
+
+    Returns:
+        A frame shaped like ``returns``, holding per-period volatility. Cells
+        with too little history are ``NaN``, which the cost models read as
+        "unknown" and degrade on rather than guess.
     """
     if lookback <= 0:
         return pd.DataFrame(index=returns.index, columns=returns.columns, dtype=float)

@@ -102,6 +102,25 @@ class NCOOptimizer(BaseOptimizer):
         detone_for_clustering: bool = True,
         **kwargs,
     ) -> None:
+        """Configure the clustering and the objective solved within each cluster.
+
+        Args:
+            *args: Passed to :class:`~optimization_engine.optimizers.base.BaseOptimizer`.
+            objective: What the intra- and inter-cluster problems optimize —
+                ``"min_variance"`` by default.
+            linkage_method: Linkage for the correlation tree.
+            n_clusters: Fix the number of clusters. ``None`` selects it from the
+                tree.
+            max_clusters: Upper bound when the count is selected rather than fixed.
+            detone_for_clustering: Strip the market eigenvalue before measuring
+                distances, so the clusters reflect residual correlation rather
+                than everything loading on one factor. It affects the *distance
+                metric only* — the covariance both solves see is untouched.
+            **kwargs: Passed to the base class.
+
+        Raises:
+            ValueError: If ``objective`` is not a registered NCO objective.
+        """
         super().__init__(*args, **kwargs)
         if objective not in NCO_OBJECTIVES:
             raise ValueError(

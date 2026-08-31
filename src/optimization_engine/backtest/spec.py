@@ -131,6 +131,19 @@ class CostSpec:
         # ``CostSpec(commission_bps=10.0)`` are the same spec, and therefore
         # carry the same hash. An int that survives into the canonical JSON
         # would make two identical runs look like different ones.
+        """Coerce every rate to ``float`` and validate the combination.
+
+        Normalizing on construction is what makes ``CostSpec(commission_bps=10)``
+        and ``CostSpec(commission_bps=10.0)`` the same spec, and therefore carry
+        the same hash: an ``int`` surviving into the canonical JSON would make two
+        identical runs look like different ones.
+
+        Raises:
+            SpecValidationError: On a negative rate, impact enabled with a
+                non-positive participation, a lookback or observation floor below
+                its minimum, an unknown participation source, or an
+                ``impact_adv_share`` outside ``(0, 1]``.
+        """
         for name in ("commission_bps", "slippage_bps", "impact_coefficient",
                      "impact_participation", "impact_adv_share"):
             object.__setattr__(self, name, float(getattr(self, name)))
@@ -189,6 +202,11 @@ class CostSpec:
 
     @property
     def has_impact(self) -> bool:
+        """Whether a square-root impact term is charged at all.
+
+        Returns:
+            ``True`` when :attr:`impact_coefficient` is positive.
+        """
         return float(self.impact_coefficient) > 0.0
 
     @property
@@ -204,13 +222,36 @@ class CostSpec:
 
     @property
     def is_free(self) -> bool:
+        """Whether trading is costless under this spec.
+
+        Returns:
+            ``True`` when both linear rates are zero and impact is off. Free
+            trading is honest only as a deliberate upper bound on performance.
+        """
         return self.total_linear_bps == 0.0 and not self.has_impact
 
     def to_dict(self) -> dict[str, Any]:
+        """This spec as a plain dict, one key per field.
+
+        Returns:
+            A JSON-serializable mapping suitable for a config file or a hash.
+        """
         return asdict(self)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any] | None) -> CostSpec:
+        """Build a spec from a mapping, filling every absent key with its default.
+
+        Args:
+            data: Field values, or ``None`` for an all-defaults spec. Unknown keys
+                are ignored, so a config carrying extra fields still loads.
+
+        Returns:
+            A validated :class:`CostSpec`.
+
+        Raises:
+            SpecValidationError: If the resulting combination is invalid.
+        """
         data = dict(data or {})
         return cls(
             commission_bps=float(data.get("commission_bps", 0.0)),
@@ -229,7 +270,15 @@ class CostSpec:
 
     @classmethod
     def from_bps(cls, transaction_cost_bps: float) -> CostSpec:
-        """The one-number cost model, kept for callers that only have one number."""
+        """The one-number cost model, kept for callers that only have one number.
+
+        Args:
+            transaction_cost_bps: Round-trip cost in basis points of the traded
+                notional.
+
+        Returns:
+            A spec charging it all as commission, with no spread and no impact.
+        """
         return cls(commission_bps=float(transaction_cost_bps))
 
 
@@ -270,6 +319,16 @@ class BacktestSpec:
     name: str = "backtest"
 
     def __post_init__(self) -> None:
+        """Coerce the integral fields and validate the spec.
+
+        Raises:
+            SpecValidationError: On an unknown rebalance frequency, a negative
+                ``execution_lag`` (which would trade on a decision not yet taken),
+                ``periods_per_year`` below 1, a non-positive ``initial_capital``,
+                or volume-priced impact on a book too small for capacity to mean
+                anything — a run that reported a cost near zero for that reason
+                would look like evidence of infinite capacity.
+        """
         object.__setattr__(self, "execution_lag", int(self.execution_lag))
         object.__setattr__(self, "periods_per_year", int(self.periods_per_year))
         object.__setattr__(self, "initial_capital", float(self.initial_capital))
@@ -308,10 +367,26 @@ class BacktestSpec:
             )
 
     def with_(self, **changes: Any) -> BacktestSpec:
-        """A copy with fields replaced — the way a sweep builds its cells."""
+        """A copy with fields replaced — the way a sweep builds its cells.
+
+        Args:
+            **changes: Field values to override.
+
+        Returns:
+            A new, revalidated :class:`BacktestSpec`. The original is unchanged.
+
+        Raises:
+            SpecValidationError: If the result is invalid.
+        """
         return replace(self, **changes)
 
     def to_dict(self) -> dict[str, Any]:
+        """This spec as a plain dict, with the cost spec nested under ``costs``.
+
+        Returns:
+            A JSON-serializable mapping. This is what :meth:`canonical_json` and
+            :attr:`spec_hash` are computed from.
+        """
         return {
             "frequency": self.frequency,
             "costs": self.costs.to_dict(),
@@ -324,6 +399,18 @@ class BacktestSpec:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any] | None) -> BacktestSpec:
+        """Build a spec from a mapping, filling every absent key with its default.
+
+        Args:
+            data: Field values, or ``None`` for an all-defaults spec. ``costs`` is
+                handed to :meth:`CostSpec.from_dict`.
+
+        Returns:
+            A validated :class:`BacktestSpec`.
+
+        Raises:
+            SpecValidationError: If the resulting combination is invalid.
+        """
         data = dict(data or {})
         return cls(
             frequency=str(data.get("frequency", "monthly")),  # type: ignore[arg-type]
@@ -354,6 +441,13 @@ class BacktestSpec:
         ).hexdigest()
 
     def describe(self) -> str:
+        """One line naming the rebalance rule, the cost model and the fill lag.
+
+        Returns:
+            Something like ``"backtest: monthly rebalance, 12.0 bps linear,
+            1-period execution lag (in-sample)"`` — the header a tearsheet and a
+            run log both carry.
+        """
         cost = (
             "costless"
             if self.costs.is_free

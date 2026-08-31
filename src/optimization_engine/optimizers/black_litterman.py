@@ -62,6 +62,13 @@ class View:
         return abs(sum(self.weights.values())) < 1e-9
 
     def describe(self) -> str:
+        """The view as a sentence.
+
+        Returns:
+            A relative view reads as ``"A outperforms B by 2.00%"``; an absolute
+            one as ``"A returns 6.00%"``. Which of the two it is follows from the
+            coefficients, not from a flag.
+        """
         longs = [a for a, v in self.weights.items() if v > 0]
         shorts = [a for a, v in self.weights.items() if v < 0]
         if shorts:
@@ -81,6 +88,15 @@ def normalize_views(
     The mapping form stays supported because it is what the config schema and
     the simple UI table produce; it is interpreted as one absolute view per
     entry.
+
+    Args:
+        views: ``{asset: annualized return}``, a list of :class:`View`
+            objects, or ``None`` for no views.
+        view_confidences: ``{asset: variance}``. Only applies to the mapping
+            form; a :class:`View` carries its own confidence.
+
+    Returns:
+        One :class:`View` per input view, in the order given.
     """
     if not views:
         return []
@@ -105,9 +121,15 @@ def build_pick_matrix(
 ) -> tuple[np.ndarray, np.ndarray, list[View]]:
     """Assemble ``(P, Q)`` from a list of views, dropping unusable ones.
 
-    A view is dropped when none of its assets are in the universe, or when
-    every coefficient is zero — either way it carries no information about
-    the assets being optimized.
+    Args:
+        views: The views to encode.
+        assets: The universe, in the order the solve indexes it.
+
+    Returns:
+        ``(P, Q, kept)`` — the pick matrix, the view returns, and the views
+        that survived. A view is dropped when none of its assets are in the
+        universe, or when every coefficient is zero: either way it carries no
+        information about the assets being optimized.
     """
     idx = {a: i for i, a in enumerate(assets)}
     rows: list[np.ndarray] = []
@@ -139,6 +161,17 @@ def implied_risk_aversion(
     implementations — it sets the entire level of the equilibrium returns.
     Calibrating it to an observed market Sharpe ratio makes the prior
     reproducible.
+
+    Args:
+        market_return: The market portfolio's expected return, annualized.
+        market_variance: Its variance, on the same annual basis.
+        risk_free_rate: Annualized risk-free rate.
+
+    Returns:
+        The risk-aversion coefficient δ.
+
+    Raises:
+        ValueError: If ``market_variance`` is not positive.
     """
     if market_variance <= 0:
         raise ValueError(
@@ -161,6 +194,16 @@ def implied_equilibrium_returns(
     The ``rf`` term makes ``π`` a *total* expected return rather than an
     excess return, matching the convention used everywhere else in the
     engine (expected returns are totals, and Sharpe subtracts ``rf``).
+
+    Args:
+        market_weights: The market portfolio, as fractions.
+        cov_matrix: Asset covariance, annualized.
+        risk_aversion: The ``δ`` coefficient. See
+            :func:`implied_risk_aversion` for deriving it rather than guessing.
+        risk_free_rate: Annualized risk-free rate.
+
+    Returns:
+        Annualized total expected returns, one per asset.
     """
     w = market_weights.reindex(cov_matrix.columns).fillna(0.0).values
     pi = risk_aversion * cov_matrix.values @ w
@@ -178,15 +221,29 @@ def black_litterman_posterior(
 ) -> tuple[pd.Series, pd.DataFrame]:
     """Compute the Black-Litterman posterior mean and covariance.
 
-    ``views`` accepts either ``{asset: annualized return}`` (absolute views)
-    or a list of :class:`View` objects (absolute *or* relative).
-    ``view_confidences`` only applies to the mapping form; ``View.confidence``
-    carries it otherwise.
+    Args:
+        cov_matrix: The prior covariance Σ, annualized.
+        market_weights: The market portfolio the equilibrium returns are
+            reverse-optimized from.
+        views: Either ``{asset: annualized return}`` (absolute views) or a
+            list of :class:`View` objects (absolute *or* relative).
+        view_confidences: Per-view variances. Only applies to the mapping
+            form; ``View.confidence`` carries it otherwise.
+        tau: Scalar on the prior covariance, in ``(0, 1]``. Small means the
+            equilibrium is trusted and the views move the posterior little.
+        risk_aversion: The δ in the reverse optimization.
+        risk_free_rate: Annualized risk-free rate.
 
     Returns:
         ``(posterior_mean, posterior_covariance)`` where the covariance is
         ``Σ + M`` — the prior plus the posterior parameter uncertainty, which
         is what should be fed to the downstream mean-variance solve.
+
+    Raises:
+        ValueError: If ``tau`` lies outside ``(0, 1]``, which makes the prior
+            either degenerate or wider than the return distribution itself, or
+            if a view confidence is not strictly positive — a zero would
+            assert a view held with perfect certainty.
     """
     if not 0 < tau <= 1:
         raise ValueError(
@@ -265,6 +322,26 @@ class BlackLittermanOptimizer(BaseOptimizer):
         calibrate_risk_aversion: bool = False,
         **kwargs,
     ) -> None:
+        """Set the equilibrium prior, the views, and how much to trust each.
+
+        Args:
+            *args: Passed to :class:`~optimization_engine.optimizers.base.BaseOptimizer`.
+            market_weights: Market-capitalization weights to reverse-optimize the
+                equilibrium returns from. Defaults to equal weights, which is a
+                real assumption rather than a neutral one.
+            views: Either the simple ``asset -> expected return`` mapping or full
+                :class:`View` objects, which can express relative views.
+            view_confidences: ``view -> confidence``. Absent views fall back to
+                the standard proportional-to-variance uncertainty.
+            tau: Scalar on the prior's uncertainty. Small means the equilibrium is
+                trusted and the views move the posterior little.
+            risk_aversion: The ``δ`` in the reverse optimization. Ignored when
+                ``calibrate_risk_aversion`` is set.
+            market_return: The market's own expected return, used for calibration.
+            calibrate_risk_aversion: Derive ``δ`` from the market's Sharpe ratio
+                instead of using the hard-coded default.
+            **kwargs: Passed to the base class.
+        """
         super().__init__(*args, **kwargs)
         self.market_weights = (
             pd.Series(market_weights) if isinstance(market_weights, dict) else market_weights

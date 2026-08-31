@@ -86,6 +86,12 @@ class FrontierResult:
 
     @property
     def n_failed(self) -> int:
+        """How many frontier points failed to solve.
+
+        A target return can be unreachable under the mandate's constraints, so a
+        non-zero count is ordinary — those points are kept as rows with a
+        non-``ok`` status rather than dropped.
+        """
         return int((self.summary["status"] != "ok").sum())
 
     def plot_frame(self, efficient_only: bool = True) -> pd.DataFrame:
@@ -94,6 +100,13 @@ class FrontierResult:
         Charting code that drops NaN rows and then indexes with a position
         taken from the *undropped* frame highlights the wrong point; this
         returns one frame so both come from the same place.
+
+        Args:
+            efficient_only: Keep only the solved points on the efficient branch.
+
+        Returns:
+            A frame with a fresh ``RangeIndex``, so a position taken from it
+            indexes it correctly.
         """
         df = self.efficient if efficient_only else self.summary[self.summary["status"] == "ok"]
         return df.dropna(subset=["expected_volatility", "expected_return"]).reset_index(drop=True)

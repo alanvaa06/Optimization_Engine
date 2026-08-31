@@ -46,6 +46,16 @@ class CatalogEntry:
     symbols: Mapping[str, str]
 
     def symbol_for(self, provider: str) -> str | None:
+        """This instrument's symbol at one provider.
+
+        Args:
+            provider: Registered provider name, e.g. ``"stooq"``.
+
+        Returns:
+            The provider's own symbol, or ``None`` when it does not carry this
+            instrument — which is what lets a universe written against catalog
+            names survive a change of provider.
+        """
         return self.symbols.get(provider)
 
 
@@ -104,7 +114,16 @@ _BY_KEY: Mapping[str, CatalogEntry] = {entry.key: entry for entry in _ENTRIES}
 
 
 def lookup(key: str) -> CatalogEntry | None:
-    """The catalog entry for an engine-side name, if there is one."""
+    """The catalog entry for an engine-side name, if there is one.
+
+    Args:
+        key: An engine-side name, e.g. ``"SP500"``. Case-insensitive.
+
+    Returns:
+        The :class:`CatalogEntry`, or ``None`` when the name is not in the
+        catalog — which is not an error: a raw ticker is passed through to the
+        provider unchanged.
+    """
     return _BY_KEY.get(str(key).strip().upper())
 
 
@@ -114,7 +133,14 @@ def catalog_entries() -> tuple[CatalogEntry, ...]:
 
 
 def entries_for(provider: str) -> tuple[CatalogEntry, ...]:
-    """Catalog entries a given provider can actually serve."""
+    """Catalog entries a given provider can actually serve.
+
+    Args:
+        provider: A registered provider name.
+
+    Returns:
+        Every entry carrying a symbol for that provider, in catalog order.
+    """
     return tuple(entry for entry in _ENTRIES if provider in entry.symbols)
 
 
@@ -161,12 +187,27 @@ def kind_for(identifier: str) -> F.InstrumentKind | None:
 
     Trusted over a provider's own guess: the catalog states that ``SP500`` is
     an index, whereas the Yahoo adapter can only infer it from a caret.
+
+    Args:
+        identifier: An engine-side name.
+
+    Returns:
+        The kind, or ``None`` when the name is not in the catalog.
     """
     entry = lookup(identifier)
     return entry.kind if entry else None
 
 
 def currency_for(identifier: str) -> str | None:
+    """The currency the catalog knows for a name, if any.
+
+    Args:
+        identifier: An engine-side name, e.g. ``"SP500"``.
+
+    Returns:
+        An ISO code, or ``None`` when the name is not in the catalog. Trusted
+        over a provider's own guess, for the same reason as :func:`kind_for`.
+    """
     entry = lookup(identifier)
     return entry.currency if entry else None
 

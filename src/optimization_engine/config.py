@@ -82,6 +82,12 @@ class OptimizerSpec:
     extra: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
+        """The spec as a plain dict, with unset fields omitted.
+
+        Returns:
+            Every field that is not ``None``, so a serialized config carries only
+            what was actually chosen rather than every knob's default.
+        """
         return {k: v for k, v in self.__dict__.items() if v is not None}
 
 
@@ -186,10 +192,20 @@ class EngineConfig:
     turnover_limit: float | None = None
 
     def __post_init__(self) -> None:
+        """Coerce the constraint layers into their canonical form.
+
+        A config loaded from YAML has mappings where one built in memory has
+        :class:`~optimization_engine.constraints.ConstraintLayer` objects; after
+        this they behave identically.
+
+        Raises:
+            LayerConfigurationError: If any layer entry is malformed.
+        """
         self.constraint_layers = list(coerce_layers(self.constraint_layers))
 
     @property
     def assets(self) -> list[str]:
+        """The universe, taken from the expected-returns keys, in insertion order."""
         return list(self.expected_returns.keys())
 
     def benchmark_weight_map(
@@ -201,8 +217,19 @@ class EngineConfig:
         that supplied the numbers directly meant those numbers. Otherwise the
         spec is expanded over ``assets`` — which matters for the rule-based
         kinds, since 1/N over ten assets is a different portfolio from 1/N
-        over twelve. An external-index benchmark has no weights in the
-        investable universe and correctly returns ``None``.
+        over twelve.
+
+        Args:
+            assets: The universe to expand the spec over. ``None`` uses the
+                config's own.
+
+        Returns:
+            ``asset -> weight``, or ``None``. An external-index benchmark has no
+            weights in the investable universe and correctly returns ``None``.
+
+        Raises:
+            BenchmarkError: If the spec names an asset or weights the universe
+                does not contain.
         """
         if self.benchmark_weights:
             return {str(k): float(v) for k, v in self.benchmark_weights.items()}
@@ -213,12 +240,31 @@ class EngineConfig:
         return None if weights is None else {str(k): float(v) for k, v in weights.items()}
 
     def get_bounds(self, asset: str, default: tuple[float, float] = (0.0, 1.0)) -> tuple[float, float]:
+        """The weight bounds for one asset.
+
+        Args:
+            asset: Asset name.
+            default: Returned when the config sets no bounds for this asset.
+                Defaults to long-only and unlevered, ``(0.0, 1.0)``.
+
+        Returns:
+            A ``(min, max)`` pair of weights, as fractions of the book.
+        """
         if asset in self.bounds:
             lo, hi = self.bounds[asset]
             return float(lo), float(hi)
         return default
 
     def to_dict(self) -> dict[str, Any]:
+        """The whole configuration as a plain, JSON- and YAML-serializable dict.
+
+        Nested objects — the optimizer spec, the benchmark spec, the constraint
+        layers — are expanded to their own dict form, so the result round-trips
+        through :meth:`from_dict` without losing anything.
+
+        Returns:
+            A mapping with one key per configuration field.
+        """
         return {
             "expected_returns": dict(self.expected_returns),
             "bounds": {k: list(v) for k, v in self.bounds.items()},
@@ -254,6 +300,20 @@ class EngineConfig:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> EngineConfig:
+        """Build a configuration from a mapping, applying every default.
+
+        Args:
+            data: The mapping to read, typically parsed from YAML or JSON.
+                ``optimizer`` may be given as a bare method name instead of a
+                mapping, which is the common shorthand in a config file.
+
+        Returns:
+            A validated :class:`EngineConfig`.
+
+        Raises:
+            LayerConfigurationError: If a constraint layer is malformed.
+            BenchmarkError: If the benchmark block is malformed.
+        """
         opt_raw = data.get("optimizer") or {}
         if isinstance(opt_raw, str):
             opt_raw = {"name": opt_raw}
@@ -314,7 +374,21 @@ class EngineConfig:
 
 
 def load_config(path: str | Path) -> EngineConfig:
-    """Load an `EngineConfig` from a YAML or JSON file."""
+    """Load an :class:`EngineConfig` from a YAML or JSON file.
+
+    Args:
+        path: The file to read. The format follows the extension —
+            ``.yaml``/``.yml`` or ``.json``.
+
+    Returns:
+        The parsed configuration.
+
+    Raises:
+        ValueError: If the extension is neither YAML nor JSON.
+        FileNotFoundError: If the path does not exist.
+        LayerConfigurationError: If a constraint layer is malformed.
+        BenchmarkError: If the benchmark block is malformed.
+    """
     p = Path(path)
     text = p.read_text(encoding="utf-8")
     if p.suffix.lower() in {".yaml", ".yml"}:
@@ -327,7 +401,13 @@ def load_config(path: str | Path) -> EngineConfig:
 
 
 def save_config(config: EngineConfig, path: str | Path) -> None:
-    """Persist an `EngineConfig` to YAML or JSON depending on extension."""
+    """Persist an :class:`EngineConfig` to YAML or JSON depending on extension.
+
+    Args:
+        config: The configuration to write.
+        path: Destination. ``.json`` writes JSON; anything else writes YAML.
+            Parent directories are not created.
+    """
     p = Path(path)
     data = config.to_dict()
     p.parent.mkdir(parents=True, exist_ok=True)

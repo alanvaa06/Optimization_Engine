@@ -135,14 +135,17 @@ class RunResult:
 
     @property
     def total_turnover(self) -> float:
+        """Sum of one-way turnover over the whole run, as a fraction of NAV."""
         return float(self.costs["turnover"].sum()) if not self.costs.empty else 0.0
 
     @property
     def total_cost(self) -> float:
+        """Every cost charged over the whole run, as a fraction of NAV."""
         return float(self.costs["total"].sum()) if not self.costs.empty else 0.0
 
     @property
     def periods_per_year(self) -> int:
+        """Annualization basis the run was simulated on, read back from the spec."""
         return int(self.meta.spec.get("periods_per_year", 252))
 
     @property
@@ -152,12 +155,30 @@ class RunResult:
         return float(self.total_turnover / years) if years > 0 else float("nan")
 
     def wealth(self, starting: float = 1.0) -> pd.Series:
+        """The net-of-cost equity curve.
+
+        Args:
+            starting: Value at the first period. Defaults to ``1.0``, which makes
+                the series read as a growth multiple.
+
+        Returns:
+            A series indexed like :attr:`returns`, compounding them from
+            ``starting``.
+        """
         return starting * (1 + self.returns).cumprod()
 
     def summary(
         self, periods_per_year: int | None = None, riskfree_rate: float = 0.0
     ) -> pd.DataFrame:
-        """Standard performance summary of the net-of-cost return stream."""
+        """Standard performance summary of the net-of-cost return stream.
+
+        Args:
+            periods_per_year: Annualization basis. Defaults to the run's own.
+            riskfree_rate: Per-period risk-free rate for the ratio metrics.
+
+        Returns:
+            A one-row-per-statistic summary frame, computed on the extended set.
+        """
         from optimization_engine.analytics.performance import summary_stats
 
         return summary_stats(
@@ -168,7 +189,15 @@ class RunResult:
         )
 
     def cost_drag(self, periods_per_year: int | None = None) -> float:
-        """Annualized return given up to transaction costs."""
+        """Annualized return given up to transaction costs.
+
+        Args:
+            periods_per_year: Annualization basis. Defaults to the run's own.
+
+        Returns:
+            The gross annualized return minus the net one, as a fraction. This is
+            what trading cost, expressed the way a return is.
+        """
         from optimization_engine.analytics.performance import annualize_returns
 
         ppy = periods_per_year or self.periods_per_year
@@ -178,6 +207,12 @@ class RunResult:
         )
 
     def describe(self) -> str:
+        """One line: sample, length, annualized turnover, total cost, degradations.
+
+        Returns:
+            A summary that names any cost degradation rather than letting a
+            cheap-looking backtest hide a cost model that switched itself off.
+        """
         sample = "out-of-sample" if self.meta.is_out_of_sample else "in-sample"
         degraded = (
             "" if not self.meta.degradations
@@ -220,6 +255,14 @@ def compute_result_hash(
     rounded first (see ``_HASH_DECIMALS``) and the rows are consumed in their
     canonical order, so the hash is stable across platforms without being so
     loose that a real change slips past it.
+
+    Args:
+        nav: The NAV path.
+        trades: The trade frame, in canonical column order.
+        costs: The cost frame, in canonical column order.
+
+    Returns:
+        A hex SHA-256 digest.
     """
     digest = hashlib.sha256()
     for date, value in nav.items():
@@ -258,7 +301,21 @@ def build_meta(
     degradations: tuple[str, ...] = (),
     notes: dict[str, Any] | None = None,
 ) -> RunMeta:
-    """Assemble the metadata block, hashing the frames as it goes."""
+    """Assemble the metadata block, hashing the frames as it goes.
+
+    Args:
+        spec: The spec the run was simulated under.
+        nav: The NAV path.
+        trades: The trade frame.
+        costs: The cost frame.
+        weights: The realized weight path.
+        degradations: Cost-model degradation notes collected during the run.
+        notes: Anything else worth recording alongside the result.
+
+    Returns:
+        A :class:`RunMeta` carrying the serialized spec, the result hash and
+        the degradations — everything needed to tell two runs apart.
+    """
     index = pd.DatetimeIndex(weights.index)
     return RunMeta(
         spec=spec.to_dict(),
@@ -275,7 +332,16 @@ def build_meta(
 
 
 def sanitize_weights(weights: pd.Series, assets: list[str]) -> np.ndarray:
-    """A weight vector aligned to ``assets``, with missing names at zero."""
+    """A weight vector aligned to ``assets``, with missing names at zero.
+
+    Args:
+        weights: The solved weights, possibly over a different universe.
+        assets: The universe to align to, in order.
+
+    Returns:
+        A float array of ``len(assets)``. An asset the solve did not hold
+        contributes zero rather than a NaN that would poison the NAV path.
+    """
     return weights.reindex(assets).fillna(0.0).to_numpy(dtype=float)
 
 

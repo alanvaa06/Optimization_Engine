@@ -75,8 +75,16 @@ def rescale_frames_to_adjusted(
     """:func:`rescale_to_adjusted`, for whole per-field frames.
 
     Applied column-wise, so a panel where one identifier pays dividends and
-    another does not is scaled correctly for both. As above, a cell with no
-    usable ratio has its range dropped rather than left on the wrong scale.
+    another does not is scaled correctly for both.
+
+    Args:
+        frames: ``field name -> frame``, which must carry both the adjusted
+            and the raw close.
+
+    Returns:
+        The same mapping with every price field put on the adjusted scale. A
+        cell with no usable ratio has its range dropped rather than left on
+        the wrong scale.
     """
     adjusted = frames.get(F.CLOSE)
     raw = frames.get(F.CLOSE_RAW)

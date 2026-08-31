@@ -89,6 +89,14 @@ class LazyModule:
     """
 
     def __init__(self, module: str, *, extra: str, purpose: str) -> None:
+        """Stand in for a module without importing it.
+
+        Args:
+            module: Importable name, e.g. ``"plotly.express"``.
+            extra: The extra that installs it, e.g. ``"viz"``.
+            purpose: What breaks without it, phrased to complete the sentence
+                "X is required for ...".
+        """
         self._module = module
         self._extra = extra
         self._purpose = purpose
@@ -97,6 +105,22 @@ class LazyModule:
     def __getattr__(self, name: str) -> Any:
         # Only reached for names that are not instance attributes, i.e. the
         # ones the caller means for the underlying module.
+        """Import on first use, then delegate to the real module.
+
+        Only reached for names that are not instance attributes — that is, the
+        ones the caller means for the underlying module. The import is cached, so
+        the cost is paid once.
+
+        Args:
+            name: Attribute to look up on the underlying module.
+
+        Returns:
+            The attribute.
+
+        Raises:
+            MissingDependencyError: If the module is not installed. The message
+                names the extra that provides it.
+        """
         resolved = self.__dict__.get("_resolved")
         if resolved is None:
             resolved = require(
@@ -108,5 +132,6 @@ class LazyModule:
         return getattr(resolved, name)
 
     def __repr__(self) -> str:
+        """``<LazyModule 'plotly.express' (deferred)>``, or ``(loaded)`` once used."""
         state = "loaded" if self.__dict__.get("_resolved") is not None else "deferred"
         return f"<LazyModule {self._module!r} ({state})>"

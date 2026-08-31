@@ -85,6 +85,12 @@ class BenchmarkSpec:
     normalize: bool = True
 
     def __post_init__(self) -> None:
+        """Normalize the spec and reject one that names nothing resolvable.
+
+        Raises:
+            BenchmarkError: On an unknown ``kind``, or a rebalance rule that is
+                neither ``"periodic"`` nor ``"buy_and_hold"``.
+        """
         self.kind = str(self.kind or "none")
         if self.kind not in _KIND_LABELS:
             raise BenchmarkError(
@@ -118,6 +124,13 @@ class BenchmarkSpec:
 
     @property
     def display_label(self) -> str:
+        """What to call this benchmark in a report, a chart or the UI.
+
+        Returns:
+            The explicit ``label`` when one was set; otherwise the asset name for
+            a single-asset benchmark, the series name for an external one, and
+            the kind's own label for the rest.
+        """
         if self.label:
             return str(self.label)
         if self.kind == "single_asset" and self.asset:
@@ -131,10 +144,19 @@ class BenchmarkSpec:
     def weight_vector(self, assets: list[str]) -> pd.Series | None:
         """The benchmark's weights over ``assets``, or None when it has none.
 
+        Args:
+            assets: The universe to expand the spec over.
+
+        Returns:
+            One weight per asset, normalized when ``normalize`` is set, or
+            ``None`` for an external-index benchmark.
+
         Raises:
             BenchmarkError: When the spec names an asset or weights that the
-                universe does not contain. Silently zero-filling would make
-                the benchmark quietly different from the one that was chosen.
+                universe does not contain, when the universe is empty, or when the
+                weights sum to zero under ``normalize``. Silently zero-filling
+                would make the benchmark quietly different from the one that was
+                chosen.
         """
         if not self.has_weights:
             return None
@@ -183,6 +205,11 @@ class BenchmarkSpec:
     # -- serialization ------------------------------------------------------
 
     def to_dict(self) -> dict[str, Any]:
+        """The spec as a plain, YAML-serializable dict.
+
+        Returns:
+            One key per field, with ``weights`` as a plain mapping or ``None``.
+        """
         return {
             "kind": self.kind,
             "asset": self.asset,
@@ -195,7 +222,19 @@ class BenchmarkSpec:
 
     @classmethod
     def from_dict(cls, data: Any) -> BenchmarkSpec:
-        """Build a spec from a mapping, a bare kind string, or ``None``."""
+        """Build a spec from a mapping, a bare kind string, or ``None``.
+
+        Args:
+            data: A full mapping, the kind alone as a string (the common
+                shorthand in a config), or ``None`` for no benchmark.
+
+        Returns:
+            The :class:`BenchmarkSpec`.
+
+        Raises:
+            BenchmarkError: If ``data`` is some other type, or the resulting spec
+                names an unknown kind or rebalance rule.
+        """
         if data is None:
             return cls()
         if isinstance(data, BenchmarkSpec):
@@ -236,6 +275,14 @@ class ResolvedBenchmark:
 
     @property
     def has_weights(self) -> bool:
+        """Whether this benchmark holds positions in the investable universe.
+
+        Returns:
+            ``True`` for the weight-defined kinds. It is ``False`` for an external
+            index, which is why a tracking-error or active-share budget cannot be
+            measured against one: a series of returns has no holdings to be active
+            against.
+        """
         return self.weights is not None
 
     def summary(self) -> pd.DataFrame:
@@ -271,11 +318,18 @@ def portfolio_returns_from_weights(
 ) -> pd.Series:
     """Return stream of a fixed weight vector held over ``returns``.
 
-    ``periodic`` restores the weights every period — the assumption behind
-    ``(returns · w).sum(axis=1)`` and behind most published index series.
-    ``buy_and_hold`` invests once and lets the weights drift, which is a
-    materially different track record over long samples: the winners compound
-    into a larger share and the result is no longer the stated allocation.
+    Args:
+        returns: Periodic asset returns.
+        weights: The allocation to hold, as fractions of the book.
+        rebalance: ``"periodic"`` restores the weights every period — the
+            assumption behind ``(returns · w).sum(axis=1)`` and behind most
+            published index series. ``"buy_and_hold"`` invests once and lets
+            the weights drift, which is a materially different track record
+            over long samples: the winners compound into a larger share and
+            the result is no longer the stated allocation.
+
+    Returns:
+        One return per row of ``returns``.
     """
     aligned = weights.reindex(returns.columns).fillna(0.0).astype(float)
     if rebalance == "periodic":

@@ -54,6 +54,13 @@ DENOISE_METHODS = ("constant_residual", "targeted_shrinkage")
 def cov_to_corr(cov: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     """Split a covariance matrix into ``(correlation, standard deviations)``.
 
+    Args:
+        cov: A covariance matrix.
+
+    Returns:
+        A ``(correlation, std)`` pair, the second in the covariance's own
+        volatility units.
+
     Raises:
         ValueError: If any asset has zero or negative variance, which makes
             the correlation undefined rather than merely awkward.
@@ -69,7 +76,15 @@ def cov_to_corr(cov: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
 
 
 def corr_to_cov(corr: np.ndarray, std: np.ndarray) -> np.ndarray:
-    """Rebuild a covariance matrix from a correlation and its volatilities."""
+    """Rebuild a covariance matrix from a correlation and its volatilities.
+
+    Args:
+        corr: A correlation matrix.
+        std: Per-asset standard deviations, aligned to it.
+
+    Returns:
+        The covariance matrix, in the units ``std`` carries.
+    """
     return corr * np.outer(std, std)
 
 
@@ -180,6 +195,15 @@ def fit_marchenko_pastur(
     observed = np.asarray(eigenvalues, dtype=float)
 
     def sse(variance: float) -> float:
+        """Squared error between the empirical and theoretical eigenvalue densities.
+
+        Args:
+            variance: Candidate noise variance to evaluate.
+
+        Returns:
+            The sum of squared differences. This is the objective the fit
+            minimizes over.
+        """
         theoretical = marchenko_pastur_pdf(float(variance), q)
         empirical = _kde_density(observed, bandwidth, theoretical.index.values)
         return float(np.sum((empirical - theoretical.values) ** 2))

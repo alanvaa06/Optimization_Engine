@@ -60,6 +60,12 @@ def resample_returns(
         block_size: Block length for ``"block"``. Defaults to
             ``ceil(T ** (1/3))``, the usual rule of thumb.
         rng: Seeded generator, for reproducibility.
+
+    Returns:
+        One drawn history of the same shape as ``returns``.
+
+    Raises:
+        ValueError: On an unknown ``method``, or fewer than 2 observations.
     """
     rng = rng or np.random.default_rng()
     n_obs = len(returns)
@@ -117,12 +123,30 @@ class FrontierUncertainty:
         This is the number to quote when someone asks how much to trust the
         frontier: "at 10% volatility, expected return is somewhere in a
         4-percentage-point range."
+
+        Args:
+            quantile_low: Lower quantile of the band, as a fraction.
+            quantile_high: Upper quantile, as a fraction.
+
+        Returns:
+            Band height in annualized-return units, indexed by volatility level.
+
+        Raises:
+            KeyError: If either quantile was not computed when the band was
+                built.
         """
         lo = self.quantiles[f"q{int(quantile_low * 100):02d}"]
         hi = self.quantiles[f"q{int(quantile_high * 100):02d}"]
         return (hi - lo).rename("band_width")
 
     def summary(self) -> str:
+        """How wide the frontier's confidence band is, in one sentence.
+
+        Returns:
+            A statement of the typical band width across the resampled histories,
+            and the reminder it implies: differences smaller than that are not
+            distinguishable from estimation noise.
+        """
         width = self.band_width()
         if width.empty or not np.isfinite(width).any():
             return "Frontier uncertainty could not be estimated."
@@ -290,8 +314,17 @@ def resampled_efficient_frontier(
     an asset the optimizer loads on only in some draws ends up with a
     moderate weight instead of a corner.
 
+    Args:
+        returns: The observed history to resample from.
+        config: The mandate each draw is optimized under.
+        n_draws: How many histories to draw and optimize.
+        n_points: How many frontier ranks to trace per draw.
+        method: The resampling scheme. See :func:`resample_returns`.
+        seed: Seed for the generator, for reproducibility. ``None`` leaves it
+            unseeded.
+
     Returns:
-        Assets × rank frame of averaged weights. Each column sums to 1.
+        An assets × rank frame of averaged weights. Each column sums to 1.
 
     Raises:
         ValueError: If no draw produces a usable frontier.
@@ -397,6 +430,13 @@ class MCOSResult:
         return frame.sort_values("weight_rmse")
 
     def describe(self) -> str:
+        """Which method recovered the true allocation most reliably, and which least.
+
+        Returns:
+            A sentence naming the best and worst methods by weight RMSE over the
+            simulated histories, or a statement that no method produced a usable
+            allocation on any draw.
+        """
         ranked = self.ranking()
         if ranked.empty:
             return "No method produced a usable allocation on any draw."
@@ -492,6 +532,17 @@ def monte_carlo_optimization_selection(
     use_denoise = config.denoise if denoise is None else bool(denoise)
 
     def estimate(sample: pd.DataFrame) -> tuple[pd.Series, pd.DataFrame]:
+        """Estimate the inputs one simulated history implies.
+
+        Uses the same estimators the config names, so a simulation is scored
+        against the pipeline it will actually be run through.
+
+        Args:
+            sample: One simulated (or the observed) return history.
+
+        Returns:
+            An ``(expected_returns, covariance)`` pair.
+        """
         cov = covariance_matrix(
             sample,
             method=config.covariance_method,
@@ -516,6 +567,19 @@ def monte_carlo_optimization_selection(
         return mu, cov
 
     def solve(name: str, mu: pd.Series, cov: pd.DataFrame, sample: pd.DataFrame) -> pd.Series:
+        """Solve one method on one simulated history.
+
+        Args:
+            name: The optimizer to run.
+            mu: Expected returns estimated from ``sample``.
+            cov: Covariance estimated from ``sample``.
+            sample: The simulated history, for the methods that need the path
+                rather than its moments.
+
+        Returns:
+            Weights reindexed onto the full universe, with anything the solve did
+            not hold filled as zero.
+        """
         run_config = copy.deepcopy(config)
         run_config.optimizer.name = name
         run_config.expected_returns = mu.to_dict()
@@ -603,6 +667,15 @@ def monte_carlo_optimization_selection(
         )
 
     def collect(store: dict[str, list[float]]) -> pd.Series:
+        """Average one error store across simulations, per method.
+
+        Args:
+            store: ``method -> list of per-simulation errors``.
+
+        Returns:
+            One mean per method, with ``nan`` for a method that never produced a
+            usable allocation.
+        """
         return pd.Series(
             {
                 name: (float(np.mean(values)) if values else float("nan"))

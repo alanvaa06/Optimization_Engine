@@ -63,6 +63,7 @@ class WalkForwardRun:
 
     @property
     def returns(self) -> pd.Series:
+        """The net-of-cost return stream, taken from the underlying run."""
         return self.run.returns
 
     @property
@@ -92,6 +93,12 @@ class WalkForwardRun:
 
     @property
     def n_failures(self) -> int:
+        """How many windows failed to solve.
+
+        A non-zero count is not fatal — the run carries on with the last usable
+        weights — but it belongs in any read of the result, which is why
+        :meth:`describe` reports it.
+        """
         return len(self.failures)
 
     @property
@@ -112,6 +119,12 @@ class WalkForwardRun:
         return self.weights_history.diff().abs().mean()
 
     def describe(self) -> str:
+        """One line: re-solves, trade dates, trading cadence, failed solves.
+
+        Returns:
+            Something like ``"24 re-solves, 24 trade dates (trading only on
+            re-solves); 0 failed solve(s)."``
+        """
         trading = (
             "trading only on re-solves"
             if self.rebalance_frequency == "none"

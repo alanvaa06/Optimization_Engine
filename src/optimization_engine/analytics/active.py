@@ -92,6 +92,14 @@ class InformationCoefficient:
     series: pd.Series
 
     def describe(self) -> str:
+        """The IC and its t-statistic, with the skill verdict spelled out.
+
+        Returns:
+            A sentence giving the mean IC, the cross-section size, the standard
+            deviation, the t-statistic and the hit rate. A ``|t| < 2`` reads as
+            "not distinguishable from no skill" rather than as a small number the
+            reader has to interpret.
+        """
         verdict = (
             "not distinguishable from no skill"
             if abs(self.t_statistic) < 2
@@ -314,6 +322,14 @@ class FundamentalLawReport:
     active_risk: float | None = None
 
     def describe(self) -> str:
+        """The fundamental law, read as a sentence rather than a formula.
+
+        Returns:
+            IC and breadth, the unconstrained information ratio they imply, the
+            transfer coefficient, and what the mandate's constraints cost in IR.
+            When an active-risk budget was supplied, the expected active return
+            that budget buys is appended.
+        """
         line = (
             f"IC {self.information_coefficient:.3f} across "
             f"{self.breadth:.0f} independent bets a year implies an "
@@ -393,6 +409,17 @@ def implied_breadth(
     If the manager holds 40 positions and turns them over quarterly, the
     claim does not survive arithmetic.
 
+    Args:
+        information_ratio: The annualized information ratio being claimed.
+        information_coefficient: Skill, as a correlation between forecast and
+            realized return. Typically 0.02-0.10 for a real process.
+        transfer_coefficient: The share of the forecast the mandate actually
+            lets through, in ``[0, 1]``. ``1.0`` means unconstrained.
+
+    Returns:
+        Independent bets required per year, on the same annual basis as the
+        information ratio.
+
     Raises:
         ValueError: If ``IC × TC`` is zero, where any IR would need infinite
             breadth.
@@ -434,6 +461,9 @@ def grinold_alpha(
     Returns:
         Expected active return per asset, on the same annual scale as
         ``volatility``.
+
+    Raises:
+        ValueError: If ``scores`` and ``volatility`` share no assets.
     """
     assets = scores.index.intersection(volatility.index)
     if len(assets) == 0:
@@ -461,6 +491,14 @@ def risk_aversion_from_information_ratio(
     tracking-error budget at an IR of 0.5" is a sentence a committee can
     argue with.
 
+    Args:
+        information_ratio: The annualized information ratio believed in.
+        target_active_risk: The tracking-error budget, as an annualized
+            fraction — ``0.04`` for 4%.
+
+    Returns:
+        The active risk-aversion coefficient ``λ_A``.
+
     Raises:
         ValueError: If ``target_active_risk`` is not positive.
     """
@@ -475,6 +513,13 @@ def optimal_active_risk(
     information_ratio: float, risk_aversion: float
 ) -> float:
     """The tracking error that maximizes value added: ``ψ* = IR / (2·λ_A)``.
+
+    Args:
+        information_ratio: The annualized information ratio believed in.
+        risk_aversion: The active risk-aversion coefficient ``λ_A``.
+
+    Returns:
+        The optimal tracking error, as an annualized fraction.
 
     Raises:
         ValueError: If ``risk_aversion`` is not positive — with zero or
@@ -491,7 +536,18 @@ def optimal_active_risk(
 def value_added(
     information_ratio: float, active_risk: float, risk_aversion: float
 ) -> float:
-    """``IR·ψ − λ_A·ψ²`` — risk-adjusted value added at a given active risk."""
+    """``IR·ψ − λ_A·ψ²`` — risk-adjusted value added at a given active risk.
+
+    Args:
+        information_ratio: The annualized information ratio.
+        active_risk: The tracking error actually run, as an annualized
+            fraction.
+        risk_aversion: The active risk-aversion coefficient ``λ_A``.
+
+    Returns:
+        Value added, in the same annualized return units as the inputs. It is
+        negative when the tracking error run is more than twice the optimum.
+    """
     return float(
         information_ratio * active_risk - risk_aversion * active_risk**2
     )
@@ -520,7 +576,16 @@ def active_risk_decomposition(
     benchmark holds it too. Managing one number while reporting the other is
     a standard way to be surprised.
 
-    Columns:
+    Args:
+        weights: Portfolio weights, as fractions of the book.
+        benchmark_weights: The benchmark's weights over the same universe.
+            Assets it does not hold count as zero.
+        cov_matrix: Asset covariance, on whatever periodicity the reported
+            tracking error should carry.
+
+    Returns:
+        A frame indexed by asset with:
+
         ``weight`` / ``benchmark_weight`` / ``active_weight``
         ``marginal_tracking_error`` — ``∂TE/∂w_i``.
         ``contribution`` — ``Δw_i · ∂TE/∂w_i``, summing exactly to the

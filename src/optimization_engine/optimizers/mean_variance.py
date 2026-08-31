@@ -68,6 +68,19 @@ class MeanVarianceOptimizer(BaseOptimizer):
     bounds_mode = "hard"
 
     def __init__(self, *args, risk_aversion: float = 1.0, **kwargs) -> None:
+        """Set the risk-aversion coefficient; everything else is the base class's.
+
+        Args:
+            *args: Passed to :class:`~optimization_engine.optimizers.base.BaseOptimizer`.
+            risk_aversion: The ``λ`` in ``μ'w − λ·w'Σw``, used only in utility
+                mode — that is, when neither a target return nor a target
+                volatility is set. Higher means more risk-averse.
+            **kwargs: Passed to the base class.
+
+        Raises:
+            ValueError: If ``risk_aversion`` is negative, which would reward risk
+                and leave the problem unbounded.
+        """
         super().__init__(*args, **kwargs)
         self.risk_aversion = float(risk_aversion)
         if self.risk_aversion < 0:

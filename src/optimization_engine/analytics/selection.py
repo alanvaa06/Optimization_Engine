@@ -161,6 +161,14 @@ class DeflatedSharpe:
         return self.deflated >= 0.95
 
     def describe(self) -> str:
+        """The Sharpe ratio, and what it is worth after the trial count.
+
+        Returns:
+            A sentence giving the raw Sharpe, the best result expected under the
+            null across the declared trials, the deflated Sharpe, the
+            probabilistic Sharpe before deflation, and the verdict at the 95%
+            level — plus the skew and kurtosis the adjustment used.
+        """
         verdict = (
             "clears the selection-bias threshold"
             if self.is_significant
@@ -355,6 +363,14 @@ class OverfittingReport:
     out_of_sample: np.ndarray
 
     def describe(self) -> str:
+        """What the CSCV procedure found, and whether the selection means anything.
+
+        Returns:
+            A sentence giving the probability of backtest overfitting across the
+            balanced splits, the verdict it implies (no better than chance at
+            ``>= 0.5``, real information at ``<= 0.2``, weak in between), and the
+            slope of out-of-sample performance regressed on in-sample.
+        """
         verdict = (
             "the selection process is no better than chance"
             if self.pbo >= 0.5
@@ -437,6 +453,19 @@ def probability_of_backtest_overfitting(
     ]
 
     def performance(rows: np.ndarray) -> np.ndarray:
+        """Score every candidate over one set of rows.
+
+        Args:
+            rows: A ``periods x candidates`` block of returns.
+
+        Returns:
+            One score per candidate: the mean return under ``metric="mean"``, or
+            the mean over the standard deviation under ``"sharpe"``, with a
+            zero-variance candidate scored zero rather than as a division by zero.
+
+        Raises:
+            ValueError: If ``metric`` is neither ``"sharpe"`` nor ``"mean"``.
+        """
         mean = rows.mean(axis=0)
         if metric == "mean":
             return mean

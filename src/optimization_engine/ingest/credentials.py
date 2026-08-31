@@ -50,7 +50,15 @@ _MIN_LENGTH_TO_HINT = 16
 
 
 def env_var_for(provider: str) -> str:
-    """The environment variable a provider's key is read from."""
+    """The environment variable a provider's key is read from.
+
+    Args:
+        provider: A registered provider name.
+
+    Returns:
+        ``OPTENGINE_API_KEY_<PROVIDER>``, upper-cased. One convention for
+        every provider, so there is nothing per-provider to remember.
+    """
     slug = re.sub(r"[^A-Za-z0-9]+", "_", str(provider)).strip("_").upper()
     return f"{_ENV_PREFIX}{slug}"
 
@@ -136,9 +144,15 @@ def resolve_api_key(provider: str, explicit: str | None = None) -> str | None:
 def mask(secret: str | None) -> str:
     """Render a secret as something safe to print.
 
-    Short secrets are fully masked rather than partially revealed: seven
-    characters is a fifth of a 40-character token and most of a nine-character
-    one, so anything under :data:`_MIN_LENGTH_TO_HINT` gets no hint at all.
+    Args:
+        secret: The value to mask, or ``None``.
+
+    Returns:
+        A masked string that never reveals enough to reconstruct the secret.
+        Short secrets are fully masked rather than partially revealed: seven
+        characters is a fifth of a 40-character token and most of a
+        nine-character one, so anything under :data:`_MIN_LENGTH_TO_HINT` gets
+        no hint at all.
     """
     if not secret:
         return "—"
@@ -175,6 +189,12 @@ class KeyStatus:
 
     @property
     def label(self) -> str:
+        """A one-line status safe to print, log or render.
+
+        Returns:
+            Whether a key is needed, set, or malformed — never the key itself, nor
+            any part of it. This is what ``optengine providers`` shows.
+        """
         if not self.required:
             return "No key needed"
         if self.malformed:
@@ -188,6 +208,15 @@ def key_status(provider: str, *, required: bool, signup_url: str | None = None) 
     Never raises: this runs on every Streamlit rerun and on every
     ``optengine providers``, where a malformed key is something to report
     rather than something to crash on.
+
+    Args:
+        provider: A registered provider name.
+        required: Whether this provider needs a key at all.
+        signup_url: Where a user goes to get one, for the hint.
+
+    Returns:
+        A :class:`KeyStatus` saying whether the key is present, absent or
+        malformed — and carrying no part of the key itself.
     """
     try:
         key = resolve_api_key(provider)

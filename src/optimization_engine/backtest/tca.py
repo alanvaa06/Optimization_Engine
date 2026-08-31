@@ -81,6 +81,12 @@ class TcaPanel:
         return pd.DataFrame({"value": rows})
 
     def describe(self) -> str:
+        """One line: turnover, cost per unit of notional, and annualized drag.
+
+        Returns:
+            A sentence, or a statement that there is no cost to analyze when the
+            run never traded.
+        """
         if self.cost_bps_of_notional is None:
             return "No trades were executed; there is no cost to analyze."
         drag = (
@@ -99,6 +105,14 @@ def compute_tca(run: RunResult) -> TcaPanel:
 
     Sums are accumulated over the frames in their canonical order so the
     panel is reproducible for a given run, in the same way the result hash is.
+
+    Args:
+        run: The finished run to analyze.
+
+    Returns:
+        A :class:`TcaPanel` with turnover, cost per unit of notional, cost per
+        rebalance and the annualized drag. Every ratio is ``None`` rather than
+        zero when the run never traded.
     """
     reasons: dict[str, str] = {}
     commission = 0.0
@@ -170,6 +184,13 @@ def cost_by_asset(run: RunResult) -> pd.DataFrame:
     Concentrated cost is usually a liquidity story: one illiquid position
     being rebalanced against, over and over, by an optimizer that has no idea
     it is expensive.
+
+    Args:
+        run: The finished run to analyze.
+
+    Returns:
+        One row per traded asset with its turnover, its total cost as a
+        fraction of NAV, and its share of the run's whole cost.
     """
     if run.trades.empty:
         return pd.DataFrame(

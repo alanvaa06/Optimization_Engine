@@ -25,7 +25,19 @@ def yahoo_cache_key(
     end: str | None,
     interval: str,
 ) -> tuple[Hashable, ...]:
-    """Build a stable key for the Yahoo inputs that define a price download."""
+    """Build a stable key for the Yahoo inputs that define a price download.
+
+    Args:
+        tickers: The universe requested.
+        period: The lookback shorthand, e.g. ``"5y"``.
+        start: Explicit start date, or ``None``.
+        end: Explicit end date, or ``None``.
+        interval: The bar size, e.g. ``"1d"``.
+
+    Returns:
+        A hashable tuple. Two calls that would download the same data produce
+        the same key.
+    """
     return (tuple(tickers), period, start, end, interval)
 
 
@@ -36,7 +48,20 @@ def yahoo_prices_for_rerun(
     state: MutableMapping[str, object],
     fetch_prices: Callable[[], pd.DataFrame],
 ) -> pd.DataFrame | None:
-    """Return fetched Yahoo prices, reusing them after Streamlit button reruns."""
+    """Return fetched Yahoo prices, reusing them after Streamlit button reruns.
+
+    Args:
+        fetch_clicked: Whether the user pressed fetch on this rerun.
+        cache_key: The key from :func:`yahoo_cache_key`.
+        state: The session state to read and write through.
+        fetch_prices: Called to perform the download when there is nothing
+            usable cached.
+
+    Returns:
+        The price panel, or ``None`` when nothing has been fetched yet.
+        Streamlit reruns the whole script on every interaction, so without
+        this a fetch would repeat on each click.
+    """
     cached = state.get(YAHOO_PRICES_CACHE_KEY)
     if (
         not fetch_clicked
@@ -112,6 +137,13 @@ def derive_widget_state(method_name: str) -> dict[str, dict[str, object]]:
     """Map widget keys to enabled/tooltip state for the given optimizer.
 
     Pure function — used by the Streamlit app and easy to unit-test.
+
+    Args:
+        method_name: The optimizer the form is configuring.
+
+    Returns:
+        ``widget key -> {"disabled": bool, "help": str}``, so the form can
+        grey out and explain every input the chosen method ignores.
     """
     req: MethodRequirements = requirements_for(method_name)
     extra_keys = {e.key for e in req.extras}
@@ -239,6 +271,12 @@ class LayerPreset:
     help: str = ""
 
     def __post_init__(self) -> None:
+        """Give the preset an empty limits map when none was supplied.
+
+        A mutable default cannot be declared on the field itself, and a preset
+        with no limits is the ordinary case: it names buckets and leaves the
+        numbers to whoever applies it.
+        """
         if self.limits is None:
             self.limits = {}
 
@@ -292,6 +330,17 @@ LAYER_PRESETS: tuple[LayerPreset, ...] = (
 
 
 def preset_by_label(label: str) -> LayerPreset:
+    """Look up a layer preset by the label the UI shows.
+
+    Args:
+        label: The preset's display label.
+
+    Returns:
+        The matching :class:`LayerPreset`.
+
+    Raises:
+        KeyError: If no preset carries that label.
+    """
     for preset in LAYER_PRESETS:
         if preset.label == label:
             return preset
@@ -307,7 +356,16 @@ def assignment_from_source(
 ) -> dict:
     """Seed a layer's ``asset -> bucket`` map from data the app already has.
 
-    Returns an empty-ish map (everything unassigned) for ``"manual"``.
+    Args:
+        source: Where to seed from — the currency map, the existing group
+            map, or ``"manual"``.
+        assets: The universe to assign.
+        currencies: ``asset -> ISO code``, for the currency source.
+        base_currency: Which code counts as local.
+        groups: ``asset -> group``, for the group source.
+
+    Returns:
+        ``asset -> bucket``, everything unassigned for ``"manual"``.
     """
     currencies = dict(currencies or {})
     groups = dict(groups or {})
@@ -336,7 +394,21 @@ def new_layer_state(
     existing_names: Sequence[str] = (),
     uid: int = 0,
 ) -> dict:
-    """Build the editable session-state dict for a new layer from a preset."""
+    """Build the editable session-state dict for a new layer from a preset.
+
+    Args:
+        preset: The preset to start from.
+        assets: The universe to assign.
+        currencies: ``asset -> ISO code``, when the preset seeds from currency.
+        base_currency: Which code counts as local.
+        groups: ``asset -> group``, when the preset seeds from groups.
+        existing_names: Names already taken, so the new layer gets a distinct
+            one.
+        uid: A unique id, used to key the layer's Streamlit widgets.
+
+    Returns:
+        The editor state for one layer.
+    """
     assignments = assignment_from_source(
         preset.source, assets, currencies, base_currency, groups
     )
@@ -366,6 +438,13 @@ def unique_layer_name(name: str, existing: Sequence[str]) -> str:
 
     Layer names are how a relative layer points at its parent, so two layers
     sharing one is not a cosmetic problem.
+
+    Args:
+        name: The desired name.
+        existing: Names already taken.
+
+    Returns:
+        ``name`` itself, or it with a numeric suffix.
     """
     taken = {str(n) for n in existing}
     if name not in taken:
@@ -380,9 +459,15 @@ def unique_layer_name(name: str, existing: Sequence[str]) -> str:
 def sync_layer_state(state: Mapping, assets: Sequence[str]) -> dict:
     """Reconcile a layer's state with the current universe and bucket list.
 
-    Assets that left the panel are dropped, new ones arrive unassigned, and an
-    assignment pointing at a bucket the user has since renamed away falls back
-    to unassigned rather than silently constraining nothing.
+    Args:
+        state: The layer's editor state.
+        assets: The current universe.
+
+    Returns:
+        A new state in which assets that left the panel are dropped, new ones
+        arrive unassigned, and an assignment pointing at a bucket the user has
+        since renamed away falls back to unassigned rather than silently
+        constraining nothing.
     """
     buckets = [str(b) for b in state.get("buckets", []) if str(b).strip()]
     buckets = list(dict.fromkeys(buckets))
@@ -407,10 +492,14 @@ def sync_layer_state(state: Mapping, assets: Sequence[str]) -> dict:
 def layer_state_to_layer(state: Mapping) -> ConstraintLayer | None:
     """Convert one editor state into a :class:`ConstraintLayer`.
 
-    Returns ``None`` when the layer constrains nothing — no buckets, nothing
-    assigned, or every limit left at the full 0–100% range. A layer that binds
-    nothing is noise in the feasibility report and in the compliance panel, so
-    it is dropped rather than carried.
+    Args:
+        state: The layer's editor state.
+
+    Returns:
+        The layer, or ``None`` when it constrains nothing — no buckets,
+        nothing assigned, or every limit left at the full 0-100% range. A
+        layer that binds nothing is noise in the feasibility report and in the
+        compliance panel, so it is dropped rather than carried.
     """
     assignments = {
         a: b
@@ -441,7 +530,14 @@ def layer_state_to_layer(state: Mapping) -> ConstraintLayer | None:
 
 
 def layer_states_to_layers(states: Iterable[Mapping]) -> list[ConstraintLayer]:
-    """Every editor state that actually constrains something, in order."""
+    """Every editor state that actually constrains something, in order.
+
+    Args:
+        states: The editor states to convert.
+
+    Returns:
+        The layers that bind, with the ones that constrain nothing dropped.
+    """
     out = []
     for state in states or []:
         layer = layer_state_to_layer(state)
@@ -451,7 +547,15 @@ def layer_states_to_layers(states: Iterable[Mapping]) -> list[ConstraintLayer]:
 
 
 def layer_state_from_layer(layer: ConstraintLayer, uid: int = 0) -> dict:
-    """Round-trip a saved layer back into editor state."""
+    """Round-trip a saved layer back into editor state.
+
+    Args:
+        layer: The layer to load.
+        uid: A unique id, used to key the layer's Streamlit widgets.
+
+    Returns:
+        The editor state for it.
+    """
     buckets = layer.buckets()
     return {
         "uid": int(uid),
@@ -469,8 +573,15 @@ def layer_headroom(state: Mapping, assets: Sequence[str]) -> dict:
 
     The arithmetic an analyst gets wrong first: caps of 60/30/10 across every
     asset leave exactly no slack, and caps of 50/20/10 cannot reach 100% at
-    all. Returns ``{covers_all, cap_total, floor_total, unassigned}``; for a
-    relative layer the totals are shares of the parent instead.
+    all.
+
+    Args:
+        state: The layer's editor state.
+        assets: The current universe.
+
+    Returns:
+        ``{covers_all, cap_total, floor_total, unassigned}``. For a relative
+        layer the totals are shares of the parent instead of the book.
     """
     synced = sync_layer_state(state, assets)
     assignments = synced["assignments"]
@@ -493,6 +604,13 @@ def policy_table(layers: Sequence[ConstraintLayer], assets: Sequence[str]):
 
     This is the summary an allocator signs off on, so it states the limits in
     the units they were written in and says which layer each one belongs to.
+
+    Args:
+        layers: The policy to tabulate.
+        assets: The universe, for the member counts.
+
+    Returns:
+        One row per bucket with its layer, basis, limits and member count.
     """
     rows = []
     for layer in layers:

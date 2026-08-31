@@ -120,6 +120,20 @@ def rolling_relative(
     frame that says whether the outperformance was earned throughout or in a
     single regime — and whether the beta the portfolio is running today is the
     one the full-sample regression reports.
+
+    Args:
+        portfolio: The portfolio's return stream.
+        benchmark: The benchmark's, over the same dates.
+        window: Rolling window length, in periods. At least 2.
+        periods_per_year: Annualization basis for the excess return, the
+            tracking error and the information ratio.
+
+    Returns:
+        A frame indexed like the inputs, with one column per rolling metric
+        and NaN over the first ``window - 1`` rows.
+
+    Raises:
+        ValueError: If ``window`` is below 2.
     """
     if window < 2:
         raise ValueError(f"Rolling window must be at least 2 periods; got {window}.")
@@ -184,6 +198,12 @@ class PerformanceReport:
 
     @property
     def has_benchmark(self) -> bool:
+        """Whether this report carries benchmark-relative figures.
+
+        Returns:
+            ``True`` when a benchmark was resolved and the relative block was
+            computed. Every relative accessor returns ``nan`` when it is ``False``.
+        """
         return self.relative is not None
 
     def _abs(self, metric: str) -> float:
@@ -457,6 +477,23 @@ def compare_performance(
     Used by the comparison views, where the question is not "how did this do"
     but "which of these did better, and by how much against the same
     benchmark".
+
+    Args:
+        streams: ``label -> return stream``. The labels become the columns.
+        benchmark_returns: A common benchmark. When ``None``, only the
+            absolute statistics are computed.
+        periods_per_year: Annualization basis for every stream.
+        riskfree_rate: Per-period risk-free rate used by the ratio metrics.
+
+    Returns:
+        A frame with one row per statistic and one column per stream. With a
+        benchmark, the relative statistics are joined on with a ``" (rel)"``
+        suffix where a name would otherwise collide.
+
+    Raises:
+        ValueError: If ``streams`` is empty.
+        MissingDependencyError: If a benchmark is supplied and statsmodels is
+            not installed. Install it with ``finport-optengine[stats]``.
     """
     if not streams:
         raise ValueError("compare_performance needs at least one return stream.")

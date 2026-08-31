@@ -61,6 +61,11 @@ Thumbs.db
 # Claude Code — personal local settings (the team-shared ones live in .claude/settings.json)
 .claude/settings.local.json
 
+# Rendered API reference. Built from the docstrings by
+# `scripts/build_api_docs.py` and published by the docs workflow, so a copy
+# checked in here would only ever be a stale one.
+site/
+
 # Test / coverage
 .pytest_cache/
 .coverage

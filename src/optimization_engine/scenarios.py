@@ -44,6 +44,15 @@ class Scenario:
 
 
 def scenario_to_dict(s: Scenario) -> dict[str, Any]:
+    """One scenario as a plain, YAML-serializable dict.
+
+    Args:
+        s: The scenario to serialize.
+
+    Returns:
+        Its name, truncated notes, timestamps, and the full config dict.
+        Round-trips through :func:`scenario_from_dict`.
+    """
     return {
         "name": str(s.name),
         "notes": _truncate_notes(s.notes),
@@ -54,6 +63,18 @@ def scenario_to_dict(s: Scenario) -> dict[str, Any]:
 
 
 def scenario_from_dict(d: dict[str, Any]) -> Scenario:
+    """Rebuild a scenario from its serialized form.
+
+    Args:
+        d: A mapping as produced by :func:`scenario_to_dict`.
+
+    Returns:
+        The :class:`Scenario`.
+
+    Raises:
+        ValueError: If ``name`` or ``config`` is missing.
+        LayerConfigurationError: If the nested config's layers are malformed.
+    """
     if "name" not in d:
         raise ValueError("Scenario entry is missing required key 'name'.")
     if "config" not in d:
@@ -73,7 +94,15 @@ def scenario_from_dict(d: dict[str, Any]) -> Scenario:
 
 
 def dump_scenarios_yaml(scenarios: dict[str, Scenario]) -> str:
-    """Serialize a name→Scenario mapping into YAML text."""
+    """Serialize a name→Scenario mapping into YAML text.
+
+    Args:
+        scenarios: The scenarios to write, keyed by name.
+
+    Returns:
+        YAML carrying a ``schema_version`` and a ``scenarios`` list, in the
+        mapping's own order.
+    """
     payload = {
         "schema_version": SCHEMA_VERSION,
         "scenarios": [scenario_to_dict(scenarios[k]) for k in scenarios],
@@ -82,7 +111,19 @@ def dump_scenarios_yaml(scenarios: dict[str, Scenario]) -> str:
 
 
 def load_scenarios_yaml(text: str) -> dict[str, Scenario]:
-    """Parse a scenarios YAML string into a name→Scenario mapping."""
+    """Parse a scenarios YAML string into a name→Scenario mapping.
+
+    Args:
+        text: The YAML document.
+
+    Returns:
+        The scenarios, keyed by name, in the document's order.
+
+    Raises:
+        ValueError: If the payload is not a mapping, carries an unsupported
+            ``schema_version``, has a ``scenarios`` key that is not a list or
+            whose entries are not mappings, or names the same scenario twice.
+    """
     data = yaml.safe_load(text) or {}
     if not isinstance(data, dict):
         raise ValueError("Top-level YAML payload must be a mapping.")
@@ -107,7 +148,15 @@ def load_scenarios_yaml(text: str) -> dict[str, Scenario]:
 
 
 def save_scenarios(scenarios: dict[str, Scenario], path: str | Path) -> None:
-    """Persist scenarios to a YAML or JSON file."""
+    """Persist scenarios to a YAML or JSON file.
+
+    Args:
+        scenarios: The scenarios to write, keyed by name.
+        path: Destination. The format follows the extension.
+
+    Raises:
+        ValueError: If the extension is neither YAML nor JSON.
+    """
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
     if p.suffix.lower() in {".yaml", ".yml"}:
@@ -123,7 +172,20 @@ def save_scenarios(scenarios: dict[str, Scenario], path: str | Path) -> None:
 
 
 def load_scenarios(path: str | Path) -> dict[str, Scenario]:
-    """Load scenarios from a YAML or JSON file."""
+    """Load scenarios from a YAML or JSON file.
+
+    Args:
+        path: The file to read. The parser follows the extension.
+
+    Returns:
+        The scenarios, keyed by name, in the file's order.
+
+    Raises:
+        ValueError: If the extension is neither YAML nor JSON, the JSON
+            payload is not an object, the ``schema_version`` is unsupported,
+            or the same scenario is named twice.
+        FileNotFoundError: If the path does not exist.
+    """
     p = Path(path)
     text = p.read_text(encoding="utf-8")
     if p.suffix.lower() in {".yaml", ".yml"}:
@@ -159,6 +221,19 @@ def rename_scenario(
 
     Preserves insertion order, refuses collisions, and (by default) bumps
     ``updated_at``.
+
+    Args:
+        scenarios: The mapping to rename within. It is not mutated.
+        old: The existing name.
+        new: The new name.
+        touch: Bump the renamed scenario's ``updated_at`` timestamp.
+
+    Returns:
+        A new mapping with the rename applied, in the original order.
+
+    Raises:
+        KeyError: If ``old`` names no scenario.
+        ValueError: If ``new`` is empty, or already taken.
     """
     if old not in scenarios:
         raise KeyError(f"No scenario named {old!r}")
@@ -181,7 +256,18 @@ def rename_scenario(
 
 
 def delete_scenario(scenarios: dict[str, Scenario], name: str) -> dict[str, Scenario]:
-    """Return a new dict with ``name`` removed."""
+    """Return a new dict with ``name`` removed.
+
+    Args:
+        scenarios: The mapping to delete from. It is not mutated.
+        name: The scenario to remove.
+
+    Returns:
+        A new mapping without it, in the original order.
+
+    Raises:
+        KeyError: If ``name`` names no scenario.
+    """
     if name not in scenarios:
         raise KeyError(f"No scenario named {name!r}")
     return {k: v for k, v in scenarios.items() if k != name}
@@ -193,11 +279,30 @@ def delete_scenario(scenarios: dict[str, Scenario], name: str) -> dict[str, Scen
 
 
 def config_signature(cfg: EngineConfig) -> str:
-    """JSON signature of an EngineConfig, stable across dict insertion order."""
+    """JSON signature of an EngineConfig, stable across dict insertion order.
+
+    Args:
+        cfg: The configuration to sign.
+
+    Returns:
+        Key-sorted JSON. Two configurations describing the same mandate
+        produce the same string, whatever order their dicts were built in.
+    """
     return json.dumps(cfg.to_dict(), sort_keys=True, default=str)
 
 
 def scenario_signature(scn: Scenario) -> str:
+    """A stable signature of the scenario's configuration.
+
+    Args:
+        scn: The scenario to sign.
+
+    Returns:
+        The JSON signature of its config, insensitive to dict insertion order,
+        so two scenarios describing the same mandate compare equal. Notes,
+        name and timestamps are deliberately outside it: renaming a scenario
+        does not make it a different one.
+    """
     return config_signature(scn.config)
 
 

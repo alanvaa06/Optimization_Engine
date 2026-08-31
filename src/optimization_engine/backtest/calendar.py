@@ -21,6 +21,13 @@ def rebalance_dates(
     The first date is always included: that is the initial purchase, which
     happens whatever the cadence.
 
+    Args:
+        index: The simulation's date index.
+        frequency: The cadence, e.g. ``"monthly"`` or ``"none"``.
+
+    Returns:
+        The subset of ``index`` on which a target is set.
+
     Raises:
         ValueError: If the frequency is not one the runner understands.
     """
@@ -53,7 +60,16 @@ def execution_positions(
     A decision taken on a date that leaves fewer than ``execution_lag``
     periods of history behind it is dropped, not clamped to the last date:
     an order that could not be filled inside the sample was not filled.
-    Returns ``{decision position: execution position}``.
+
+    Args:
+        index: The simulation's date index.
+        decision_dates: The dates on which targets are chosen.
+        execution_lag: How many periods pass between deciding and trading.
+            ``1`` is the desk's default — you do not trade on a close you have
+            not seen.
+
+    Returns:
+        ``{decision position: execution position}``, both indexing ``index``.
     """
     positions: dict[int, int] = {}
     lookup = {date: pos for pos, date in enumerate(index)}

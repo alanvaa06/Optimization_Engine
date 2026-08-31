@@ -192,6 +192,13 @@ def describe_optimizer(name: str) -> dict[str, Any]:
     Args:
         name: An optimizer name, e.g. ``"risk_parity"``. Use
             ``list_optimizers`` if you are unsure.
+
+    Returns:
+        What the method requires, what it supports, and what it assumes.
+
+    Raises:
+        ToolError: If no optimizer carries that name. The message lists the
+            available ones.
     """
     from optimization_engine.optimizers.factory import available_optimizers
     from optimization_engine.optimizers.requirements import requirements_for
@@ -293,6 +300,10 @@ def optimize(
         Weights under ``weights``, and the evidence under ``diagnostics``,
         ``covariance`` and ``feasibility``. Reporting the weights alone
         discards what distinguishes this engine.
+
+    Raises:
+        ToolError: If the mandate has no solution. The message carries the
+            feasibility report naming the binding constraint.
     """
     from optimization_engine.engine import run_engine
     from optimization_engine.optimizers.feasibility import InfeasibleConstraintsError

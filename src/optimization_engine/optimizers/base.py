@@ -78,6 +78,16 @@ class PortfolioConstraints:
     def __post_init__(self) -> None:
         # Accept the mapping form a YAML round-trip produces, so a config
         # loaded from disk and one built in memory behave identically.
+        """Coerce the constraint layers into their canonical form.
+
+        A YAML round-trip produces mappings where the in-memory form has
+        :class:`~optimization_engine.constraints.ConstraintLayer` objects. Coercing
+        here is what makes a config loaded from disk and one built in memory
+        behave identically.
+
+        Raises:
+            LayerConfigurationError: If any layer entry is malformed.
+        """
         self.constraint_layers = coerce_layers(self.constraint_layers)
 
     @property
@@ -105,10 +115,15 @@ class PortfolioConstraints:
     def benchmark_vector(self, assets: list[str]) -> np.ndarray | None:
         """The benchmark's weights aligned to ``assets``, or None if unset.
 
-        Assets the benchmark does not name are held at zero — for a benchmark
-        that is a *subset* of the investable universe that is exactly right,
-        and it is the only reading that lets a manager hold something the
-        index does not.
+        Args:
+            assets: The universe, in the order the solve indexes it.
+
+        Returns:
+            A weight array aligned to ``assets``, or ``None`` when no benchmark
+            weights are set. Assets the benchmark does not name are held at
+            zero — for a benchmark that is a *subset* of the investable universe
+            that is exactly right, and it is the only reading that lets a manager
+            hold something the index does not.
         """
         if not self.benchmark_weights:
             return None
@@ -124,6 +139,15 @@ class PortfolioConstraints:
         ``long_only`` is applied here rather than as a separate constraint so
         that every consumer — the CVXPY builder, the projection helpers and
         the post-solve checker — sees exactly the same box.
+
+        Args:
+            asset: The asset to resolve.
+            default: Bounds to fall back on when the mandate names none.
+                ``None`` uses the mandate's own global default.
+
+        Returns:
+            A ``(min, max)`` pair in weight units, with the long-only floor
+            already applied.
         """
         if asset in self.bounds:
             lo, hi = self.bounds[asset]
@@ -156,6 +180,13 @@ class OptimizationResult:
 
     @property
     def solver_status(self) -> str:
+        """The solver's own verdict, or ``"unknown"`` when none was recorded.
+
+        Returns:
+            Typically ``"optimal"`` or ``"optimal_inaccurate"``. An inaccurate
+            status is a usable answer the solver is not confident in, and it is
+            reported rather than hidden.
+        """
         return str(self.extras.get("solver_status", "unknown"))
 
     @property
@@ -165,9 +196,24 @@ class OptimizationResult:
 
     @property
     def is_compliant(self) -> bool:
+        """Whether the solved weights breach no constraint.
+
+        Returns:
+            ``True`` when :attr:`violations` is empty. A solver can return an
+            answer that violates a constraint within its own tolerance, which is
+            why this is checked after the solve rather than assumed from it.
+        """
         return not self.violations
 
     def as_dict(self) -> dict[str, Any]:
+        """This result as a flat, JSON-serializable mapping.
+
+        Returns:
+            The weights as an ``asset -> weight`` dict, the three summary
+            statistics as floats, and every diagnostic in :attr:`extras` merged in
+            at the top level. This is what the CLI's ``--json`` payload is built
+            from.
+        """
         return {
             "weights": self.weights.to_dict(),
             "expected_return": float(self.expected_return),
@@ -200,6 +246,22 @@ class BaseOptimizer(ABC):
         constraints: PortfolioConstraints | None = None,
         risk_free_rate: float = 0.0,
     ) -> None:
+        """Store the inputs a solve will run against.
+
+        None of them is validated here: the factory checks what each method
+        requires, and the feasibility analysis checks whether the mandate can be
+        satisfied at all.
+
+        Args:
+            expected_returns: Per-asset expected returns, in the same periodicity
+                as the covariance. Optional for methods that do not use them.
+            cov_matrix: Asset covariance, indexed and columned by asset name.
+            constraints: The mandate. Defaults to an unconstrained long-only book
+                summing to one.
+            risk_free_rate: Per-period risk-free rate, in the same periodicity as
+                the inputs. Used by the Sharpe-based objectives and reported in
+                the result's summary statistics.
+        """
         self.expected_returns = expected_returns
         self.cov_matrix = cov_matrix
         self.constraints = constraints or PortfolioConstraints()
@@ -209,6 +271,16 @@ class BaseOptimizer(ABC):
 
     @property
     def assets(self) -> list[str]:
+        """The universe this optimizer will solve over, in column order.
+
+        Returns:
+            The covariance matrix's columns when there is one, and the expected
+            returns' index otherwise.
+
+        Raises:
+            ValueError: If neither input was supplied, so there is no universe to
+                infer.
+        """
         if self.cov_matrix is not None:
             return list(self.cov_matrix.columns)
         if self.expected_returns is not None:
@@ -219,7 +291,23 @@ class BaseOptimizer(ABC):
     def _solve(self) -> np.ndarray: ...
 
     def optimize(self) -> OptimizationResult:
-        """Solve, validate, and package the allocation with its diagnostics."""
+        """Solve, validate, and package the allocation with its diagnostics.
+
+        Returns:
+            An :class:`OptimizationResult` carrying the weights, the three summary
+            statistics, and every diagnostic the solve produced — the solver that
+            answered, its status, and any constraint the answer breaches. A
+            breach is reported here rather than raised: the caller decides whether
+            a violation within solver tolerance is acceptable.
+
+        Raises:
+            RuntimeError: If the solve produced non-finite weights, which means
+                the problem is unbounded or numerically degenerate.
+            SolverFailure: If no solver in the fallback chain returned a usable
+                solution.
+            InfeasibleBoundsError: If the projection step cannot reconcile the
+                bounds with the budget.
+        """
         weights = self._solve()
         weights = np.asarray(weights, dtype=float).flatten()
         if not np.isfinite(weights).all():

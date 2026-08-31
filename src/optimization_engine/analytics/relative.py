@@ -30,7 +30,17 @@ sm = LazyModule("statsmodels.api", extra="stats", purpose="OLS regression metric
 def spread(
     series_1: pd.Series | pd.DataFrame, series_2: pd.Series | pd.DataFrame
 ) -> pd.DataFrame | pd.Series:
-    """Arithmetic difference of two aligned return streams."""
+    """Arithmetic difference of two aligned return streams.
+
+    Args:
+        series_1: The stream to subtract from.
+        series_2: The stream to subtract.
+
+    Returns:
+        ``series_1 - series_2`` over their common dates. Note this is an
+        arithmetic difference of returns, not a relative return: for a
+        compounding view of "how far behind" see :func:`relative_drawdown`.
+    """
     if isinstance(series_2, pd.DataFrame):
         series_2 = series_2.iloc[:, 0]
     if isinstance(series_1, pd.DataFrame):
@@ -90,17 +100,44 @@ def _geometric_capture(
 
 
 def up_capture(r: pd.Series | pd.DataFrame, rb: pd.Series | pd.DataFrame) -> pd.Series:
-    """Geometric up-capture: share of the benchmark's gains that was captured."""
+    """Geometric up-capture: share of the benchmark's gains that was captured.
+
+    Args:
+        r: Portfolio returns — a stream, or a frame of them.
+        rb: Benchmark returns, over the same dates.
+
+    Returns:
+        One ratio per column of ``r``, computed only over the periods in which
+        the benchmark rose. Above 1 means the portfolio outran the index on
+        the way up.
+    """
     return _geometric_capture(r, rb, upside=True)
 
 
 def down_capture(r: pd.Series | pd.DataFrame, rb: pd.Series | pd.DataFrame) -> pd.Series:
-    """Geometric down-capture: share of the benchmark's losses that was taken."""
+    """Geometric down-capture: share of the benchmark's losses that was taken.
+
+    Args:
+        r: Portfolio returns — a stream, or a frame of them.
+        rb: Benchmark returns, over the same dates.
+
+    Returns:
+        One ratio per column of ``r``, computed only over the periods in which
+        the benchmark fell. Below 1 is the good direction here.
+    """
     return _geometric_capture(r, rb, upside=False)
 
 
 def capture_ratio(r: pd.Series | pd.DataFrame, rb: pd.Series | pd.DataFrame) -> pd.Series:
-    """Up-capture over down-capture. Above 1 is the asymmetry worth paying for."""
+    """Up-capture over down-capture. Above 1 is the asymmetry worth paying for.
+
+    Args:
+        r: Portfolio returns — a stream, or a frame of them.
+        rb: Benchmark returns, over the same dates.
+
+    Returns:
+        One value per column of ``r``.
+    """
     return up_capture(r, rb) / down_capture(r, rb)
 
 
@@ -112,13 +149,24 @@ def regression_stats(
 ) -> pd.DataFrame:
     """Full CAPM regression of each column on the benchmark.
 
-    Returns alpha (annualized), beta, the t-statistic of alpha, R², and
-    residual (idiosyncratic) volatility.
-
     Beta on its own says how much market exposure a portfolio carries; it says
     nothing about whether the rest of the return was skill or noise. The alpha
     t-statistic and R² are what turn a number into a claim: an alpha of 2%
     with a t-stat of 0.4 has not been demonstrated.
+
+    Args:
+        r: Portfolio returns — a stream, or a frame of them.
+        rb: Benchmark returns, over the same dates.
+        riskfree_rate: Annualized risk-free rate, as a fraction.
+        periods_per_year: Annualization basis — 252 for daily, 12 for monthly.
+
+    Returns:
+        One row per column of ``r`` with the annualized alpha, beta, the
+        t-statistic of alpha, R², and residual (idiosyncratic) volatility.
+
+    Raises:
+        MissingDependencyError: If statsmodels is not installed. Install it
+            with ``finport-optengine[stats]``.
     """
     frame, bench = _aligned(r, rb)
     rf = (1 + riskfree_rate) ** (1 / periods_per_year) - 1
@@ -143,7 +191,19 @@ def regression_stats(
 
 
 def beta(r: pd.Series | pd.DataFrame, rb: pd.Series | pd.DataFrame) -> pd.Series:
-    """OLS beta of each column of ``r`` against benchmark ``rb``."""
+    """OLS beta of each column of ``r`` against benchmark ``rb``.
+
+    Args:
+        r: Portfolio returns — a stream, or a frame of them.
+        rb: Benchmark returns, over the same dates.
+
+    Returns:
+        One value per column of ``r``.
+
+    Raises:
+        MissingDependencyError: If statsmodels is not installed. Install it
+            with ``finport-optengine[stats]``.
+    """
     frame, bench = _aligned(r, rb)
     x = sm.add_constant(bench.rename("benchmark"))
     out = {
@@ -161,6 +221,17 @@ def conditional_beta(
     A portfolio with the same beta in both directions is symmetric; one whose
     down-beta exceeds its up-beta is the shape investors dislike most, and a
     single full-sample beta averages the two into silence.
+
+    Args:
+        r: Portfolio returns — a stream, or a frame of them.
+        rb: Benchmark returns, over the same dates.
+
+    Returns:
+        One row per column of ``r``, with an up-beta and a down-beta column.
+
+    Raises:
+        MissingDependencyError: If statsmodels is not installed. Install it
+            with ``finport-optengine[stats]``.
     """
     frame, bench = _aligned(r, rb)
     rows: dict[str, dict[str, float]] = {}
@@ -184,7 +255,17 @@ def tracking_error(
     rb: pd.Series | pd.DataFrame,
     periods_per_year: int = 252,
 ) -> pd.Series | float:
-    """Annualized volatility of the return difference versus the benchmark."""
+    """Annualized volatility of the return difference versus the benchmark.
+
+    Args:
+        r: Portfolio returns — a stream, or a frame of them.
+        rb: Benchmark returns, over the same dates.
+        periods_per_year: Annualization basis — 252 for daily, 12 for monthly.
+
+    Returns:
+        Annualized tracking error as a fraction. One value per column of
+        ``r``.
+    """
     frame, bench = _aligned(r, rb)
     return annualize_volatility(frame.sub(bench, axis=0), periods_per_year)
 
@@ -199,6 +280,14 @@ def information_ratio(
     That is the industry convention, and it is worth knowing it is a mismatch:
     over long, volatile samples the two conventions can differ by enough to
     move an IR by a tenth.
+
+    Args:
+        r: Portfolio returns — a stream, or a frame of them.
+        rb: Benchmark returns, over the same dates.
+        periods_per_year: Annualization basis — 252 for daily, 12 for monthly.
+
+    Returns:
+        One value per column of ``r``.
     """
     frame, bench = _aligned(r, rb)
     ann_excess = annualize_returns(frame, periods_per_year) - annualize_returns(
@@ -218,6 +307,13 @@ def batting_average(
     10 and still post a strong IR because the 4 were large. Reported next to
     :func:`up_down_number_ratio` so the reader can see which of the two
     stories the excess return is telling.
+
+    Args:
+        r: Portfolio returns — a stream, or a frame of them.
+        rb: Benchmark returns, over the same dates.
+
+    Returns:
+        A fraction in ``[0, 1]``, one per column of ``r``.
     """
     frame, bench = _aligned(r, rb)
     diff = frame.sub(bench, axis=0)
@@ -235,6 +331,14 @@ def up_down_number_ratio(
     Capture ratios are magnitudes; these are counts. A manager can post a
     flattering down-capture from a single well-timed month while having lost
     to the benchmark in most of the others, and only the count reveals it.
+
+    Args:
+        r: Portfolio returns — a stream, or a frame of them.
+        rb: Benchmark returns, over the same dates.
+
+    Returns:
+        One row per column of ``r``, with the share of rising and of falling
+        benchmark periods in which the portfolio came out ahead.
     """
     frame, bench = _aligned(r, rb)
     diff = frame.sub(bench, axis=0)
@@ -267,6 +371,19 @@ def treynor_ratio(
     instead, so it ranks portfolios by the return earned on the market
     exposure alone — the right comparison for a sleeve inside a larger book,
     the wrong one for a standalone allocation.
+
+    Args:
+        r: Portfolio returns — a stream, or a frame of them.
+        rb: Benchmark returns, over the same dates.
+        riskfree_rate: Annualized risk-free rate, as a fraction.
+        periods_per_year: Annualization basis — 252 for daily, 12 for monthly.
+
+    Returns:
+        One value per column of ``r``.
+
+    Raises:
+        MissingDependencyError: If statsmodels is not installed. Install it
+            with ``finport-optengine[stats]``.
     """
     frame, bench = _aligned(r, rb)
     betas = beta(frame, bench)
@@ -288,6 +405,16 @@ def m_squared(
     the Sharpe ratio — the ranking is identical — but in percentage points
     rather than in ratio units, which is what makes it answerable: "this
     portfolio earned 1.8% a year more than the index at the same risk".
+
+    Args:
+        r: Portfolio returns — a stream, or a frame of them.
+        rb: Benchmark returns, over the same dates.
+        riskfree_rate: Annualized risk-free rate, as a fraction.
+        periods_per_year: Annualization basis — 252 for daily, 12 for monthly.
+
+    Returns:
+        An annualized return as a fraction, one per column of ``r``. Compare
+        it against the benchmark's own annualized return.
     """
     frame, bench = _aligned(r, rb)
     sr = sharpe_ratio(frame, riskfree_rate, periods_per_year)
@@ -307,6 +434,19 @@ def appraisal_ratio(
     ratio divides excess return by total tracking error — which includes any
     deliberate beta tilt — this isolates the part of the deviation that the
     benchmark cannot explain at all.
+
+    Args:
+        r: Portfolio returns — a stream, or a frame of them.
+        rb: Benchmark returns, over the same dates.
+        riskfree_rate: Annualized risk-free rate, as a fraction.
+        periods_per_year: Annualization basis — 252 for daily, 12 for monthly.
+
+    Returns:
+        One value per column of ``r``.
+
+    Raises:
+        MissingDependencyError: If statsmodels is not installed. Install it
+            with ``finport-optengine[stats]``.
     """
     stats = regression_stats(r, rb, riskfree_rate, periods_per_year)
     return pd.Series(
@@ -318,7 +458,15 @@ def appraisal_ratio(
 def excess_returns(
     r: pd.Series | pd.DataFrame, rb: pd.Series | pd.DataFrame
 ) -> pd.DataFrame:
-    """Per-period portfolio-minus-benchmark returns, on their common dates."""
+    """Per-period portfolio-minus-benchmark returns, on their common dates.
+
+    Args:
+        r: Portfolio returns — a stream, or a frame of them.
+        rb: Benchmark returns, over the same dates.
+
+    Returns:
+        A frame indexed by the shared dates, one column per column of ``r``.
+    """
     frame, bench = _aligned(r, rb)
     return frame.sub(bench, axis=0)
 
@@ -333,6 +481,15 @@ def relative_drawdown(
     drawdown of the excess return — that would compound a difference of
     returns as if it were a return — but the drawdown of the ratio of the two
     wealth curves, which is what "behind by 8% since 2022" means.
+
+    Args:
+        r: Portfolio returns — a stream, or a frame of them.
+        rb: Benchmark returns, over the same dates.
+
+    Returns:
+        A frame indexed by the shared dates, one column per column of ``r``,
+        zero whenever the portfolio is at a new high against the benchmark and
+        negative below it.
     """
     frame, bench = _aligned(r, rb)
     bench_wealth = (1.0 + bench).cumprod()
@@ -351,6 +508,22 @@ def relative_summary_extras(
     Kept separate from :func:`summary_relative` so the headline table stays
     short enough to read at a glance, and so a caller that wants everything
     can ask for it explicitly.
+
+    Args:
+        r: Portfolio returns — a stream, or a frame of them.
+        rb: Benchmark returns, over the same dates.
+        riskfree_rate: Annualized risk-free rate, as a fraction.
+        periods_per_year: Annualization basis — 252 for daily, 12 for monthly.
+
+    Returns:
+        One row per column of ``r`` with the batting average, Treynor ratio,
+        M², appraisal ratio, correlation to the benchmark, downside tracking
+        error, worst relative drawdown, the probability that the excess
+        return is positive, and the up/down outperformance counts.
+
+    Raises:
+        MissingDependencyError: If statsmodels is not installed. Install it
+            with ``finport-optengine[stats]``.
     """
     frame, bench = _aligned(r, rb)
     diff = frame.sub(bench, axis=0)
@@ -397,6 +570,14 @@ def active_share(weights: pd.Series, benchmark_weights: pd.Series) -> float:
     0 means the portfolio is the benchmark; 1 means it shares no holding with
     it. Unlike tracking error, active share is computed from positions alone,
     so it cannot be flattered by a quiet market.
+
+    Args:
+        weights: Portfolio weights, as fractions of the book.
+        benchmark_weights: The benchmark's weights over the same universe.
+            Assets it does not hold count as zero.
+
+    Returns:
+        A fraction in ``[0, 1]`` for a long-only book.
     """
     assets = weights.index.union(benchmark_weights.index)
     w = weights.reindex(assets).fillna(0.0)

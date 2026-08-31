@@ -75,8 +75,19 @@ def fetch_fx_to_usd(
 ) -> pd.DataFrame:
     """Fetch X→USD rates from FRED for the given currencies.
 
-    Returns a DataFrame indexed by date with one column per currency.
-    USD itself is included as a constant ``1.0`` column for convenience.
+    Args:
+        currencies: ISO codes to fetch. See :func:`supported_currencies`.
+        start: First date to fetch. ``None`` takes FRED's own start.
+        end: Last date to fetch. ``None`` takes today.
+
+    Returns:
+        One column per currency, indexed by date, holding the multiplier that
+        converts one unit of that currency into USD. USD itself is included as
+        a constant ``1.0`` column.
+
+    Raises:
+        FXError: If a currency has no built-in FRED mapping, or the fetch
+            failed.
     """
     cleaned = _normalize_currencies(currencies)
     requested_usd = "USD" in cleaned
@@ -119,8 +130,21 @@ def fetch_fx_to_base(
 ) -> pd.DataFrame:
     """Fetch X→base rates by triangulating through USD.
 
-    Returns a DataFrame with one column per currency; ``base`` is
-    included as a constant 1.0 column. Indexed by date.
+    Args:
+        currencies: ISO codes to fetch. See :func:`supported_currencies` for
+            what the built-in FRED source can serve.
+        base: ISO code of the target currency.
+        start: First date to fetch. ``None`` takes FRED's own start.
+        end: Last date to fetch. ``None`` takes today.
+
+    Returns:
+        One column per currency, indexed by date, holding the multiplier that
+        converts one unit of that currency into ``base``. ``base`` itself is
+        included as a constant ``1.0`` column.
+
+    Raises:
+        FXError: If FRED returned nothing for the requested currencies, or the
+            base→USD leg could not be sourced.
     """
     base = base.upper()
     cleaned = _normalize_currencies(currencies)
@@ -155,20 +179,22 @@ def convert_prices_to_base(
     """Convert a multi-currency price panel into a single base currency.
 
     Args:
-        prices: Price panel (rows = dates, cols = assets). Index must
-            be a DatetimeIndex.
-        asset_currency: ``asset -> ISO currency code``. Assets missing
-            from this map are assumed to already be in ``base``.
+        prices: Price panel (rows = dates, cols = assets). The index must be a
+            ``DatetimeIndex``.
+        asset_currency: ``asset -> ISO currency code``. Assets missing from
+            this map are assumed to already be in ``base``.
         base: ISO code of the desired base currency.
-        fx_rates: Optional DataFrame of pre-fetched X→base rates. If
-            ``None``, this function fetches them from FRED for the
-            range of ``prices``.
-        fill: How to fill FX gaps when business-day calendars don't
-            align ("ffill" by default; pass ``None`` to skip).
+        fx_rates: Pre-fetched X→base rates. When ``None``, they are fetched
+            from FRED over the range of ``prices``.
+        fill: How to fill FX gaps when business-day calendars do not align
+            (``"ffill"`` by default; pass ``None`` to skip).
 
     Returns:
-        A new DataFrame, same shape as ``prices``, with values in
-        ``base`` currency.
+        A new frame of the same shape as ``prices``, valued in ``base``.
+
+    Raises:
+        FXError: If the price index is not a ``DatetimeIndex``, or a rate for
+            one of the panel's currencies is unavailable.
     """
     base = base.upper()
     if not isinstance(prices.index, pd.DatetimeIndex):
