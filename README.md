@@ -1,8 +1,8 @@
 # Optimization Engine
 
 A multi-asset portfolio optimization engine with a clean API, a Streamlit
-UI, and a CLI. Built on top of `cvxpy`, `scipy`, `pandas` and
-`scikit-learn`, with plotting, Excel and regression support behind
+UI, a CLI, and an MCP server. Built on top of `cvxpy`, `scipy`, `pandas`
+and `scikit-learn`, with plotting, Excel and regression support behind
 optional extras.
 
 The engine is opinionated about one thing: **an allocation is not a result
@@ -12,6 +12,17 @@ respected, how well-conditioned the covariance estimate was, how concentrated
 the book is in risk rather than capital, how much of the backtest survives out
 of sample, and how much of *that* survives the number of configurations you
 tried before settling on this one.
+
+> **New in 0.5.0 — the engine answers to agents as well as to people.**
+> There is an [MCP server](#mcp-server) exposing five tools, `--json` on
+> `optimize`, `backtest`, `check` and `describe`, and an
+> [`AGENTS.md`](https://github.com/alanvaa06/Optimization_Engine/blob/main/AGENTS.md)
+> written as an API map for coding agents. No optimizer or estimator changed
+> behaviour; one pre-flight bug did — `check` was validating a different
+> mandate from the one `optimize` went on to solve. Details in the
+> [release notes](https://github.com/alanvaa06/Optimization_Engine/releases/tag/v0.5.0)
+> and the
+> [changelog](https://github.com/alanvaa06/Optimization_Engine/blob/main/CHANGELOG.md).
 
 ```bash
 pip install finport-optengine
@@ -671,7 +682,7 @@ The parts most callers do not need are extras:
 | `mcp` | mcp | The MCP server, `optengine-mcp` (needs Python 3.10+) |
 | `data` | yfinance, pyarrow | The Yahoo provider, and Parquet panels |
 | `ui` | streamlit, ipywidgets, plotly | The Streamlit app |
-| `all` | everything above except `ui` | The CLI's worked examples |
+| `all` | everything above except `ui` and `mcp` | The CLI's worked examples |
 
 Reaching a feature whose extra is missing raises with the command that fixes
 it, rather than a bare `ModuleNotFoundError`. To run the CLI end to end:
@@ -683,7 +694,7 @@ pip install "finport-optengine[all]"
 For a source checkout, working on the engine itself:
 
 ```bash
-pip install -e ".[all,ui,dev]"
+pip install -e ".[all,ui,mcp,dev]"
 ```
 
 The import name stays `optimization_engine` and the console script stays
@@ -864,6 +875,105 @@ next to the out-of-sample one.
 
 `check` exits non-zero when the data has errors or the constraints have no
 solution, so it drops straight into CI or a pre-commit hook.
+
+Four commands take `--json`: `optimize`, `backtest`, `check` and `describe`.
+Human narration moves to stderr, so stdout is exactly one parseable document
+and a pipeline can act on a result without scraping a formatted table.
+
+```bash
+optengine describe risk_parity --json | jq '{name, requires, supports}'
+```
+
+```json
+{
+  "name": "risk_parity",
+  "requires": {
+    "expected_returns": false,
+    "covariance": true,
+    "return_history": false,
+    "benchmark": false
+  },
+  "supports": {
+    "target_return": false,
+    "target_volatility": false,
+    "risk_aversion": false,
+    "risk_free_rate": false,
+    "group_bounds": true,
+    "frontier": false,
+    "turnover": false,
+    "benchmark_limits": false
+  }
+}
+```
+
+Read `describe --json` before building a config. `supports.turnover` false
+means a turnover budget is *ignored*, not rejected, and nothing will tell you
+at runtime.
+
+Every payload carries `schema_version`, so a consumer can refuse a major it
+does not know. A command that fails still emits JSON — an object with `error`
+and `exit_code` — whether it returned a code or raised, so a caller never has
+to distinguish "no output" from "output I could not parse". The builders are
+importable at `optimization_engine.reporting.payloads` if you are in-process
+rather than shelling out.
+
+### MCP server
+
+For agents that call tools rather than write code. `optengine-mcp` speaks the
+[Model Context Protocol](https://modelcontextprotocol.io) over stdio.
+
+```bash
+pip install "finport-optengine[mcp]"   # needs Python 3.10+
+optengine-mcp                          # speaks stdio; narration on stderr
+```
+
+Register it by pointing a client at the console script. Claude Code takes it
+from the command line:
+
+```bash
+claude mcp add optimization-engine -- optengine-mcp
+```
+
+Any client reading a JSON config — Claude Desktop's
+`claude_desktop_config.json`, and most others — takes the same server as:
+
+```json
+{
+  "mcpServers": {
+    "optimization-engine": {
+      "command": "optengine-mcp"
+    }
+  }
+}
+```
+
+If the client cannot see your PATH, give the absolute path to the script
+instead — `/path/to/venv/bin/optengine-mcp`.
+
+Five tools:
+
+| Tool | What it answers |
+| --- | --- |
+| `list_optimizers` | Which methods exist, one line each. Start here when you don't yet know what a mandate needs |
+| `describe_optimizer` | What one method requires as input, and which constraints it will actually honour |
+| `check_mandate` | Can these constraints be satisfied at all; what return range is reachable; is the covariance conditioned well enough to optimize on |
+| `optimize` | Weights, plus which solver answered, whether the constraints held, and how concentrated the book is in risk rather than capital |
+| `backtest` | The process walked forward with commission, slippage and market impact, plus the hashes that identify the run |
+
+They return the same payloads as `--json`, built by the same module, so the
+two surfaces cannot drift apart. Pass `sample: true` for the built-in panel or
+`prices_path` for a file of prices; `config_path` takes the same YAML the CLI
+reads.
+
+Three of the five read filesystem paths — `config_path` and `prices_path`.
+None writes a file, fetches over the network, or touches a keyed provider. Solving blocks — a large solve is seconds of CPU
+and these tools are synchronous, so a client that looks hung is usually an
+optimizer working.
+
+Failures a tool anticipates come back with their message intact; anything
+unanticipated is wrapped by the SDK as `Error executing tool optimize` with
+the reason discarded, which is why every reachable bad-input path raises the
+SDK's own error type.
 
 ### Python
 

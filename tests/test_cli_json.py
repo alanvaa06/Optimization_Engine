@@ -152,3 +152,41 @@ def test_every_payload_declares_its_schema_version(capsys):
     ):
         _, payload = _run(capsys, argv)
         assert payload["schema_version"] == SCHEMA_VERSION
+
+
+@pytest.mark.parametrize(
+    ("argv", "expected_type"),
+    [
+        (["optimize", "--config", "/no/such/file.yaml", "--sample", "--json"],
+         "FileNotFoundError"),
+        (["check", "--config", "/no/such/file.yaml", "--sample", "--json"],
+         "FileNotFoundError"),
+        (["backtest", "--config", "/no/such/file.yaml", "--sample", "--json"],
+         "FileNotFoundError"),
+    ],
+)
+def test_a_raised_exception_still_emits_json(capsys, argv, expected_type):
+    """The half of the contract that a returned exit code does not cover.
+
+    `_emit_json` originally caught only a command that *returned* non-zero.
+    A command that *raised* — an unreadable config being the cheapest way in
+    — printed a traceback and left stdout empty, which is exactly the "no
+    output versus output I could not parse" ambiguity this mode exists to
+    remove. The payload has to survive the exception, not just the failure.
+    """
+    code, payload = _run(capsys, argv)
+    assert code != 0
+    assert payload["exit_code"] == code
+    assert payload["schema_version"] == SCHEMA_VERSION
+    # The type and message, so a caller can tell a missing file from a bad
+    # one without scraping the traceback.
+    assert expected_type in payload["error"]
+
+
+def test_the_traceback_survives_on_stderr(capsys):
+    """Catching the exception must not cost the human their diagnosis."""
+    main(["optimize", "--config", "/no/such/file.yaml", "--sample", "--json"])
+    captured = capsys.readouterr()
+    json.loads(captured.out)
+    assert "Traceback" in captured.err
+    assert "FileNotFoundError" in captured.err
