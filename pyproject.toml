@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "finport-optengine"
-version = "0.5.0"
+version = "0.5.1"
 description = "Multi-asset portfolio optimization engine with mean-variance, risk parity, HRP, Black-Litterman, CVaR and more."
 readme = "README.md"
 license = { file = "LICENSE" }
