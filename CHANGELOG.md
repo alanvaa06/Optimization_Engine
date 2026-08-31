@@ -11,6 +11,20 @@ with what to do about it.
 
 ## [Unreleased]
 
+### Fixed
+
+- The README renders on PyPI. Every image and repository link was a relative
+  path, which resolves against the repo on GitHub and against nothing on
+  PyPI — all nine figures were broken on the project page, along with the
+  links to the licence and the research notes. They are absolute now.
+
+### Changed
+
+- The README leads with the install command and a runnable quickstart
+  instead of burying `pip install` 600 lines down. The example's printed
+  output is checked against what the code in that same block actually
+  produces, so it cannot drift into fiction.
+
 ## [0.4.0] — 2026-08-31
 
 The release that makes the project installable from PyPI. No optimizer,
