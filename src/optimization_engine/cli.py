@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import sys
+import traceback
 from collections.abc import Callable
 from pathlib import Path
 
@@ -1325,19 +1326,35 @@ def _emit_json(
     caller parsing stdout should never have to distinguish "no JSON" from
     "JSON I could not read"; an error object with the exit code is
     unambiguous, and the human-readable reason is on stderr.
+
+    That promise covers a raised exception as much as a non-zero return.
+    An unreadable config or an unwritable output directory raises rather
+    than returning, and letting it propagate would print a traceback and
+    leave stdout empty — precisely the case this mode exists to remove.
+    The traceback still goes to stderr, where the human debugging it looks;
+    the caller parsing stdout gets the exception's type and message.
     """
     import json
 
     sink: dict[str, object] = {}
     args._json_sink = sink
-    with contextlib.redirect_stdout(sys.stderr):
-        code = command(args)
+    failure: str | None = None
+    try:
+        with contextlib.redirect_stdout(sys.stderr):
+            code = command(args)
+    except Exception as exc:  # noqa: BLE001 — the payload *is* the contract
+        traceback.print_exc()
+        failure = f"{type(exc).__name__}: {exc}"
+        code = 1
     payload = sink.get("payload")
-    if payload is None:
+    if failure is not None or payload is None:
+        # A run that raised reports the failure even if it had already
+        # captured a payload: emitting that payload under a non-zero exit
+        # code would describe a result the command did not finish producing.
         payload = {
             "schema_version": SCHEMA_VERSION,
             "command": args.command,
-            "error": "the command exited before producing a result",
+            "error": failure or "the command exited before producing a result",
             "exit_code": code,
         }
     print(json.dumps(payload, indent=2, default=str))

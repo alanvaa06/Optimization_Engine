@@ -120,8 +120,9 @@ Five tools — `list_optimizers`, `describe_optimizer`, `check_mandate`,
 same module. The server is a transport, not a second serialization layer.
 
 Pass `sample=true` for the built-in panel, or `prices_path` for a file of
-prices. Two tools read filesystem paths; nothing writes, fetches over the
-network, or touches a keyed provider.
+prices. Three of the five read filesystem paths — `config_path` and
+`prices_path` — and nothing writes a file, fetches over the network, or
+touches a keyed provider.
 
 Solving blocks: a large solve is seconds of CPU and these tools are
 synchronous. That is an optimizer working, not a hung server.
@@ -139,7 +140,7 @@ the part that distinguishes this library.
 
 ```bash
 pip install -e ".[all,ui,mcp,dev]"
-pytest -q          # 846 tests, ~2 minutes
+pytest -q          # 850 tests, ~2 minutes
 ruff check src app tests scripts
 ```
 

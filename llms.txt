@@ -14,9 +14,17 @@ PyPI. Python 3.9+. MIT.
 
 The core install is numpy, pandas, scipy, cvxpy, scs and scikit-learn.
 Plotting (`viz`), Excel I/O (`excel`), regression-based benchmark metrics
-(`stats`), the Streamlit app (`ui`) and network data providers (`data`) are
-extras; `all` covers everything but the app. Reaching a feature whose extra
-is missing raises with the install command that fixes it.
+(`stats`), the MCP server (`mcp`, Python 3.10+), the Streamlit app (`ui`) and
+network data providers (`data`) are extras; `all` covers everything but the
+app and the server. Reaching a feature whose extra is missing raises with the
+install command that fixes it.
+
+Three ways in. As a library, importing `optimization_engine`. As a CLI,
+`optengine`, where `optimize`, `backtest`, `check` and `describe` take
+`--json` and put one parseable document on stdout. As an MCP server,
+`pip install "finport-optengine[mcp]"` then `optengine-mcp`, which speaks
+stdio and exposes five tools — `list_optimizers`, `describe_optimizer`,
+`check_mandate`, `optimize`, `backtest` — returning those same payloads.
 
 Twelve optimizers (mean-variance, max-Sharpe, min-variance, risk parity,
 HRP, HERC, NCO, CVaR, CDaR, Black-Litterman, max-diversification, equal

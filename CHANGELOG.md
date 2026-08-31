@@ -11,6 +11,27 @@ with what to do about it.
 
 ## [Unreleased]
 
+### Fixed
+
+- `--json` emitted nothing at all when a command raised. The mode promised
+  that a failure still produces a parseable document, and delivered it only
+  for a command that *returned* a non-zero code — a raised exception, an
+  unreadable config being the cheapest way in, propagated instead: traceback
+  on stderr, stdout empty. That is precisely the "no output versus output I
+  could not parse" ambiguity the flag exists to remove, and it was reachable
+  from all four commands. The payload now survives the exception and carries
+  the exception's type and message; the traceback still goes to stderr, where
+  someone debugging it looks.
+
+### Changed
+
+- The README announces the agent-facing surface instead of leaving it in the
+  changelog: the MCP server has its own section with the install, the
+  registration for a JSON-config client and for `claude mcp add`, and what
+  each of the five tools answers; `--json` is documented in the CLI section
+  with real `jq` output rather than a sketch of it. The development install
+  gains the `mcp` extra it needed to run the MCP tests.
+
 ## [0.5.0] — 2026-08-31
 
 A minor rather than a patch: this adds public API surface — an optional
