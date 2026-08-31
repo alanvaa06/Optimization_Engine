@@ -11,43 +11,7 @@ with what to do about it.
 
 ## [Unreleased]
 
-### Fixed
-
-- The release workflow could never publish. `pypa/gh-action-pypi-publish`
-  was referenced by commit SHA — the usual supply-chain advice, and wrong
-  for this action: it is a Docker action, and the runner pulls
-  `ghcr.io/pypa/gh-action-pypi-publish` tagged with whatever ref the `uses:`
-  line carries. PyPA publishes that image only under release tags, so the
-  SHA resolved to no manifest and the step died with `manifest unknown`
-  before reaching the index. Now referenced as `@v1.14.2`, a tag confirmed
-  to exist in the registry, with the reasoning recorded in
-  `docs/RELEASING.md` so nobody "hardens" it back.
-
-### Added
-
-- A release workflow (`.github/workflows/release.yml`) publishing through
-  Trusted Publishing (OIDC), so no API token is stored in the repository.
-  A manual run publishes a fresh `.devN` to TestPyPI and then installs it
-  back *from* TestPyPI to prove the artifact is reachable; pushing a `v*`
-  tag publishes to PyPI behind a required-reviewer gate. The build refuses
-  to proceed if `pyproject.toml` and `__init__.py` disagree on the version,
-  or if a tag does not match the version it claims.
-- `docs/RELEASING.md` — the one-time Trusted Publishing setup each index
-  needs, the release procedure, and what to do about a bad release.
-
-### Fixed
-
-- Excluded `scs` 3.3.0. Its wheel ships an incomplete Intel oneMKL bundle,
-  so importing it and solving aborts the interpreter — "Cannot load
-  libmkl_avx512.so.3 or libmkl_def.so.3" — rather than raising. SCS sits in
-  `SOLVER_FALLBACK`, so any solve that got past CLARABEL and ECOS would take
-  the process down with it, with no traceback and nothing for the fallback
-  chain to catch. Reproduced on GitHub's runners and in a local container;
-  3.2.11 is unaffected. `scs` is now named directly in the dependencies,
-  since the engine reaches for it by name rather than leaving the choice to
-  cvxpy. Remove the exclusion once a fixed release ships.
-
-## [0.4.0] — 2026-08-30
+## [0.4.0] — 2026-08-31
 
 The release that makes the project installable from PyPI. No optimizer,
 estimator or backtest changed behaviour: every number this version produces
@@ -81,6 +45,16 @@ matches 0.3.0.
 
 ### Added
 
+- A release workflow (`.github/workflows/release.yml`) publishing through
+  Trusted Publishing (OIDC), so no API token is stored in the repository.
+  A manual run publishes a fresh `.devN` to TestPyPI and then installs it
+  back *from* TestPyPI to prove the artifact is reachable; pushing a `v*`
+  tag publishes to PyPI behind a required-reviewer gate. The build refuses
+  to proceed if `pyproject.toml` and `__init__.py` disagree on the version,
+  or if a tag does not match the version it claims.
+- `docs/RELEASING.md` — the one-time Trusted Publishing setup each index
+  needs, the release procedure, and what to do about a bad release.
+
 - `optimization_engine.ingest` is reachable as an attribute of the top-level
   package, and its four most-used names — `IngestRequest`, `IngestResult`,
   `IngestError`, `PricePanel` — are re-exported at the top level. The
@@ -106,6 +80,28 @@ matches 0.3.0.
   `ipywidgets` as mandatory, contradicting `pyproject.toml`, which has them
   as extras. `pyproject.toml` is now the single source of truth; install the
   development set with `pip install -e ".[all,ui,extras,dev]"`.
+
+### Fixed
+
+- The release workflow could never publish. `pypa/gh-action-pypi-publish`
+  was referenced by commit SHA — the usual supply-chain advice, and wrong
+  for this action: it is a Docker action, and the runner pulls
+  `ghcr.io/pypa/gh-action-pypi-publish` tagged with whatever ref the `uses:`
+  line carries. PyPA publishes that image only under release tags, so the
+  SHA resolved to no manifest and the step died with `manifest unknown`
+  before reaching the index. Now referenced as `@v1.14.2`, a tag confirmed
+  to exist in the registry, with the reasoning recorded in
+  `docs/RELEASING.md` so nobody "hardens" it back.
+
+- Excluded `scs` 3.3.0. Its wheel ships an incomplete Intel oneMKL bundle,
+  so importing it and solving aborts the interpreter — "Cannot load
+  libmkl_avx512.so.3 or libmkl_def.so.3" — rather than raising. SCS sits in
+  `SOLVER_FALLBACK`, so any solve that got past CLARABEL and ECOS would take
+  the process down with it, with no traceback and nothing for the fallback
+  chain to catch. Reproduced on GitHub's runners and in a local container;
+  3.2.11 is unaffected. `scs` is now named directly in the dependencies,
+  since the engine reaches for it by name rather than leaving the choice to
+  cvxpy. Remove the exclusion once a fixed release ships.
 
 ## [0.3.0] and earlier
 
