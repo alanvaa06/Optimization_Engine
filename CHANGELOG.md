@@ -11,6 +11,12 @@ with what to do about it.
 
 ## [Unreleased]
 
+## [0.4.1] — 2026-08-31
+
+A correctness and packaging release. Two of the three entries below only
+reach you if you had `riskfolio-lib` installed or read the project page on
+PyPI; the third is the reason the first two are worth a release at all.
+
 ### Fixed
 
 - `covariance_method="shrink"` no longer means different mathematics on
@@ -140,5 +146,6 @@ providers, with per-identifier provenance), the stateless backtest core with
 its cost model and trial counting, the walk-forward and final-holdout audit
 path, and the constraint-layer editor in the Streamlit app.
 
-[Unreleased]: https://github.com/alanvaa06/optimization_engine/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/alanvaa06/optimization_engine/compare/v0.4.1...HEAD
+[0.4.1]: https://github.com/alanvaa06/optimization_engine/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/alanvaa06/optimization_engine/releases/tag/v0.4.0
