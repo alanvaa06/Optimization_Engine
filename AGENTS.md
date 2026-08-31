@@ -106,6 +106,26 @@ you at runtime.
 The payload builders are importable directly, if you are in-process rather
 than shelling out: `optimization_engine.reporting.payloads`.
 
+## Calling it as an MCP tool
+
+For agents that call tools rather than write code:
+
+```bash
+pip install "finport-optengine[mcp]"   # needs Python 3.10+
+optengine-mcp                          # speaks stdio
+```
+
+Five tools — `list_optimizers`, `describe_optimizer`, `check_mandate`,
+`optimize`, `backtest` — returning the same payloads as `--json`, from the
+same module. The server is a transport, not a second serialization layer.
+
+Pass `sample=true` for the built-in panel, or `prices_path` for a file of
+prices. Two tools read filesystem paths; nothing writes, fetches over the
+network, or touches a keyed provider.
+
+Solving blocks: a large solve is seconds of CPU and these tools are
+synchronous. That is an optimizer working, not a hung server.
+
 ## What the library is opinionated about
 
 Weights are half of a result. Every solve also reports which solver
@@ -118,10 +138,14 @@ the part that distinguishes this library.
 ## Working on the repository itself
 
 ```bash
-pip install -e ".[all,ui,dev]"
-pytest -q          # 833 tests, ~3 minutes
+pip install -e ".[all,ui,mcp,dev]"
+pytest -q          # 846 tests, ~2 minutes
 ruff check src app tests scripts
 ```
+
+Without the `mcp` extra — or on Python 3.9, where the SDK will not install —
+`tests/test_mcp_server.py` skips rather than failing, so the count is lower
+and the suite still passes.
 
 CI runs lint, the suite on Python 3.9–3.12, the Streamlit app tests, a
 core-install job that asserts no optional dependency leaked into the core,

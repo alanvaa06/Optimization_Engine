@@ -11,7 +11,25 @@ with what to do about it.
 
 ## [Unreleased]
 
+### Fixed
+
+- `check` validated a different mandate from the one `optimize` solved. On a
+  config with no `expected_returns` block it derived the vector as zeros
+  while `run_engine` derived it from the return history, so the pre-flight
+  reported a reachable return range of exactly zero to zero and would call a
+  target unreachable that the solve then reached. Both now go through
+  `resolve_expected_returns`, extracted from `run_engine` so the two cannot
+  drift apart again. Affects `optengine check` and the MCP `check_mandate`.
+
 ### Added
+
+- An MCP server, `optengine-mcp`, behind the `mcp` extra (Python 3.10+).
+  Five tools — `list_optimizers`, `describe_optimizer`, `check_mandate`,
+  `optimize`, `backtest` — returning the same payloads as `--json`, from the
+  same module, so the two cannot disagree. Anticipated failures raise the
+  SDK's `ToolError`, which is the only class whose message reaches the
+  client; anything else is wrapped as "Error executing tool optimize" with
+  the reason discarded.
 
 - `--json` on `optimize`, `backtest`, `check` and `describe`. Human
   narration moves to stderr, so stdout is one parseable document and an

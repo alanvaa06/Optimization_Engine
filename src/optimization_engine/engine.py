@@ -727,6 +727,50 @@ class EngineRun:
         }
 
 
+def resolve_expected_returns(
+    config: EngineConfig,
+    returns: pd.DataFrame,
+    cov: pd.DataFrame,
+    expected_returns: pd.Series | None = None,
+) -> pd.Series:
+    """The expected-return vector a run will actually optimize against.
+
+    Extracted because more than one caller needs it and they have to agree.
+    A pre-flight check that validates a mandate against a different vector
+    from the one the solve uses is worse than no check: on a config with no
+    ``expected_returns`` block it would report the reachable return range as
+    zero to zero, pronounce a return target unreachable, and then watch the
+    solve succeed — or the reverse.
+
+    Precedence: an explicit vector, then ``config.expected_returns``, then
+    an estimate from the return history using the configured method. The
+    result is always reindexed onto ``returns.columns``, so an asset the
+    config forgot contributes zero rather than a NaN that propagates
+    silently through the objective.
+    """
+    if expected_returns is None and config.expected_returns:
+        expected_returns = pd.Series(config.expected_returns)
+    if expected_returns is None:
+        from optimization_engine.data.covariance import expected_returns_from_history
+
+        market_w = pd.Series(config.market_weights) if config.market_weights else None
+        expected_returns = expected_returns_from_history(
+            returns,
+            method=(
+                "mean"
+                if config.expected_returns_method == "historical_mean"
+                else config.expected_returns_method
+            ),
+            periods_per_year=config.periods_per_year,
+            span=config.ema_span,
+            market_return=config.market_return,
+            risk_free_rate=config.optimizer.risk_free_rate,
+            market_weights=market_w,
+            cov_matrix=cov,
+        )
+    return expected_returns.reindex(returns.columns).fillna(0.0)
+
+
 def run_engine(
     returns: pd.DataFrame,
     config: EngineConfig,
@@ -775,26 +819,9 @@ def run_engine(
         ewma_lambda=config.ewma_lambda,
     )
 
-    if expected_returns is None and config.expected_returns:
-        expected_returns = pd.Series(config.expected_returns)
-    if expected_returns is None:
-        from optimization_engine.data.covariance import expected_returns_from_history
-
-        market_w = (
-            pd.Series(config.market_weights) if config.market_weights else None
-        )
-        expected_returns = expected_returns_from_history(
-            returns,
-            method=("mean" if config.expected_returns_method == "historical_mean"
-                    else config.expected_returns_method),
-            periods_per_year=config.periods_per_year,
-            span=config.ema_span,
-            market_return=config.market_return,
-            risk_free_rate=config.optimizer.risk_free_rate,
-            market_weights=market_w,
-            cov_matrix=cov,
-        )
-    expected_returns = expected_returns.reindex(returns.columns).fillna(0.0)
+    expected_returns = resolve_expected_returns(
+        config, returns, cov, expected_returns
+    )
 
     benchmark = resolve_benchmark(config.benchmark, returns, external_returns)
     constraints = constraints_from_config(config, list(returns.columns))

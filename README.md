@@ -668,6 +668,7 @@ The parts most callers do not need are extras:
 | `viz` | plotly | Every figure in `reporting.plots` |
 | `excel` | openpyxl, xlsxwriter | Reading and writing `.xlsx` |
 | `stats` | statsmodels | Benchmark-relative OLS metrics (beta, regression stats) |
+| `mcp` | mcp | The MCP server, `optengine-mcp` (needs Python 3.10+) |
 | `data` | yfinance, pyarrow | The Yahoo provider, and Parquet panels |
 | `ui` | streamlit, ipywidgets, plotly | The Streamlit app |
 | `all` | everything above except `ui` | The CLI's worked examples |

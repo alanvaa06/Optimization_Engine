@@ -16,7 +16,11 @@ from optimization_engine.data.fred import FREDError, load_fred_series
 from optimization_engine.data.fx import FXError
 from optimization_engine.data.loader import load_prices, prices_to_returns, sample_dataset
 from optimization_engine.data.yahoo import YahooFinanceError, load_prices_yahoo
-from optimization_engine.engine import apply_fx_conversion, run_engine
+from optimization_engine.engine import (
+    apply_fx_conversion,
+    resolve_expected_returns,
+    run_engine,
+)
 from optimization_engine.ingest import (
     IngestError,
     IngestRequest,
@@ -1132,7 +1136,10 @@ def _cmd_check(args: argparse.Namespace) -> int:
         print("  Covariance estimate looks well conditioned.")
 
     print("\n== Constraints ==")
-    mu = pd.Series(config.expected_returns).reindex(returns.columns).fillna(0.0)
+    # The same vector the solve will use. Deriving it differently here —
+    # zeros, when the config carries no expected_returns block — would have
+    # this command validate a mandate the optimizer never sees.
+    mu = resolve_expected_returns(config, returns, cov)
     report = analyze_feasibility(
         list(returns.columns),
         constraints_from_config(config, list(returns.columns)),

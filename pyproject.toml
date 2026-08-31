@@ -61,6 +61,11 @@ excel = ["openpyxl>=3.1", "xlsxwriter>=3.1"]
 # regression stats. Only reached when a benchmark is supplied, so an
 # absolute-return workflow never needs it.
 stats = ["statsmodels>=0.14"]
+# The MCP server, for agents that call the engine as a tool rather than
+# importing it. The SDK needs Python 3.10, one minor above this package's
+# own floor, so on 3.9 pip reports no compatible version — which is the
+# honest failure, and why the message in mcp_server.py names the version.
+mcp = ["mcp>=2.0,<3"]
 ui = ["streamlit>=1.49", "ipywidgets>=8.0", "plotly>=5.17"]
 # ``pyarrow`` is what pandas uses to read and write Parquet. Nothing in the
 # engine's core needs it — the panel cache deliberately stores NumPy so that it
@@ -80,6 +85,7 @@ dev = ["pytest>=7.4", "pytest-cov>=4.1", "ruff>=0.5"]
 
 [project.scripts]
 optengine = "optimization_engine.cli:main"
+optengine-mcp = "optimization_engine.mcp_server:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
