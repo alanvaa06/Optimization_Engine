@@ -126,20 +126,31 @@ rejected.
 
 Fixing forward is always the answer. There is no version number to reuse.
 
-## Keeping the publish action current
-
-`pypa/gh-action-pypi-publish` is pinned by commit SHA rather than by tag,
-with the version in a trailing comment:
+## Why the publish action is pinned by tag, not SHA
 
 ```yaml
-uses: pypa/gh-action-pypi-publish@a892a5a61159132606e93a2fa6f4358831b04d26 # v1.14.2
+uses: pypa/gh-action-pypi-publish@v1.14.2
 ```
 
-A git tag can be repointed at a different commit; a SHA cannot. Since this
-is the step holding a token that can publish under your name, it is worth
-the small cost of updating the pin deliberately. To move it, resolve the new
-tag and replace both the SHA and the comment:
+Pinning a third-party action by commit SHA is the usual advice, and it is
+wrong here — this one is a Docker action. The runner pulls
+`ghcr.io/pypa/gh-action-pypi-publish` tagged with whatever ref the `uses:`
+line carries, and PyPA publishes that image only under release tags. A SHA
+ref resolves to no manifest, and the step dies with `manifest unknown`
+before it ever contacts the index. That is exactly how the first run of this
+workflow failed.
+
+So the reference has to be a tag PyPA has published an image for. Confirm one
+exists before bumping:
 
 ```bash
-git ls-remote https://github.com/pypa/gh-action-pypi-publish refs/tags/v1.15.0
+TOKEN=$(curl -s "https://ghcr.io/token?scope=repository:pypa/gh-action-pypi-publish:pull&service=ghcr.io" \
+  | python3 -c "import json,sys; print(json.load(sys.stdin)['token'])")
+curl -s -H "Authorization: Bearer $TOKEN" \
+  "https://ghcr.io/v2/pypa/gh-action-pypi-publish/tags/list?n=200" \
+  | python3 -c "import json,sys; print([t for t in json.load(sys.stdin)['tags'] if t.startswith('v1.')][-10:])"
 ```
+
+`release/v1` is PyPA's own floating recommendation and also works; an exact
+version is preferred here so that the action cannot change under a release
+without the change being a commit in this repository.

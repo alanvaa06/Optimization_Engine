@@ -11,6 +11,18 @@ with what to do about it.
 
 ## [Unreleased]
 
+### Fixed
+
+- The release workflow could never publish. `pypa/gh-action-pypi-publish`
+  was referenced by commit SHA — the usual supply-chain advice, and wrong
+  for this action: it is a Docker action, and the runner pulls
+  `ghcr.io/pypa/gh-action-pypi-publish` tagged with whatever ref the `uses:`
+  line carries. PyPA publishes that image only under release tags, so the
+  SHA resolved to no manifest and the step died with `manifest unknown`
+  before reaching the index. Now referenced as `@v1.14.2`, a tag confirmed
+  to exist in the registry, with the reasoning recorded in
+  `docs/RELEASING.md` so nobody "hardens" it back.
+
 ### Added
 
 - A release workflow (`.github/workflows/release.yml`) publishing through

@@ -14,6 +14,13 @@ name: Release
 # its identity to the index and receives a short-lived token. There is no API
 # token in this repository's secrets, so there is none to leak or rotate.
 # See docs/RELEASING.md for the one-time setup each index needs.
+#
+# The publish action is referenced by release tag rather than by commit SHA,
+# which is the opposite of the usual advice and is forced: it is a Docker
+# action, and the runner pulls ghcr.io/pypa/gh-action-pypi-publish tagged with
+# whatever ref appears below. PyPA publishes that image only under release
+# tags, so a SHA ref resolves to no manifest and the step dies with
+# "manifest unknown" before it ever reaches the index.
 
 on:
   workflow_dispatch:
@@ -211,7 +218,7 @@ jobs:
         with:
           name: dist
           path: dist/
-      - uses: pypa/gh-action-pypi-publish@a892a5a61159132606e93a2fa6f4358831b04d26 # v1.14.2
+      - uses: pypa/gh-action-pypi-publish@v1.14.2
         with:
           repository-url: https://test.pypi.org/legacy/
 
@@ -270,4 +277,4 @@ jobs:
         with:
           name: dist
           path: dist/
-      - uses: pypa/gh-action-pypi-publish@a892a5a61159132606e93a2fa6f4358831b04d26 # v1.14.2
+      - uses: pypa/gh-action-pypi-publish@v1.14.2
