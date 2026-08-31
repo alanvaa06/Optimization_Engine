@@ -240,7 +240,7 @@ constraint and any breach is reported.
 **Covariance estimators**
 
 `sample`, `ledoit_wolf`, `oas`, `ewma` (RiskMetrics), `semi`,
-`shrink` (riskfolio passthrough when installed), and `denoised`.
+`shrink` (an alias for `ledoit_wolf`), and `denoised`.
 
 Every estimate is symmetrized and PSD-repaired, and comes with diagnostics:
 observations per asset, condition number, smallest eigenvalue, and effective
@@ -670,8 +670,7 @@ The parts most callers do not need are extras:
 | `stats` | statsmodels | Benchmark-relative OLS metrics (beta, regression stats) |
 | `data` | yfinance, pyarrow | The Yahoo provider, and Parquet panels |
 | `ui` | streamlit, ipywidgets, plotly | The Streamlit app |
-| `extras` | riskfolio-lib | Its covariance estimators, where installed |
-| `all` | everything above except `ui`/`extras` | The CLI's worked examples |
+| `all` | everything above except `ui` | The CLI's worked examples |
 
 Reaching a feature whose extra is missing raises with the command that fixes
 it, rather than a bare `ModuleNotFoundError`. To run the CLI end to end:
@@ -683,7 +682,7 @@ pip install "finport-optengine[all]"
 For a source checkout, working on the engine itself:
 
 ```bash
-pip install -e ".[all,ui,extras,dev]"
+pip install -e ".[all,ui,dev]"
 ```
 
 The import name stays `optimization_engine` and the console script stays
