@@ -101,7 +101,13 @@ def run_backtest(
             same-period-fill, in-sample replay.
         cost_model: Override the model built from ``spec.costs``. Useful for
             testing and for cost models this library does not ship.
-        notes: Free-form annotations to carry on the result metadata.
+        notes: Free-form annotations to carry on the result metadata. When
+            ``returns`` has missing values the runner adds a
+            ``"missing_returns"`` entry of its own: how many periods had a
+            gap somewhere, and — the part worth reading — which *held*
+            assets had one, and how often. A missing return is replayed as
+            a flat period for that asset alone; it never touches the rest
+            of the book.
         context_returns: A longer history the cost models may estimate from.
             A walk-forward evaluation starts partway into the sample, so
             estimating trailing volatility from the evaluation window alone
@@ -208,6 +214,8 @@ def run_backtest(
     degradations: list[str] = []
     seen_degradations: set[str] = set()
     traded_dates: list[pd.Timestamp] = []
+    missing_held: dict[str, int] = {}
+    missing_periods = 0
     nav = float(spec.initial_capital)
 
     for position, date in enumerate(index):
@@ -277,6 +285,20 @@ def run_backtest(
 
         held_rows.append(held.copy())
         period = returns_matrix[position]
+        missing = np.isnan(period)
+        if missing.any():
+            # A missing return is a flat period, not a poison pill: an asset
+            # with no print — not yet listed, delisted, a holiday elsewhere —
+            # contributes nothing, and the rest of the book is unaffected.
+            # Left as NaN, ``0 * NaN`` would turn the whole NAV path NaN from
+            # here on, even for a name the book never held. A missing return
+            # on a name that *is* held is recorded on the run so it can be
+            # read as the data gap it is.
+            missing_periods += 1
+            for asset_position in np.flatnonzero(missing & (np.abs(held) > _TRADE_EPS)):
+                name = assets[asset_position]
+                missing_held[name] = missing_held.get(name, 0) + 1
+            period = np.where(missing, 0.0, period)
         gross = float(held @ period)
         gross_returns.append(gross)
         net = gross - period_cost
@@ -284,9 +306,16 @@ def run_backtest(
         nav = nav * (1.0 + net)
         nav_path.append(nav)
 
+        # Drift: each position grows with its own return while the book as a
+        # whole grows with the portfolio return, so the new weight is the
+        # position's share of the *grown* book. The denominator is the book's
+        # growth, not the sum of the positions — those only coincide when the
+        # book is fully invested. Dividing by the positions' sum would silently
+        # convert any cash residual into positions after one period, and turn
+        # a 60/−40 long-short book into one levered many times over.
         grown = held * (1.0 + period)
-        total = grown.sum()
-        held = grown / total if abs(total) > _TRADE_EPS else grown
+        growth = 1.0 + gross
+        held = grown / growth if growth > _TRADE_EPS else grown
 
     nav_series = pd.Series(nav_path, index=index, name="nav")
     trades = (
@@ -300,6 +329,12 @@ def run_backtest(
         else empty_costs()
     )
     held_frame = pd.DataFrame(held_rows, index=index, columns=assets)
+    if missing_periods:
+        notes = dict(notes or {})
+        notes["missing_returns"] = {
+            "periods": int(missing_periods),
+            "held_assets": {k: int(v) for k, v in sorted(missing_held.items())},
+        }
 
     return RunResult(
         returns=pd.Series(net_returns, index=index, name="portfolio"),

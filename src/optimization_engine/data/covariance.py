@@ -445,12 +445,22 @@ def james_stein_shrinkage(
     cov_matrix: pd.DataFrame,
     n_observations: int,
     target: float | None = None,
+    periods_per_year: int = 252,
 ) -> tuple[pd.Series, float]:
     """Shrink a vector of sample means toward a common target.
 
     Implements the Jorion (1986) Bayes-Stein estimator: the shrinkage
     intensity grows with the number of assets and the dispersion of the
     covariance, and shrinks as the sample lengthens.
+
+    The intensity is Jorion's ``λ = (N+2) / ((N+2) + T·(μ−μ₀)'Σ⁻¹(μ−μ₀))``,
+    a statistic of the *per-observation* moments: ``T`` counts observations,
+    so the quadratic form has to be in the units of one observation too.
+    Annualized inputs inflate it by ``periods_per_year`` — the means scale by
+    the basis and the covariance by the basis, so their ratio does — and
+    with daily data that made the shrinkage some 250 times too weak. The
+    quadratic form is therefore divided by ``periods_per_year`` before the
+    intensity is formed.
 
     Args:
         sample_mean: Annualized sample means, one per asset.
@@ -459,6 +469,9 @@ def james_stein_shrinkage(
         target: Grand mean to shrink toward. ``None`` uses the
             minimum-variance portfolio's expected return, which is the
             Jorion prior.
+        periods_per_year: The annualization basis of ``sample_mean`` and
+            ``cov_matrix`` — 252 for daily inputs, 12 for monthly, ``1``
+            when they are already per-period.
 
     Returns:
         ``(shrunk_means, intensity)`` where ``intensity`` is in ``[0, 1]``.
@@ -482,7 +495,7 @@ def james_stein_shrinkage(
             else float(ones @ inv @ mu.values) / denom
         )
         diff = mu.values - mu_target
-        quad = float(diff @ inv @ diff)
+        quad = float(diff @ inv @ diff) / float(periods_per_year)
         if quad <= 0:
             return mu, 1.0
         lam = (n + 2) / (n + 2 + n_observations * quad)
@@ -521,8 +534,7 @@ def expected_returns_from_history(
         span: EWMA span in periods. Only used by ``ema``.
         market_return: The market's expected return, for ``capm``. Estimated
             from the market portfolio when omitted.
-        risk_free_rate: Annualized risk-free rate, used by ``capm`` and by
-            the shrinkage target.
+        risk_free_rate: Annualized risk-free rate, used by ``capm``.
         market_weights: The market portfolio for ``capm``. Defaults to equal
             weights, which is an assumption rather than a neutral choice.
         cov_matrix: A pre-computed covariance, needed by ``capm`` and
@@ -550,7 +562,9 @@ def expected_returns_from_history(
             cov_matrix = covariance_matrix(
                 returns, method="ledoit_wolf", periods_per_year=periods_per_year
             )
-        shrunk, _ = james_stein_shrinkage(raw, cov_matrix, len(returns))
+        shrunk, _ = james_stein_shrinkage(
+            raw, cov_matrix, len(returns), periods_per_year=periods_per_year
+        )
         return shrunk
     if method == "capm":
         if cov_matrix is None:

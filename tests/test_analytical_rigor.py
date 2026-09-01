@@ -995,3 +995,41 @@ def test_weight_cleaning_respects_group_budgets_too():
     assert result.weights[["a", "b"]].sum() <= 0.60 + 1e-6
     assert result.weights.max() <= 0.45 + 1e-6
     assert result.is_compliant, result.violations
+
+
+# ---------------------------------------------------------------------------
+# Bayes-Stein on the right units (review fix O5)
+# ---------------------------------------------------------------------------
+
+
+def test_james_stein_intensity_does_not_depend_on_the_annualization_basis():
+    rng = np.random.default_rng(3)
+    n, t = 6, 500
+    per_period = pd.DataFrame(rng.normal(0.0, 0.01, size=(t, n)), columns=[f"X{i}" for i in range(n)])
+    _, daily = james_stein_shrinkage(per_period.mean(), per_period.cov(), t, periods_per_year=1)
+    _, annual = james_stein_shrinkage(
+        per_period.mean() * 252, per_period.cov() * 252, t, periods_per_year=252
+    )
+    _, monthly = james_stein_shrinkage(
+        per_period.mean() * 12, per_period.cov() * 12, t, periods_per_year=12
+    )
+    assert annual == pytest.approx(daily, rel=1e-9)
+    assert monthly == pytest.approx(daily, rel=1e-9)
+    # Six assets whose means differ by nothing but noise: most of the spread
+    # is noise, and the intensity should say so. Before the fix, annualized
+    # inputs gave an intensity about 250 times too small (~0.01 here).
+    assert annual > 0.3
+
+
+def test_shrunk_mean_actually_shrinks_noise():
+    from optimization_engine.data.covariance import expected_returns_from_history
+
+    rng = np.random.default_rng(5)
+    n, t = 8, 750
+    idx = pd.date_range("2020-01-01", periods=t, freq="B")
+    noise = pd.DataFrame(
+        rng.normal(0.0003, 0.012, size=(t, n)), index=idx, columns=[f"X{i}" for i in range(n)]
+    )
+    raw = expected_returns_from_history(noise, method="mean")
+    shrunk = expected_returns_from_history(noise, method="shrunk_mean")
+    assert shrunk.std() < 0.7 * raw.std(), (raw.std(), shrunk.std())

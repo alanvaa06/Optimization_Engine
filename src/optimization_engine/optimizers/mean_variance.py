@@ -10,6 +10,7 @@ import numpy as np
 from optimization_engine.optimizers._cvxpy_helpers import (
     build_constraints,
     build_scaled_constraints,
+    homogeneous_ignored_constraints,
     solve_problem,
 )
 from optimization_engine.optimizers.base import BaseOptimizer
@@ -143,13 +144,17 @@ class MaxSharpeOptimizer(BaseOptimizer):
     """Maximum Sharpe ratio (tangency) portfolio.
 
     Solved as the standard homogeneous reformulation: minimize ``y'Σy``
-    subject to ``(μ − rf)·y = 1``, then renormalize ``w = y / Σy``. Bounds
-    and group budgets are scaled by ``κ = Σy`` so they stay exact.
+    subject to ``(μ − rf)·y = 1``, then renormalize ``w = y / Σy``.
 
-    Two things do not survive the transform, and both are reported rather
-    than silently dropped: a turnover budget (affine, not homogeneous) and
-    the case where the tangency ray points the wrong way because no asset
-    earns more than the risk-free rate.
+    Bounds, group budgets, layer limits, a gross-exposure cap and the
+    benchmark-relative budgets are scaled by ``κ = Σy`` so they stay exact.
+
+    Three things do not survive the transform, and all are reported rather
+    than silently dropped: a turnover budget (affine, not homogeneous), an
+    open budget (``fully_invested=False`` — the ray fixes a direction, and
+    the result always sums to one), and the case where the tangency ray
+    points the wrong way because no asset earns more than the risk-free
+    rate.
     """
 
     name = "max_sharpe"
@@ -170,15 +175,9 @@ class MaxSharpeOptimizer(BaseOptimizer):
                 "or revisit the expected returns."
             )
 
-        if self.constraints.turnover_limit is not None:
-            warnings.warn(
-                "Max-Sharpe ignores the turnover budget: the tangency solve "
-                "works on a scaled ray where a turnover constraint is not "
-                "well defined. Use mean_variance with a return target to "
-                "respect turnover.",
-                stacklevel=3,
-            )
-            self._diagnostics["ignored_constraints"] = ["turnover_limit"]
+        ignored = homogeneous_ignored_constraints(self.constraints, "Max-Sharpe")
+        if ignored:
+            self._diagnostics["ignored_constraints"] = ignored
 
         n = len(self.assets)
         y = cp.Variable(n)

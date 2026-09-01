@@ -389,12 +389,16 @@ def compare_in_and_out_of_sample(
         out_of_sample: The walk-forward stream, from the same process run
             without hindsight.
         periods_per_year: Annualization basis for both.
-        riskfree_rate: Per-period risk-free rate used by the ratio metrics.
+        riskfree_rate: Annual risk-free rate used by the ratio metrics.
 
     Returns:
         A frame with one row per statistic and a column per sample —
         ``"In-sample (fitted)"`` and ``"Out-of-sample (walk-forward)"`` —
         plus a ``"Degradation"`` column holding the first minus the second.
+        Both columns are computed over the periods the two streams *share*:
+        a walk-forward starts one lookback into the sample, and scoring the
+        fitted stream over a longer window than the one it is compared with
+        would not be a comparison.
     """
     from optimization_engine.analytics.performance import summary_stats
 
@@ -404,7 +408,8 @@ def compare_in_and_out_of_sample(
             out_of_sample.rename("Out-of-sample (walk-forward)"),
         ],
         axis=1,
-    )
+        join="inner",
+    ).dropna(how="any")
     stats = summary_stats(
         frame, periods_per_year=periods_per_year, riskfree_rate=riskfree_rate
     ).T

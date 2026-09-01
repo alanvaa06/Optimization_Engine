@@ -458,9 +458,15 @@ def build_scaled_constraints(
     tangency and maximum-diversification portfolios honour an active-risk
     mandate rather than reporting a violation after the fact.
 
-    Turnover budgets do **not** carry over: ``‖w − w_prev‖₁ ≤ τ`` is affine
-    in ``w`` with a constant term that has no ``κ`` to absorb it, so it is
-    left to the caller to reject or warn.
+    A gross-exposure cap is homogeneous too — ``‖y‖₁ ≤ L·κ`` — and carries
+    over as a hard constraint.
+
+    Two things do **not** carry over, and the caller has to say so (see
+    :func:`homogeneous_ignored_constraints`). A turnover budget
+    ``‖w − w_prev‖₁ ≤ τ`` is affine in ``w`` with a constant term that has
+    no ``κ`` to absorb it. And an *open* budget — ``fully_invested=False`` —
+    cannot be expressed on a ray at all: the ray fixes only the direction,
+    and ``w = y/κ`` always sums to one.
 
     Args:
         y: The unnormalized ray variable.
@@ -479,6 +485,9 @@ def build_scaled_constraints(
     lb, ub = bounds_arrays(assets, constraints)
     cons.append(y >= cp.multiply(lb, kappa))
     cons.append(y <= cp.multiply(ub, kappa))
+
+    if constraints.leverage is not None:
+        cons.append(cp.norm(y, 1) <= float(constraints.leverage) * kappa)
 
     cons.extend(layer_constraints(y, assets, constraints, scale=kappa))
 
@@ -512,3 +521,44 @@ def build_scaled_constraints(
         cons.append(cp.norm(psd_sqrt(cov_matrix) @ active, 2) <= te * kappa)
 
     return cons
+
+
+def homogeneous_ignored_constraints(
+    constraints: PortfolioConstraints, method: str
+) -> list[str]:
+    """Name the constraints a ray-space solve cannot honour, and warn once each.
+
+    The homogeneous reformulations behind max-Sharpe and max-diversification
+    carry every constraint that scales with the book (see
+    :func:`build_scaled_constraints`) and none that does not. This is the
+    one place that decides which those are, so the two optimizers cannot
+    disagree about it, and so a mandate that is only partly honoured says so
+    in ``result.extras["ignored_constraints"]`` rather than in a violation
+    the reader has to notice.
+
+    Args:
+        constraints: The mandate being translated.
+        method: The optimizer's display name, for the warning text.
+
+    Returns:
+        The names of the ignored constraints, in a fixed order — empty when
+        everything carried over. Each one also raises a ``UserWarning``.
+    """
+    ignored: list[str] = []
+    if constraints.turnover_limit is not None:
+        ignored.append("turnover_limit")
+        warnings.warn(
+            f"{method} ignores the turnover budget: the solve works on a "
+            "scaled ray where a turnover constraint is not well defined. "
+            "Use mean_variance with a return target to respect turnover.",
+            stacklevel=4,
+        )
+    if not constraints.fully_invested:
+        ignored.append("fully_invested")
+        warnings.warn(
+            f"{method} ignores fully_invested=False: the solve fixes only the "
+            "direction of the book, and the weights it returns always sum to "
+            "one. Size the result against cash separately.",
+            stacklevel=4,
+        )
+    return ignored

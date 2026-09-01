@@ -799,3 +799,89 @@ def test_the_default_audit_path_is_the_one_the_repository_protects():
     from optimization_engine.backtest.holdout import DEFAULT_AUDIT_PATH
 
     assert DEFAULT_AUDIT_PATH.as_posix() == "runs/holdout_audit.jsonl"
+
+
+# ---------------------------------------------------------------------------
+# Drift and missing returns (review fixes B1, B2)
+# ---------------------------------------------------------------------------
+
+
+def _flat_panel(n: int = 6, a: float = 0.01, b: float = 0.0) -> pd.DataFrame:
+    idx = pd.date_range("2024-01-01", periods=n, freq="D")
+    return pd.DataFrame({"A": [a] * n, "B": [b] * n}, index=idx)
+
+
+def test_drift_keeps_a_cash_residual_as_cash():
+    # Half the book in A, the rest uninvested. A earns 1% a period, so the
+    # book earns ~0.5% and A's share creeps up — it does not jump to 100%.
+    run = run_backtest(
+        _flat_panel(),
+        pd.Series({"A": 0.5, "B": 0.0}),
+        BacktestSpec(frequency="none", periods_per_year=252),
+    )
+    invested = run.weights.sum(axis=1)
+    assert invested.iloc[0] == pytest.approx(0.5)
+    assert invested.max() < 0.52, invested.tolist()
+    assert (invested.diff().dropna() > 0).all()  # creeping up, not flat
+    assert run.returns.between(0.005, 0.0052).all(), run.returns.tolist()
+
+
+def test_drift_preserves_the_net_exposure_of_a_long_short_book():
+    idx = pd.date_range("2024-01-01", periods=5, freq="D")
+    returns = pd.DataFrame({"A": [0.02, -0.01, 0.0, 0.03, 0.01], "B": [0.01, 0.02, -0.01, 0.0, 0.0]}, index=idx)
+    run = run_backtest(
+        returns,
+        pd.Series({"A": 0.6, "B": -0.4}),
+        BacktestSpec(frequency="none", periods_per_year=252),
+    )
+    net = run.weights.sum(axis=1)
+    # 60/−40 is 20% net long; drift moves it by the return differential, not
+    # to 100%. Before the fix the second row was 264/−164.
+    assert net.iloc[0] == pytest.approx(0.2)
+    assert net.between(0.15, 0.25).all(), net.tolist()
+    assert run.weights["A"].max() < 0.7 and run.weights["B"].min() > -0.5
+
+
+def test_a_fully_invested_book_drifts_exactly_as_it_always_did(returns, equal_weights):
+    # The denominator change is invisible when the book is fully invested:
+    # the positions' sum *is* the book's growth. Hand-roll the first two
+    # periods with the old formula and check they agree.
+    run = run_backtest(
+        returns.iloc[:3], equal_weights, BacktestSpec(frequency="none", periods_per_year=252)
+    )
+    held = equal_weights.to_numpy()
+    grown = held * (1.0 + returns.iloc[0].to_numpy())
+    old_formula = grown / grown.sum()
+    np.testing.assert_allclose(run.weights.iloc[1].to_numpy(), old_formula, atol=1e-12)
+    assert run.weights.sum(axis=1).round(10).eq(1.0).all()
+
+
+def test_a_missing_return_on_an_unheld_asset_does_not_poison_the_nav():
+    idx = pd.date_range("2024-01-01", periods=4, freq="D")
+    returns = pd.DataFrame(
+        {"A": [0.01] * 4, "LATE_IPO": [np.nan, np.nan, 0.02, 0.01]}, index=idx
+    )
+    run = run_backtest(
+        returns,
+        pd.Series({"A": 1.0, "LATE_IPO": 0.0}),
+        BacktestSpec(frequency="none", periods_per_year=252),
+    )
+    assert run.returns.notna().all() and run.nav.notna().all()
+    assert run.returns.round(10).eq(0.01).all()
+    assert run.weights.notna().all().all()
+    note = run.meta.notes["missing_returns"]
+    assert note["periods"] == 2
+    assert note["held_assets"] == {}  # never held, so nothing to flag
+
+
+def test_a_missing_return_on_a_held_asset_is_flat_and_is_recorded():
+    idx = pd.date_range("2024-01-01", periods=4, freq="D")
+    returns = pd.DataFrame({"A": [0.01, np.nan, 0.01, 0.01], "B": [0.0] * 4}, index=idx)
+    run = run_backtest(
+        returns,
+        pd.Series({"A": 0.5, "B": 0.5}),
+        BacktestSpec(frequency="none", periods_per_year=252),
+    )
+    assert run.returns.notna().all()
+    assert run.returns.iloc[1] == pytest.approx(0.0)  # the gap is a flat period
+    assert run.meta.notes["missing_returns"]["held_assets"] == {"A": 1}

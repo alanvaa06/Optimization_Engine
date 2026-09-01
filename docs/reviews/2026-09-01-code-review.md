@@ -6,6 +6,10 @@ was reproduced with a snippet or the CLI against the sample panel (pandas 3.0.5,
 numpy 2.4.6, cvxpy 1.9.2, CLARABEL/SCS/OSQP/HIGHS installed, ECOS absent).
 The suite passes at the reviewed commit: 824 passed, 4 skipped, 53 s.
 
+**Status.** The five headline items — B1, B2, B4, O1, O2+O3, O5 — are
+fixed on this branch, with tests, and listed under *Unreleased* in the
+changelog. Everything else below is still open.
+
 Things that checked out and are *not* flagged: HRP quasi-diagonalisation and
 recursive bisection match the reference implementation exactly; the ERC
 log-barrier, Rockafellar-Uryasev CVaR and Chekhlov-Uryasev CDaR programs are

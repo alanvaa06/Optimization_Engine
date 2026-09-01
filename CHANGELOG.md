@@ -11,6 +11,66 @@ with what to do about it.
 
 ## [Unreleased]
 
+Five numerical fixes from a full-package review; the review itself is in
+`docs/reviews/2026-09-01-code-review.md`. Each one changes a number a user
+may already be looking at, and each is listed with what moves.
+
+### Fixed
+
+- **Backtest drift no longer forces full investment.** The simulation core
+  renormalized drifted weights by the sum of the positions, which is the
+  book's growth only when the book is fully invested. Any cash residual was
+  silently converted into positions after one period, and a 60/−40 long-short
+  book became 264/−164 on its second bar. Weights now drift by the book's own
+  growth, `1 + w·r`. A fully invested target replays exactly as before; every
+  non-fully-invested backtest — `fully_invested=False`, a partial target, a
+  long-short book — moves.
+- **A missing return no longer poisons the NAV path.** `0 × NaN` made every
+  period from the first gap onward NaN, even for a name the book never held.
+  A gap is now a flat period for that asset alone; a gap on a *held* asset is
+  recorded on `meta.notes["missing_returns"]` so it reads as the data problem
+  it is.
+- **Comparisons score both streams over their common window.**
+  `compare_in_and_out_of_sample` and `compare_performance` padded the shorter
+  stream with NaN, which `annualize_returns` and `hit_rate` counted as zero-
+  return periods and `var_historic` turned into NaN. On the sample panel that
+  reported a walk-forward CAGR of −2.9% for a stream that made −5.8%, and
+  flattered the `Degradation` column whenever the out-of-sample run was
+  losing. The two functions now align on the periods both streams cover, and
+  the three metrics count observations rather than rows, so an isolated gap
+  anywhere is neither a return nor a loss.
+- **Black-Litterman with no views now returns the market portfolio.** The
+  equilibrium prior `π = δΣw` is the first-order condition of
+  `μ'w − (δ/2)·w'Σw`, but the mean-variance sub-solve it fed maximizes
+  `μ'w − λ·w'Σw` with no half, so the effective aversion was doubled and the
+  no-view answer sat exactly halfway between the market and the minimum-
+  variance portfolio. The sub-solve now receives `λ = δ/2`. Every
+  `black_litterman` allocation moves, toward the market portfolio.
+- **`BlackLittermanOptimizer.optimize()` is idempotent.** It used to write the
+  posterior back over `cov_matrix` and `expected_returns`, so a second call
+  reverse-optimized from the first call's answer and the weights drifted on
+  every solve. The posterior now lives on the optimizer privately; the
+  result's return and risk are still reported against it, and the inputs are
+  left as given. Code that read `optimizer.cov_matrix` *after* a solve and
+  expected the posterior will now see the prior.
+- **Max-Sharpe and max-diversification honour a `leverage` cap.** The
+  homogeneous reformulation translated bounds, layers and the benchmark
+  budgets into ray space and skipped the gross-exposure cap, so a 1.2× mandate
+  could come back at 2.5× gross with nothing in `ignored_constraints`. The cap
+  is now a hard constraint of the ray-space solve. `fully_invested=False`
+  cannot be expressed on a ray at all; both optimizers now warn and record it
+  in `result.extras["ignored_constraints"]` instead of silently returning a
+  fully invested book.
+- **Bayes-Stein shrinkage is computed on per-period moments.** Jorion's
+  intensity `(N+2) / ((N+2) + T·q)` counts observations in `T`, so the
+  quadratic form `q` has to be per-observation too; `shrunk_mean` handed it
+  annualized means and covariance, inflating `q` by the annualization basis
+  and leaving daily data some 250 times under-shrunk. `james_stein_shrinkage`
+  takes a `periods_per_year` (default 252, matching
+  `expected_returns_from_history`) and divides the quadratic form by it.
+  Every `expected_returns_method="shrunk_mean"` vector moves, toward the
+  minimum-variance portfolio's return.
+
 ## [0.5.2] — 2026-09-01
 
 Documentation only. No behaviour changed, no signature moved, and the test

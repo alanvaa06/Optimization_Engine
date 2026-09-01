@@ -19,14 +19,13 @@ ratio whenever the caps actually bind.
 
 from __future__ import annotations
 
-import warnings
-
 import cvxpy as cp
 import numpy as np
 
 from optimization_engine.optimizers._bounds import project_to_constraints
 from optimization_engine.optimizers._cvxpy_helpers import (
     build_scaled_constraints,
+    homogeneous_ignored_constraints,
     solve_problem,
 )
 from optimization_engine.optimizers.base import BaseOptimizer
@@ -51,14 +50,11 @@ class MaxDiversificationOptimizer(BaseOptimizer):
                 "universe."
             )
 
-        if self.constraints.turnover_limit is not None:
-            warnings.warn(
-                "Max-diversification ignores the turnover budget: the solve "
-                "works on a scaled ray where a turnover constraint is not well "
-                "defined.",
-                stacklevel=3,
-            )
-            self._diagnostics["ignored_constraints"] = ["turnover_limit"]
+        ignored = homogeneous_ignored_constraints(
+            self.constraints, "Max-diversification"
+        )
+        if ignored:
+            self._diagnostics["ignored_constraints"] = ignored
 
         n = len(self.assets)
         y = cp.Variable(n)

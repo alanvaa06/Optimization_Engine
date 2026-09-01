@@ -369,3 +369,135 @@ def test_infeasible_target_raises_clearly(returns, baseline_config):
     )
     with pytest.raises(RuntimeError, match=r"infeasible|status|Solver"):
         run_engine(returns, cfg)
+
+
+# ---------------------------------------------------------------------------
+# Black-Litterman convention and idempotence; ray-space constraints
+# (review fixes O1, O2, O3)
+# ---------------------------------------------------------------------------
+
+
+def _synthetic_cov(n: int = 5, seed: int = 0) -> pd.DataFrame:
+    rng = np.random.default_rng(seed)
+    a = rng.normal(size=(n, n))
+    names = [f"X{i}" for i in range(n)]
+    return pd.DataFrame(a @ a.T / 50 + np.eye(n) * 0.01, index=names, columns=names)
+
+
+def test_black_litterman_with_no_views_returns_the_market_portfolio():
+    from optimization_engine.optimizers.base import PortfolioConstraints
+    from optimization_engine.optimizers.black_litterman import BlackLittermanOptimizer
+
+    cov = _synthetic_cov()
+    market = pd.Series([0.4, 0.25, 0.15, 0.12, 0.08], index=cov.index)
+    for rf in (0.0, 0.03):
+        bl = BlackLittermanOptimizer(
+            cov_matrix=cov,
+            market_weights=market,
+            constraints=PortfolioConstraints(
+                long_only=True, fully_invested=True, bounds={a: (0.0, 1.0) for a in cov.index}
+            ),
+            risk_free_rate=rf,
+            risk_aversion=2.5,
+        )
+        weights = bl.optimize().weights
+        # The defining check of the model: no views, no move. With the
+        # risk-aversion conventions of the prior and the sub-solve out of step
+        # this landed halfway to the minimum-variance portfolio.
+        np.testing.assert_allclose(weights.to_numpy(), market.to_numpy(), atol=1e-3)
+
+
+def test_black_litterman_solves_are_idempotent():
+    from optimization_engine.optimizers.black_litterman import BlackLittermanOptimizer
+
+    cov = _synthetic_cov()
+    prior = cov.copy()
+    bl = BlackLittermanOptimizer(
+        cov_matrix=cov,
+        market_weights=pd.Series(0.2, index=cov.index),
+        views={"X0": 0.10},
+        view_confidences={"X0": 0.0004},
+    )
+    first = bl.optimize()
+    second = bl.optimize()
+    third = bl.optimize()
+    pd.testing.assert_series_equal(first.weights, second.weights)
+    pd.testing.assert_series_equal(first.weights, third.weights)
+    assert first.expected_return == pytest.approx(third.expected_return)
+    pd.testing.assert_frame_equal(bl.cov_matrix, prior)  # the input is not overwritten
+    pd.testing.assert_series_equal(
+        first.extras["bl_prior_returns"], third.extras["bl_prior_returns"]
+    )
+
+
+def _levered_tangency_inputs():
+    names = ["A", "B", "C", "D"]
+    mu = pd.Series([0.10, 0.02, 0.08, -0.03], index=names)
+    corr = np.array(
+        [[1.0, 0.8, 0.2, 0.7], [0.8, 1.0, 0.1, 0.6], [0.2, 0.1, 1.0, 0.3], [0.7, 0.6, 0.3, 1.0]]
+    )
+    vol = np.array([0.20, 0.15, 0.25, 0.18])
+    cov = pd.DataFrame(np.outer(vol, vol) * corr, index=names, columns=names)
+    return mu, cov
+
+
+def test_max_sharpe_honours_a_leverage_cap():
+    from optimization_engine.optimizers.base import PortfolioConstraints
+    from optimization_engine.optimizers.mean_variance import MaxSharpeOptimizer
+
+    mu, cov = _levered_tangency_inputs()
+    bounds = {a: (-1.0, 1.0) for a in cov.index}
+    free = MaxSharpeOptimizer(
+        expected_returns=mu,
+        cov_matrix=cov,
+        constraints=PortfolioConstraints(long_only=False, fully_invested=True, bounds=bounds),
+    ).optimize()
+    assert free.weights.abs().sum() > 1.3  # the unconstrained tangency wants leverage
+
+    capped = MaxSharpeOptimizer(
+        expected_returns=mu,
+        cov_matrix=cov,
+        constraints=PortfolioConstraints(
+            long_only=False, fully_invested=True, bounds=bounds, leverage=1.2
+        ),
+    ).optimize()
+    assert capped.weights.abs().sum() <= 1.2 + 1e-6
+    assert capped.weights.sum() == pytest.approx(1.0, abs=1e-6)
+    assert capped.extras["violations"] == []
+    assert "ignored_constraints" not in capped.extras
+
+
+def test_max_diversification_honours_a_leverage_cap():
+    from optimization_engine.optimizers.base import PortfolioConstraints
+    from optimization_engine.optimizers.max_diversification import MaxDiversificationOptimizer
+
+    _, cov = _levered_tangency_inputs()
+    bounds = {a: (-1.0, 1.0) for a in cov.index}
+    capped = MaxDiversificationOptimizer(
+        cov_matrix=cov,
+        constraints=PortfolioConstraints(
+            long_only=False, fully_invested=True, bounds=bounds, leverage=1.1
+        ),
+    ).optimize()
+    assert capped.weights.abs().sum() <= 1.1 + 1e-6
+    assert capped.extras["violations"] == []
+
+
+@pytest.mark.parametrize("name", ["max_sharpe", "max_diversification"])
+def test_ray_space_solves_report_an_open_budget_as_ignored(name):
+    from optimization_engine.optimizers.base import PortfolioConstraints
+    from optimization_engine.optimizers.max_diversification import MaxDiversificationOptimizer
+    from optimization_engine.optimizers.mean_variance import MaxSharpeOptimizer
+
+    mu, cov = _levered_tangency_inputs()
+    constraints = PortfolioConstraints(
+        long_only=True, fully_invested=False, bounds={a: (0.0, 1.0) for a in cov.index}
+    )
+    if name == "max_sharpe":
+        optimizer = MaxSharpeOptimizer(expected_returns=mu, cov_matrix=cov, constraints=constraints)
+    else:
+        optimizer = MaxDiversificationOptimizer(cov_matrix=cov, constraints=constraints)
+    with pytest.warns(UserWarning, match="fully_invested=False"):
+        result = optimizer.optimize()
+    assert "fully_invested" in result.extras["ignored_constraints"]
+    assert result.weights.sum() == pytest.approx(1.0, abs=1e-6)
