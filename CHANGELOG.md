@@ -11,9 +11,12 @@ with what to do about it.
 
 ## [Unreleased]
 
-Five numerical fixes from a full-package review; the review itself is in
-`docs/reviews/2026-09-01-code-review.md`. Each one changes a number a user
-may already be looking at, and each is listed with what moves.
+## [0.5.3] — 2026-09-01
+
+Five numerical fixes from a full-package review, and the interface fixes
+that followed it; the review itself is in
+`docs/reviews/2026-09-01-code-review.md`. Each numerical fix changes a
+number a user may already be looking at, and each is listed with what moves.
 
 ### Fixed
 
