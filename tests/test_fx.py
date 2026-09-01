@@ -212,3 +212,31 @@ def test_convert_then_optimize(monkeypatch):
     returns = prices_to_returns(converted)
     run = run_engine(returns, cfg)
     assert run.result.weights.sum() == pytest.approx(1.0, abs=1e-3)
+
+
+def test_a_short_leading_fx_gap_is_valued_at_the_first_known_rate():
+    dates = pd.bdate_range("2024-01-01", periods=10)  # starts on a US holiday
+    prices = pd.DataFrame({"X": np.full(10, 100.0)}, index=dates)
+    fx_rates = pd.DataFrame({"MXN": np.full(9, 1.0 / 17.0)}, index=dates[1:])
+    out = convert_prices_to_base(
+        prices, asset_currency={"X": "MXN"}, base="USD", fx_rates=fx_rates
+    )
+    np.testing.assert_allclose(out["X"].values, np.full(10, 100.0 / 17.0))
+
+
+def test_a_long_leading_fx_gap_is_refused_rather_than_filled_from_the_future():
+    dates = pd.bdate_range("2024-01-01", periods=30)
+    prices = pd.DataFrame({"X": np.full(30, 100.0)}, index=dates)
+    late = dates[fx.MAX_LEADING_FX_GAP + 1 :]
+    fx_rates = pd.DataFrame({"MXN": np.full(len(late), 1.0 / 17.0)}, index=late)
+    # Back-filling a month of prices from a rate observed a month later
+    # values them with information from the future.
+    with pytest.raises(FXError, match="starts"):
+        convert_prices_to_base(
+            prices, asset_currency={"X": "MXN"}, base="USD", fx_rates=fx_rates
+        )
+    # The caller can still ask for it explicitly.
+    out = convert_prices_to_base(
+        prices, asset_currency={"X": "MXN"}, base="USD", fx_rates=fx_rates, fill="bfill"
+    )
+    np.testing.assert_allclose(out["X"].values, np.full(30, 100.0 / 17.0))

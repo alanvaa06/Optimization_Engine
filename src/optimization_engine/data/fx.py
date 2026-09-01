@@ -169,6 +169,13 @@ def fetch_fx_to_base(
     return out[[c for c in universe if c in out.columns]].sort_index()
 
 
+#: How many leading rows a price panel may run ahead of its FX history and
+#: still be valued at the first known rate. Covers a request that starts on
+#: a US holiday, where FRED has no print; anything longer is refused rather
+#: than valued with a rate from the future.
+MAX_LEADING_FX_GAP = 5
+
+
 def convert_prices_to_base(
     prices: pd.DataFrame,
     asset_currency: Mapping[str, str],
@@ -186,15 +193,26 @@ def convert_prices_to_base(
         base: ISO code of the desired base currency.
         fx_rates: Pre-fetched X→base rates. When ``None``, they are fetched
             from FRED over the range of ``prices``.
-        fill: How to fill FX gaps when business-day calendars do not align
-            (``"ffill"`` by default; pass ``None`` to skip).
+        fill: How to fill FX gaps when business-day calendars do not align.
+            ``"ffill"`` (the default) carries the last known rate forward,
+            which is the only direction that uses no future information.
+            A gap *before* the first known rate cannot be forward-filled;
+            it is back-filled from the first rate for at most
+            :data:`MAX_LEADING_FX_GAP` rows — the case of a request that
+            starts on a holiday — and refused beyond that, because valuing
+            a month of prices at a rate from a month later is look-ahead.
+            ``"bfill"`` back-fills without limit; ``None`` skips filling.
 
     Returns:
         A new frame of the same shape as ``prices``, valued in ``base``.
 
     Raises:
-        FXError: If the price index is not a ``DatetimeIndex``, or a rate for
-            one of the panel's currencies is unavailable.
+        FXError: If the price index is not a ``DatetimeIndex``, a rate for
+            one of the panel's currencies is unavailable, or the rate
+            history starts more than :data:`MAX_LEADING_FX_GAP` rows after
+            the prices do.
+        ValueError: On a ``fill`` other than ``"ffill"``, ``"bfill"`` or
+            ``None``.
     """
     base = base.upper()
     if not isinstance(prices.index, pd.DatetimeIndex):
@@ -216,9 +234,11 @@ def convert_prices_to_base(
     fx_rates.index = pd.to_datetime(fx_rates.index)
     aligned = fx_rates.reindex(prices.index)
     if fill == "ffill":
-        aligned = aligned.ffill().bfill()
+        aligned = aligned.ffill().bfill(limit=MAX_LEADING_FX_GAP)
+    elif fill == "bfill":
+        aligned = aligned.bfill()
     elif fill is not None:
-        aligned = aligned.fillna(method=fill)
+        raise ValueError(f"fill must be 'ffill', 'bfill' or None; got {fill!r}.")
 
     out = prices.copy()
     for asset in prices.columns:
@@ -227,7 +247,18 @@ def convert_prices_to_base(
             continue
         if ccy not in aligned.columns:
             raise FXError(f"FX rate for {ccy}->{base} not available.")
-        out[asset] = prices[asset].astype(float) * aligned[ccy].astype(float)
+        rate = aligned[ccy].astype(float)
+        if rate.isna().any():
+            first_rate = fx_rates[ccy].dropna().index.min()
+            raise FXError(
+                f"The {ccy}->{base} rate history starts {first_rate.date()}, "
+                f"more than {MAX_LEADING_FX_GAP} rows after the prices do "
+                f"({prices.index.min().date()}). Trim the panel to where the "
+                "rate exists, or pass fx_rates that cover it — filling the "
+                "gap from a later rate would value those prices with "
+                "information from the future."
+            )
+        out[asset] = prices[asset].astype(float) * rate
     return out
 
 

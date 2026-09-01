@@ -126,7 +126,9 @@ def annualize_returns(
     if prices:
         r = r.pct_change().dropna()
     compounded = (1 + r).prod()
-    n = r.shape[0]
+    # Count the observations that exist, not the rows: ``prod`` skips a NaN,
+    # so counting its row would price a missing period as a zero return.
+    n = r.count()
     return compounded ** (periods_per_year / n) - 1
 
 
@@ -264,7 +266,9 @@ def hit_rate(r: pd.Series | pd.DataFrame, threshold: float = 0.0) -> float | pd.
         instead of it. One value per column for a frame, a scalar for a
         series.
     """
-    return (r > threshold).mean()
+    # A NaN period is neither a win nor a loss, so it leaves the denominator
+    # as well as the numerator; ``(r > t).mean()`` would count it as a loss.
+    return (r > threshold).sum() / r.count()
 
 
 def gain_to_pain_ratio(r: pd.Series | pd.DataFrame) -> float | pd.Series:

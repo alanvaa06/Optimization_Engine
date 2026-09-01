@@ -396,3 +396,52 @@ def test_an_override_stream_marks_the_report_out_of_sample(returns):
     report = run.performance(returns_override=oos)
     assert report.metadata["out_of_sample"] is True
     assert len(report.returns) == len(oos)
+
+
+# ---------------------------------------------------------------------------
+# Streams of unequal length (review fix B4)
+# ---------------------------------------------------------------------------
+
+
+def test_comparisons_score_streams_over_their_common_window(returns):
+    from optimization_engine.analytics.backtest import compare_in_and_out_of_sample
+    from optimization_engine.analytics.performance import summary_stats
+
+    fitted = returns.iloc[:, :5].mean(axis=1)
+    walk_forward = returns.iloc[504:, :3].mean(axis=1) - 0.0004  # starts later, does worse
+
+    table = compare_in_and_out_of_sample(fitted, walk_forward, 252, 0.03)
+    assert not table.isna().any().any(), table[table.isna().any(axis=1)]
+
+    alone = summary_stats(walk_forward.to_frame("x"), periods_per_year=252, riskfree_rate=0.03).T["x"]
+    pd.testing.assert_series_equal(
+        table["Out-of-sample (walk-forward)"], alone, check_names=False
+    )
+    fitted_on_window = summary_stats(
+        fitted.reindex(walk_forward.index).to_frame("x"), periods_per_year=252, riskfree_rate=0.03
+    ).T["x"]
+    pd.testing.assert_series_equal(table["In-sample (fitted)"], fitted_on_window, check_names=False)
+
+    side_by_side = compare_performance(
+        {"fitted": fitted, "walk-forward": walk_forward}, returns.mean(axis=1), riskfree_rate=0.03
+    )
+    assert not side_by_side.isna().any().any()
+    assert side_by_side.loc["walk-forward", "Annualized Return"] == pytest.approx(
+        alone["Annualized Return"]
+    )
+
+
+def test_a_nan_period_is_neither_a_return_nor_a_loss(returns):
+    from optimization_engine.analytics.performance import annualize_returns, hit_rate
+    from optimization_engine.analytics.risk import cvar_historic, var_historic
+
+    stream = returns.iloc[:, 0]
+    padded = pd.concat([pd.Series(np.nan, index=returns.index[:300]), stream.iloc[300:]])
+    alone = stream.iloc[300:]
+
+    assert annualize_returns(padded, 252) == pytest.approx(annualize_returns(alone, 252))
+    assert hit_rate(padded) == pytest.approx(hit_rate(alone))
+    assert var_historic(padded) == pytest.approx(var_historic(alone))
+    assert cvar_historic(padded) == pytest.approx(cvar_historic(alone))
+    frame = pd.DataFrame({"padded": padded, "alone": alone})
+    assert annualize_returns(frame, 252)["padded"] == pytest.approx(annualize_returns(alone, 252))

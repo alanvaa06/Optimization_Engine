@@ -363,3 +363,55 @@ def test_backtest_rejects_a_malformed_sweep(feasible_config, capsys):
     )
     err = capsys.readouterr().err
     assert "Sweep skipped" in err and "PATH=V1,V2" in err
+
+
+# ---------------------------------------------------------------------------
+# check and optimize see the same mandate (review fix E1)
+# ---------------------------------------------------------------------------
+
+
+def test_check_and_optimize_accept_the_same_config_without_expected_returns(
+    tmp_path, capsys
+):
+    # A method that needs no mu, and a config that supplies none: the vector
+    # is estimated from history. `check` called this ready while `optimize`
+    # refused it with "no expected returns matching the price columns".
+    config = tmp_path / "rp.yaml"
+    config.write_text("optimizer:\n  name: risk_parity\n")
+    assert main(["check", "--config", str(config), "--sample"]) == 0
+    assert "Ready to optimize." in capsys.readouterr().out
+    out_path = tmp_path / "rp.xlsx"
+    assert (
+        main(["optimize", "--config", str(config), "--sample", "--output", str(out_path)])
+        == 0
+    )
+    assert "no expected returns" not in capsys.readouterr().err
+    assert out_path.exists()
+
+
+def test_check_honours_the_benchmark_flags_optimize_does(feasible_config, capsys):
+    # A tracking-error budget tight enough to be unreachable has to fail the
+    # pre-flight the same way it fails the solve, or `check` is validating a
+    # different mandate.
+    code = main(
+        [
+            "check", "--config", str(feasible_config), "--sample",
+            "--benchmark", "equal_weight", "--max-tracking-error", "0.0001",
+        ]
+    )
+    captured = capsys.readouterr()
+    assert code == 1, captured.out + captured.err
+    assert "Not ready to optimize." in captured.err
+
+
+def test_backtest_no_longer_seeds_zero_expected_returns(tmp_path, capsys):
+    # A return target with no explicit mu was infeasible before the walk-
+    # forward even started, because the seed solve saw a vector of zeros
+    # rather than the history-derived one every window would then use.
+    config = tmp_path / "target.yaml"
+    config.write_text(
+        "optimizer:\n  name: mean_variance\n  target_return: 0.04\n"
+    )
+    assert main(["backtest", "--config", str(config), "--sample", "--lookback", "504",
+                 "--rebalance-every", "252"]) == 0
+    assert "initial solve failed" not in capsys.readouterr().err

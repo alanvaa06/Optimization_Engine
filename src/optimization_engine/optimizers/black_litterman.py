@@ -352,6 +352,12 @@ class BlackLittermanOptimizer(BaseOptimizer):
         self.risk_aversion = float(risk_aversion)
         self.market_return = market_return
         self.calibrate_risk_aversion = bool(calibrate_risk_aversion)
+        # The posterior the last solve optimized against. Kept apart from the
+        # inputs so that a second ``optimize()`` starts from the same prior as
+        # the first — writing the posterior back over ``cov_matrix`` made every
+        # call reverse-optimize from the previous call's answer.
+        self._posterior_mean: pd.Series | None = None
+        self._posterior_cov: pd.DataFrame | None = None
 
     def _market_portfolio(self) -> pd.Series:
         if self.market_weights is None:
@@ -407,12 +413,19 @@ class BlackLittermanOptimizer(BaseOptimizer):
             }
         )
 
+        # ``π = δΣw`` is the first-order condition of ``μ'w − (δ/2)·w'Σw``;
+        # the mean-variance utility is ``μ'w − λ·w'Σw`` with no half. Handing
+        # it ``λ = δ/2`` is what makes the two agree — and what makes the
+        # defining check of the model hold: with no views, the posterior is
+        # the prior and the solve returns the market portfolio. With ``λ = δ``
+        # the effective aversion is doubled and the no-view answer lands
+        # halfway between the market and the minimum-variance portfolio.
         sub_optimizer = MeanVarianceOptimizer(
             expected_returns=post_mean,
             cov_matrix=post_cov,
             constraints=self.constraints,
             risk_free_rate=self.risk_free_rate,
-            risk_aversion=delta,
+            risk_aversion=delta / 2.0,
         )
         result = sub_optimizer.optimize()
         self._diagnostics.update(
@@ -422,8 +435,25 @@ class BlackLittermanOptimizer(BaseOptimizer):
                 if k in ("solver", "solver_status", "solve_seconds", "mode")
             }
         )
-        # The posterior covariance is what the sub-solve optimized against;
-        # reporting portfolio risk against the prior would understate it.
-        self.cov_matrix = post_cov
-        self.expected_returns = post_mean
+        # The posterior is what the sub-solve optimized against, so the
+        # result's return and risk are reported against it (see
+        # ``_mu_vector`` / ``_sigma_matrix``); the prior inputs stay as given.
+        self._posterior_mean = post_mean
+        self._posterior_cov = post_cov
         return result.weights.reindex(self.assets).fillna(0.0).values
+
+    def _mu_vector(self) -> np.ndarray | None:
+        """The posterior mean once solved, so the reported return is the one optimized."""
+        if self._posterior_mean is None:
+            return super()._mu_vector()
+        return self._posterior_mean.reindex(self.assets).fillna(0.0).to_numpy(dtype=float)
+
+    def _sigma_matrix(self) -> np.ndarray | None:
+        """The posterior covariance once solved; risk against the prior would understate it."""
+        if self._posterior_cov is None:
+            return super()._sigma_matrix()
+        return (
+            self._posterior_cov.reindex(index=self.assets, columns=self.assets)
+            .fillna(0.0)
+            .to_numpy(dtype=float)
+        )

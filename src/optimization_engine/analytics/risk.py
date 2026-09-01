@@ -122,7 +122,7 @@ def var_historic(r: pd.Series | pd.DataFrame, level: float = 5) -> float | pd.Se
     if isinstance(r, pd.DataFrame):
         return r.aggregate(var_historic, level=level)
     if isinstance(r, pd.Series):
-        return -np.percentile(r, level)
+        return -np.percentile(r.dropna(), level)
     raise TypeError("Expected Series or DataFrame")
 
 

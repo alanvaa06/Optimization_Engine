@@ -45,7 +45,7 @@ bounds:
 # so the optimizer sees one homogeneous universe rather than four currencies
 # pretending to be comparable.
 base_currency: USD
-asset_currency:
+currencies:
   SP500: USD
   DAX: EUR
   NIKKEI225: JPY

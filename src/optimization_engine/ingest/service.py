@@ -24,6 +24,8 @@ should not have to compare column counts to find out.
 from __future__ import annotations
 
 import concurrent.futures
+import hashlib
+import json
 import logging
 import time
 from collections.abc import Mapping, Sequence
@@ -220,8 +222,11 @@ def ingest(
         if (use_cache and request.cache_dir)
         else None
     )
+    # The provider options are part of what was fetched — ``path=`` decides
+    # which file the ``file`` provider reads — so they are part of the key.
+    cache_key = _cache_key(request, provider_options)
     if cache is not None:
-        cached = cache.load(request.fingerprint())
+        cached = cache.load(cache_key)
         if cached is not None:
             panel, entry = cached
             # The fingerprint covers what was fetched, not what the caller
@@ -269,8 +274,9 @@ def ingest(
     panel = _apply_catalog_metadata(panel, source.name)
     panel = _reorder(panel, request.identifiers)
 
+    fx_degraded = False
     if request.currency:
-        panel, currency_note = _convert_currency(panel, request.currency)
+        panel, currency_note, fx_degraded = _convert_currency(panel, request.currency)
         if currency_note:
             warnings.append(currency_note)
 
@@ -280,7 +286,17 @@ def ingest(
     )
 
     if cache is not None:
-        cache.store(request.fingerprint(), panel)
+        # Only a panel that is what the request asked for goes into the
+        # cache. One with a failed or missing identifier would come back on
+        # every warm run for the length of the TTL as "the provider returned
+        # no series", and never be retried; one whose currency conversion
+        # degraded would be served under a fingerprint that claims the base
+        # currency while holding native quotes.
+        not_cached = _uncacheable_reason(outcomes, fx_degraded)
+        if not_cached:
+            warnings.append(f"Not cached: {not_cached}")
+        else:
+            cache.store(cache_key, panel)
 
     return IngestResult(
         panel=panel,
@@ -537,7 +553,42 @@ def _reorder(panel: PricePanel, identifiers: tuple[str, ...]) -> PricePanel:
     return panel.select([*present, *extra])
 
 
-def _convert_currency(panel: PricePanel, base: str) -> tuple[PricePanel, str]:
+def _cache_key(request: IngestRequest, provider_options: Mapping[str, Any]) -> str:
+    """The request's fingerprint, extended by the provider options that shape the data.
+
+    Without them the ``file`` provider served file A's panel for file B, and
+    the ``sample`` provider one seed's panel for another, whenever the
+    identifiers and window matched. A request with no options keeps the
+    bare fingerprint, so existing cache entries stay valid.
+    """
+    fingerprint = request.fingerprint()
+    if not provider_options:
+        return fingerprint
+    blob = json.dumps(
+        {"fingerprint": fingerprint, "options": provider_options},
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]
+
+
+def _uncacheable_reason(
+    outcomes: tuple[IdentifierOutcome, ...], fx_degraded: bool
+) -> str:
+    """Why this panel must not be cached, or ``""`` when it may be."""
+    if fx_degraded:
+        return "the currency conversion fell back to native quotes."
+    not_ok = [o.identifier for o in outcomes if o.status in (STATUS_FAILED, STATUS_MISSING)]
+    if not_ok:
+        return (
+            f"{', '.join(not_ok)} did not arrive, and a cached panel would not "
+            "be retried."
+        )
+    return ""
+
+
+def _convert_currency(panel: PricePanel, base: str) -> tuple[PricePanel, str, bool]:
     """Convert every price field into ``base``.
 
     Volume is left alone — it counts shares, not money — and every price field
@@ -546,7 +597,8 @@ def _convert_currency(panel: PricePanel, base: str) -> tuple[PricePanel, str]:
 
     A conversion that cannot be sourced degrades to the native quote with a
     warning rather than failing the run: a panel in mixed currencies that says
-    so is more useful than no panel at all.
+    so is more useful than no panel at all. The third value says whether that
+    happened, so the caller can keep the degraded panel out of the cache.
     """
     known = {
         identifier: record.currency
@@ -562,8 +614,8 @@ def _convert_currency(panel: PricePanel, base: str) -> tuple[PricePanel, str]:
                 f"in, so they were left as they arrived rather than converted "
                 f"to {base}. If any of them is not already in {base}, its "
                 "returns are not comparable with the rest."
-            )
-        return panel, ""
+            ), False
+        return panel, "", False
 
     converted: dict[str, pd.DataFrame] = {}
     try:
@@ -576,7 +628,7 @@ def _convert_currency(panel: PricePanel, base: str) -> tuple[PricePanel, str]:
         return panel, (
             f"Could not convert to {base} ({exc}); series are shown in their "
             "native currencies."
-        )
+        ), True
 
     # Only series whose currency was actually known get stamped with the base.
     # One with no declared currency was *assumed* to be in the base already;
@@ -600,7 +652,7 @@ def _convert_currency(panel: PricePanel, base: str) -> tuple[PricePanel, str]:
             f" {', '.join(unknown)} declare no currency and were left as they "
             f"arrived — they are only comparable if they were already in {base}."
         )
-    return PricePanel.from_frames(converted, updated), note
+    return PricePanel.from_frames(converted, updated), note, False
 
 
 def _volume_notes(panel: PricePanel, request: IngestRequest) -> list[str]:

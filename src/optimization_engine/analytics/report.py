@@ -483,12 +483,17 @@ def compare_performance(
         benchmark_returns: A common benchmark. When ``None``, only the
             absolute statistics are computed.
         periods_per_year: Annualization basis for every stream.
-        riskfree_rate: Per-period risk-free rate used by the ratio metrics.
+        riskfree_rate: Annual risk-free rate used by the ratio metrics.
 
     Returns:
-        A frame with one row per statistic and one column per stream. With a
-        benchmark, the relative statistics are joined on with a ``" (rel)"``
-        suffix where a name would otherwise collide.
+        A frame with one row per statistic and one column per stream, every
+        stream scored over the periods they *all* cover. A stream that starts
+        later — a walk-forward beside a fitted replay — shortens the window
+        for the others rather than being padded to their length, because a
+        padded period would be scored as a zero return and the comparison
+        would flatter whichever stream was shortest. With a benchmark, the
+        relative statistics are joined on with a ``" (rel)"`` suffix where a
+        name would otherwise collide.
 
     Raises:
         ValueError: If ``streams`` is empty.
@@ -497,7 +502,7 @@ def compare_performance(
     """
     if not streams:
         raise ValueError("compare_performance needs at least one return stream.")
-    frame = pd.concat(streams, axis=1).dropna(how="all")
+    frame = pd.concat(streams, axis=1, join="inner").dropna(how="any")
     out = summary_stats(
         frame,
         periods_per_year=periods_per_year,
