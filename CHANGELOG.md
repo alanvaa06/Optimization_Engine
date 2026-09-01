@@ -11,6 +11,8 @@ with what to do about it.
 
 ## [Unreleased]
 
+## [0.5.2] — 2026-09-01
+
 Documentation only. No behaviour changed, no signature moved, and the test
 suite is untouched — but the reference the library never had now exists, and
 CI fails if it stops building.
@@ -260,7 +262,8 @@ providers, with per-identifier provenance), the stateless backtest core with
 its cost model and trial counting, the walk-forward and final-holdout audit
 path, and the constraint-layer editor in the Streamlit app.
 
-[Unreleased]: https://github.com/alanvaa06/optimization_engine/compare/v0.5.1...HEAD
+[Unreleased]: https://github.com/alanvaa06/optimization_engine/compare/v0.5.2...HEAD
+[0.5.2]: https://github.com/alanvaa06/optimization_engine/compare/v0.5.1...v0.5.2
 [0.5.1]: https://github.com/alanvaa06/optimization_engine/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/alanvaa06/optimization_engine/compare/v0.4.1...v0.5.0
 [0.4.1]: https://github.com/alanvaa06/optimization_engine/compare/v0.4.0...v0.4.1
