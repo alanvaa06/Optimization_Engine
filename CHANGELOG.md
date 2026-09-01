@@ -70,6 +70,54 @@ may already be looking at, and each is listed with what moves.
   `expected_returns_from_history`) and divides the quadratic form by it.
   Every `expected_returns_method="shrunk_mean"` vector moves, toward the
   minimum-variance portfolio's return.
+- **`check`, `optimize` and `backtest` build their inputs the same way.** The
+  three commands each assembled config, panel, currency, universe and
+  benchmark by hand, and had drifted: `optimize` refused a config with no
+  `expected_returns` block that `check` had just called ready; `check` never
+  saw `--base-currency`, `--benchmark` or the two active-risk limits;
+  `backtest` seeded zero expected returns for its first solve, so a return
+  target with no explicit vector was infeasible before the walk-forward
+  started. One `_prepare_inputs` now serves all three, `check` accepts the
+  flags `optimize` does, and a config that relies on `expected_returns_method`
+  solves everywhere it pre-flights. When `--ingest-currency` has already
+  converted the panel, `config.currencies` is no longer applied a second time.
+- **`--json` failures carry their reason.** A command that *returned* a
+  non-zero code, rather than raising, emitted `"the command exited before
+  producing a result"`; the message it printed to stderr now travels in the
+  payload's `error` field.
+- **MCP `optimizer=` keeps the rest of the mandate.** It replaced the whole
+  optimizer block, so a max-Sharpe override solved against a risk-free rate
+  of zero on a config that said 4%, and dropped the return target with it.
+- **MCP `optimize` reports an infeasible mandate as a `ToolError`.** The
+  branch that wrapped the feasibility report was unreachable, because the
+  engine's default lets the solver fail instead; the client saw a wrapped,
+  message-less exception. Solver failures are wrapped the same way.
+- **MCP `backtest` is shaped by its config.** The spec is now built on the
+  config's `periods_per_year` (a monthly config was simulated as daily),
+  trades only when the process re-solves (`frequency="none"`, matching the
+  CLI and `EngineRun.walk_forward_run`), measures Sharpe against the
+  config's risk-free rate, and defaults `lookback`/`rebalance_every` from the
+  basis rather than from hard-coded daily counts.
+- **The ingest cache refuses what it must not keep.** A panel with a failed
+  or missing identifier was cached and served for the TTL as "the provider
+  returned no series", never retried; a panel whose currency conversion had
+  fallen back to native quotes was cached under a fingerprint claiming the
+  base currency. Neither is stored now, and the run says `Not cached:` with
+  the reason. The cache key also covers the provider options, so the `file`
+  provider no longer serves file A's panel for file B.
+- **FX alignment no longer back-fills from the future.** A leading gap in
+  the rate history — prices starting before the first known rate — was
+  filled with a *later* rate without limit. It is now filled for at most
+  `MAX_LEADING_FX_GAP` (5) rows, the case of a request that starts on a
+  holiday, and refused with an `FXError` beyond that; `fill="bfill"` asks for
+  it explicitly. `fill="bfill"` also works on pandas 3, where the
+  `fillna(method=)` it used to call no longer exists.
+- **A config with a key the loader does not read is refused.** `max_tracking_eror:
+  0.03` loaded cleanly and constrained nothing; `EngineConfig.from_dict` now
+  raises `ConfigurationError` naming the unknown key, and an unknown optimizer
+  key raises the same rather than a bare `TypeError`. The shipped
+  `config/indices.yaml` spelled its currency block `asset_currency`, which
+  nothing read; it is `currencies` now, so its non-USD indices are converted.
 
 ## [0.5.2] — 2026-09-01
 

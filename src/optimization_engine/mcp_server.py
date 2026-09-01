@@ -24,6 +24,7 @@ That is the honest behaviour for an optimizer; it is not a hung server.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import Any
 
 import pandas as pd
@@ -150,7 +151,11 @@ def _config(config_path: str | None, optimizer: str | None) -> Any:
         except Exception as exc:
             raise ToolError(f"Could not read {config_path}: {exc}") from exc
         if optimizer:
-            config.optimizer = OptimizerSpec(name=optimizer)
+            # Swap the method, keep the rest: the risk-free rate, the return
+            # target, the risk budget and the views are part of the mandate.
+            # Replacing the whole spec silently solved max-Sharpe against a
+            # cash rate of zero on a config that said 4%.
+            config.optimizer = replace(config.optimizer, name=optimizer)
         return config
     return EngineConfig(optimizer=OptimizerSpec(name=optimizer or "risk_parity"))
 
@@ -302,21 +307,27 @@ def optimize(
         discards what distinguishes this engine.
 
     Raises:
-        ToolError: If the mandate has no solution. The message carries the
-            feasibility report naming the binding constraint.
+        ToolError: If the mandate has no solution, or no solver could
+            produce one. The message carries the feasibility report naming
+            the binding constraint.
     """
     from optimization_engine.engine import run_engine
+    from optimization_engine.optimizers._cvxpy_helpers import SolverFailure
     from optimization_engine.optimizers.feasibility import InfeasibleConstraintsError
 
     config = _config(config_path, optimizer)
     _, returns = _panel(sample, prices_path)
     try:
-        run = run_engine(returns, config)
+        run = run_engine(returns, config, raise_on_infeasible=True)
     except InfeasibleConstraintsError as exc:
         # Anticipated, and the most useful failure this tool has: the
         # message names which constraints cannot hold together. Call
         # `check_mandate` to get the same finding as data rather than text.
+        # ``raise_on_infeasible`` is what makes this branch reachable — the
+        # engine's default is to let the solver fail instead.
         raise ToolError(f"The mandate has no solution: {exc}") from exc
+    except SolverFailure as exc:
+        raise ToolError(f"No solver could produce an allocation: {exc}") from exc
     return optimization_payload(run)
 
 
@@ -334,22 +345,29 @@ def backtest(
     sample: bool = False,
     prices_path: str | None = None,
     optimizer: str | None = None,
-    lookback: int = 504,
-    rebalance_every: int = 63,
+    lookback: int | None = None,
+    rebalance_every: int | None = None,
     commission_bps: float = 5.0,
     slippage_bps: float = 5.0,
 ) -> dict[str, Any]:
     """Simulate the process, rather than replaying a fitted allocation.
+
+    The run is shaped by the config the same way ``optengine backtest`` is:
+    annualized on the config's ``periods_per_year``, traded only when the
+    process re-solves, and its Sharpe measured against the config's
+    risk-free rate.
 
     Args:
         config_path: Path to a YAML mandate. Omit for a minimal default.
         sample: Use the built-in synthetic price panel.
         prices_path: A CSV, Excel or Parquet file of prices.
         optimizer: Override the config's method.
-        lookback: Estimation window, in periods.
-        rebalance_every: Periods between rebalances.
-        commission_bps: Broker commission, in basis points of traded value.
-        slippage_bps: Slippage, in basis points of traded value.
+        lookback: Estimation window, in periods. Defaults to two years on
+            the config's ``periods_per_year``.
+        rebalance_every: Periods between re-solves. Defaults to one quarter.
+        commission_bps: Broker commission, in basis points of traded value,
+            per side.
+        slippage_bps: Slippage, in basis points of traded value, per side.
 
     Returns:
         ``spec_hash`` and ``result_hash`` identify the run; ``degradations``
@@ -357,26 +375,31 @@ def backtest(
         costs are optimistic.
     """
     from optimization_engine.backtest.spec import BacktestSpec, CostSpec
-    from optimization_engine.backtest.tearsheet import build_tearsheet
     from optimization_engine.engine import run_engine
+    from optimization_engine.optimizers._cvxpy_helpers import SolverFailure
 
     config = _config(config_path, optimizer)
     _, returns = _panel(sample, prices_path)
     spec = BacktestSpec(
         costs=CostSpec(commission_bps=commission_bps, slippage_bps=slippage_bps),
+        periods_per_year=config.periods_per_year,
+        frequency="none",
     )
     # Feasibility is checked by `check_mandate`; re-running it here would
     # reject a mandate the walk-forward could still say something useful
     # about on the windows where it does solve.
-    run = run_engine(returns, config, check_feasibility=False)
-    walk = run.walk_forward_run(
-        lookback=lookback,
-        rebalance_every=rebalance_every,
-        spec=spec,
-    )
-    return backtest_payload(
-        walk.run, tearsheet=build_tearsheet(walk.run, returns)
-    )
+    try:
+        run = run_engine(returns, config, check_feasibility=False)
+        walk = run.walk_forward_run(
+            lookback=lookback,
+            rebalance_every=rebalance_every,
+            spec=spec,
+        )
+    except SolverFailure as exc:
+        raise ToolError(f"The initial solve failed: {exc}") from exc
+    except ValueError as exc:
+        raise ToolError(f"The walk-forward could not run: {exc}") from exc
+    return backtest_payload(walk.run, tearsheet=run.tearsheet(walk.run))
 
 
 def main() -> None:

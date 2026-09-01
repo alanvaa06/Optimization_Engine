@@ -91,6 +91,23 @@ class OptimizerSpec:
         return {k: v for k, v in self.__dict__.items() if v is not None}
 
 
+#: Every key :meth:`EngineConfig.from_dict` reads. A key outside this set is
+#: a typo or a field from another schema, and either way the config would
+#: load while silently not doing what its author wrote.
+_CONFIG_KEYS = frozenset(
+    {
+        "expected_returns", "bounds", "groups", "group_bounds", "constraint_layers",
+        "currencies", "base_currency", "periods_per_year", "covariance_method",
+        "ewma_lambda", "denoise", "denoise_method", "denoise_alpha", "detone",
+        "expected_returns_method", "ema_span", "market_return", "market_weights",
+        "optimizer", "benchmark", "benchmark_weights", "max_tracking_error",
+        "max_active_share", "long_only", "fully_invested", "leverage",
+        "previous_weights", "turnover_limit",
+    }
+)
+_OPTIMIZER_KEYS = frozenset(OptimizerSpec.__dataclass_fields__)
+
+
 @dataclass
 class EngineConfig:
     """Complete engine configuration.
@@ -311,12 +328,32 @@ class EngineConfig:
             A validated :class:`EngineConfig`.
 
         Raises:
+            ConfigurationError: If the mapping carries a key this class does
+                not read, or the optimizer block carries one
+                :class:`OptimizerSpec` does not. A misspelt ``max_tracking_eror``
+                used to load cleanly and simply not constrain anything.
             LayerConfigurationError: If a constraint layer is malformed.
             BenchmarkError: If the benchmark block is malformed.
         """
+        from optimization_engine.optimizers import ConfigurationError
+
+        if data is None:
+            data = {}
+        unknown = sorted(k for k in data if k not in _CONFIG_KEYS)
+        if unknown:
+            raise ConfigurationError(
+                f"Unknown config key(s): {', '.join(unknown)}. Known keys: "
+                f"{', '.join(sorted(_CONFIG_KEYS))}."
+            )
         opt_raw = data.get("optimizer") or {}
         if isinstance(opt_raw, str):
             opt_raw = {"name": opt_raw}
+        unknown_opt = sorted(k for k in opt_raw if k not in _OPTIMIZER_KEYS)
+        if unknown_opt:
+            raise ConfigurationError(
+                f"Unknown optimizer key(s): {', '.join(unknown_opt)}. Known keys: "
+                f"{', '.join(sorted(_OPTIMIZER_KEYS))}."
+            )
         return cls(
             expected_returns=dict(data.get("expected_returns") or {}),
             bounds={k: list(v) for k, v in (data.get("bounds") or {}).items()},

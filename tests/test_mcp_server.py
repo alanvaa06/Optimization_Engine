@@ -153,3 +153,46 @@ def test_tool_error_is_the_sdk_class():
     """Guards the import in `mcp_server`, which is what makes the above work."""
     assert issubclass(ToolError, Exception)
     assert ToolError.__name__ == "ToolError"
+
+
+def test_an_optimizer_override_keeps_the_rest_of_the_mandate():
+    from optimization_engine.config import load_config
+    from optimization_engine.mcp_server import _config
+
+    original = load_config(CONFIG).optimizer
+    overridden = _config(CONFIG, "max_sharpe").optimizer
+    assert overridden.name == "max_sharpe"
+    # Replacing the whole spec solved max-Sharpe against a cash rate of zero
+    # on a config that said otherwise, and dropped the return target with it.
+    assert overridden.risk_free_rate == original.risk_free_rate
+    assert overridden.target_return == original.target_return
+    assert overridden.risk_aversion == original.risk_aversion
+
+
+def test_an_infeasible_mandate_fails_with_its_report(tmp_path):
+    import yaml
+
+    data = yaml.safe_load(Path(CONFIG).read_text())
+    data["bounds"] = {a: [0.0, 0.05] for a in data["expected_returns"]}
+    bad = tmp_path / "bad.yaml"
+    bad.write_text(yaml.safe_dump(data))
+    # The engine's default lets the solver fail instead of raising the
+    # feasibility report, which made the ToolError branch unreachable and
+    # handed the client a message-less wrapped exception.
+    message = failure("optimize", {"config_path": str(bad), "sample": True})
+    assert "no solution" in message
+    assert "100%" in message or "cap" in message.lower()
+
+
+def test_backtest_is_shaped_by_the_config_it_is_handed(tmp_path):
+    daily = call("backtest", {"sample": True, "optimizer": "risk_parity"})
+    monthly_config = tmp_path / "monthly.yaml"
+    monthly_config.write_text("periods_per_year: 12\noptimizer: risk_parity\n")
+    monthly = call(
+        "backtest",
+        {"config_path": str(monthly_config), "sample": True, "lookback": 504, "rebalance_every": 63},
+    )
+    # The spec hash covers the annualization basis and the trading cadence;
+    # a monthly config used to be simulated as daily, so the two agreed.
+    assert daily["spec_hash"] != monthly["spec_hash"]
+    assert daily["window"]["n_periods"] > 0

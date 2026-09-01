@@ -622,7 +622,8 @@ def test_a_series_with_no_declared_currency_is_not_stamped_as_converted():
     from optimization_engine.ingest.service import _convert_currency
 
     panel = _panel_with_currency("AAA", None)
-    converted, note = _convert_currency(panel, "USD")
+    converted, note, degraded = _convert_currency(panel, "USD")
+    assert not degraded
     # It was assumed to be in USD, not converted to it. Labelling it USD turns
     # an assumption into a claim.
     assert converted.meta["AAA"].currency is None
@@ -632,7 +633,8 @@ def test_a_series_with_no_declared_currency_is_not_stamped_as_converted():
 def test_a_series_with_a_declared_matching_currency_needs_no_note():
     from optimization_engine.ingest.service import _convert_currency
 
-    converted, note = _convert_currency(_panel_with_currency("AAA", "USD"), "USD")
+    converted, note, degraded = _convert_currency(_panel_with_currency("AAA", "USD"), "USD")
+    assert not degraded
     assert note == ""
     assert converted.meta["AAA"].currency == "USD"
 
@@ -788,3 +790,65 @@ def test_clear_removes_entries_and_the_directories_version_one_wrote(tmp_path):
 
     assert cache.clear() == 3
     assert list(tmp_path.iterdir()) == []
+
+
+# ---------------------------------------------------------------------------
+# What the cache refuses to keep (review fixes I1, I2, I3)
+# ---------------------------------------------------------------------------
+
+
+def test_a_partially_failed_run_is_not_cached_and_is_retried(tmp_path):
+    stub = StubProvider(failures={"BBB": ProviderTransientError("429")})
+    request = _request(cache_dir=str(tmp_path))
+    first = ingest(request, provider=stub)
+    assert not first.is_complete
+    assert any(note.startswith("Not cached:") for note in first.warnings)
+
+    stub.failures.clear()  # the provider recovers
+    second = ingest(request, provider=stub)
+    # Before the fix this came back from the cache with BBB relabelled
+    # "missing" for the length of the TTL, and the provider was never asked.
+    assert not second.from_cache
+    assert second.is_complete
+    third = ingest(request, provider=stub)
+    assert third.from_cache and third.is_complete
+
+
+def test_a_degraded_currency_conversion_is_not_cached(tmp_path, monkeypatch):
+    from optimization_engine.data.fx import FXError
+    from optimization_engine.ingest import service
+
+    class Foreign(StubProvider):
+        def fetch_one(self, identifier, request):
+            self.calls.append((identifier,))
+            return _panel_with_currency(identifier, "MXN")
+
+    attempts = []
+
+    def flaky(frame, asset_currency, base, **_):
+        attempts.append(base)
+        if len(attempts) == 1:
+            raise FXError("FRED down")
+        return frame * 0.05
+
+    monkeypatch.setattr(service, "convert_prices_to_base", flaky)
+    request = _request(("AAA",), currency="USD", cache_dir=str(tmp_path))
+    degraded = ingest(request, provider=Foreign())
+    assert any("Could not convert" in note for note in degraded.warnings)
+    assert any(note.startswith("Not cached:") for note in degraded.warnings)
+    assert degraded.panel.meta["AAA"].currency == "MXN"
+
+    healthy = ingest(request, provider=Foreign())
+    assert not healthy.from_cache
+    assert healthy.panel.meta["AAA"].currency == "USD"
+
+
+def test_provider_options_are_part_of_the_cache_key(tmp_path):
+    stub = StubProvider()
+    request = _request(("AAA",), cache_dir=str(tmp_path))
+    first = ingest(request, provider=stub, path="a.csv")
+    other = ingest(request, provider=stub, path="b.csv")
+    same = ingest(request, provider=stub, path="a.csv")
+    assert not first.from_cache
+    assert not other.from_cache  # a different file is different data
+    assert same.from_cache

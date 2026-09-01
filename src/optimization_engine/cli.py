@@ -7,6 +7,7 @@ import contextlib
 import sys
 import traceback
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 
 import pandas as pd
@@ -301,6 +302,15 @@ def _build_parser() -> argparse.ArgumentParser:
         "--detone", type=int, default=None, metavar="K",
         help="Remove K leading eigenvectors after denoising.",
     )
+    check.add_argument(
+        "--base-currency", help="Override the config's base currency for FX conversion."
+    )
+    check.add_argument(
+        "--benchmark",
+        help="Benchmark to check the mandate against: a kind or an asset name.",
+    )
+    check.add_argument("--max-tracking-error", type=float, default=None)
+    check.add_argument("--max-active-share", type=float, default=None)
 
     _add_ingest_arguments(check)
 
@@ -360,33 +370,12 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def _cmd_optimize(args: argparse.Namespace) -> int:
-    from optimization_engine.data.quality import analyze_prices
     from optimization_engine.optimizers.feasibility import InfeasibleConstraintsError
 
-    config = load_config(args.config)
-    try:
-        prices = _load_prices_for(args, config)
-    except YahooFinanceError as exc:
-        print(f"Yahoo Finance error: {exc}", file=sys.stderr)
-        return 2
-
-    _apply_estimator_flags(config, args)
-    if args.base_currency:
-        config.base_currency = args.base_currency.upper()
-    if config.currencies:
-        try:
-            prices = apply_fx_conversion(prices, config)
-        except FXError as exc:
-            print(f"FX conversion failed: {exc}", file=sys.stderr)
-            return 2
-
-    common = set(prices.columns) & set(config.expected_returns.keys())
-    if not common:
-        print("Config has no expected returns matching the price columns.", file=sys.stderr)
-        return 2
-    prices = prices[sorted(common)]
-
-    quality = analyze_prices(prices, periods_per_year=config.periods_per_year)
+    inputs = _prepare_inputs(args)
+    if isinstance(inputs, int):
+        return inputs
+    config, returns, quality = inputs.config, inputs.returns, inputs.quality
     for issue in quality.errors:
         print(f"Data error — {issue.describe()}", file=sys.stderr)
     for issue in quality.warnings:
@@ -397,20 +386,6 @@ def _cmd_optimize(args: argparse.Namespace) -> int:
             "proceed anyway.",
             file=sys.stderr,
         )
-        return 2
-
-    returns = prices_to_returns(prices).dropna(how="any")
-    if returns.empty:
-        print("No usable returns after alignment.", file=sys.stderr)
-        return 2
-    config.expected_returns = {
-        a: config.expected_returns[a] for a in returns.columns
-    }
-
-    try:
-        _apply_benchmark_flags(config, args, list(returns.columns))
-    except (BenchmarkError, ValueError) as exc:
-        print(f"Benchmark error: {exc}", file=sys.stderr)
         return 2
 
     try:
@@ -853,14 +828,12 @@ def _run_ingest(args: argparse.Namespace):
     return result
 
 
-def _load_prices_for(args: argparse.Namespace, config):
-    """Resolve the price panel from whichever source the flags name.
+def _load_prices_for(args: argparse.Namespace):
+    """Resolve the price panel from whichever legacy flag names it.
 
-    ``--provider`` takes precedence over every legacy flag: it is the newer,
-    explicit path, and a run that names a provider means it.
+    ``--provider`` is handled by :func:`_prepare_inputs`, which needs the
+    whole ingest result rather than the prices alone.
     """
-    if getattr(args, "provider", None):
-        return _run_ingest(args).prices
     if getattr(args, "yahoo", None):
         if args.yahoo_start:
             return load_prices_yahoo(
@@ -870,6 +843,116 @@ def _load_prices_for(args: argparse.Namespace, config):
     if args.sample or not args.prices:
         return sample_dataset()
     return load_prices(args.prices, sheet_name=args.sheet)
+
+
+@dataclass
+class _Inputs:
+    """What every solving command starts from, built one way."""
+
+    config: object
+    prices: pd.DataFrame
+    returns: pd.DataFrame
+    quality: object
+    volumes: pd.DataFrame | None
+
+
+def _fail(args: argparse.Namespace, message: str, code: int = 2) -> int:
+    """Report a failure on stderr — and into the JSON payload, when there is one."""
+    print(message, file=sys.stderr)
+    sink = getattr(args, "_json_sink", None)
+    if sink is not None:
+        sink.setdefault("error", message)
+    return code
+
+
+def _prepare_inputs(args: argparse.Namespace) -> _Inputs | int:
+    """Load the config and the panel, and shape both the way the solve needs.
+
+    ``check``, ``optimize`` and ``backtest`` all start here, which is what
+    makes a pre-flight worth running: it validates the mandate the solve
+    goes on to see — same panel, same currency, same universe, same
+    benchmark flags — rather than a mandate assembled slightly differently.
+    Each used to build its inputs by hand, and they drifted: ``optimize``
+    refused a config with no ``expected_returns`` block that ``check`` had
+    just called ready, ``check`` never saw ``--base-currency`` or
+    ``--benchmark``, and ``backtest`` seeded zero expected returns that
+    ``resolve_expected_returns`` would otherwise have estimated.
+
+    The order of operations: estimator flags, then the panel, then currency
+    conversion, then the universe, then the benchmark flags. Currency before
+    universe because a conversion needs every column it is told about;
+    universe before benchmark because a single-asset benchmark has to name
+    an asset that survived.
+
+    Returns:
+        The inputs, or an exit code when something the caller can fix is
+        wrong — printed on stderr, and carried into the ``--json`` payload.
+    """
+    from optimization_engine.data.quality import analyze_prices
+
+    config = load_config(args.config)
+    _apply_estimator_flags(config, args)
+
+    volumes = None
+    ingested_currency = None
+    try:
+        if getattr(args, "provider", None):
+            # One request serves both prices and volume, so a capacity-aware
+            # backtest cannot price impact off a different panel than the
+            # one it traded.
+            ingested = _run_ingest(args)
+            prices, volumes = ingested.prices, ingested.volumes
+            ingested_currency = getattr(args, "ingest_currency", None)
+        else:
+            prices = _load_prices_for(args)
+    except YahooFinanceError as exc:
+        return _fail(args, f"Yahoo Finance error: {exc}")
+    except IngestError as exc:
+        return _fail(args, f"Ingest error: {exc}")
+
+    if getattr(args, "base_currency", None):
+        config.base_currency = args.base_currency.upper()
+    if ingested_currency:
+        # The ingest step converted from the provider's own currency
+        # metadata. Applying ``config.currencies`` on top would convert the
+        # panel twice, so the config's map is set aside and the base is the
+        # one the panel was actually converted into.
+        if config.currencies:
+            print(
+                f"  Currency: the panel was converted to {ingested_currency.upper()} "
+                "on ingest, so the config's currencies map is not applied again.",
+                file=sys.stderr,
+            )
+        config.base_currency = ingested_currency.upper()
+    elif config.currencies:
+        try:
+            prices = apply_fx_conversion(prices, config)
+        except FXError as exc:
+            return _fail(args, f"FX conversion failed: {exc}")
+
+    if config.expected_returns:
+        common = [c for c in prices.columns if c in config.expected_returns]
+        if not common:
+            return _fail(
+                args, "Config has no expected returns matching the price columns."
+            )
+        prices = prices[common]
+
+    quality = analyze_prices(prices, periods_per_year=config.periods_per_year)
+    returns = prices_to_returns(prices).dropna(how="any")
+    if returns.empty:
+        return _fail(args, "No usable returns after alignment.")
+    if config.expected_returns:
+        config.expected_returns = {a: config.expected_returns[a] for a in returns.columns}
+
+    try:
+        _apply_benchmark_flags(config, args, list(returns.columns))
+    except (BenchmarkError, ValueError) as exc:
+        return _fail(args, f"Benchmark error: {exc}")
+
+    return _Inputs(
+        config=config, prices=prices, returns=returns, quality=quality, volumes=volumes
+    )
 
 
 def _parse_sweep_arguments(raw: list[str] | None):
@@ -925,17 +1008,12 @@ def _cmd_backtest(args: argparse.Namespace) -> int:
     )
     from optimization_engine.backtest.spec import SpecValidationError
 
-    config = load_config(args.config)
-    _apply_estimator_flags(config, args)
-    # Fetching once keeps the prices and the volume from the same request, so
-    # a capacity-aware run cannot end up pricing impact off a different panel
-    # than the one it traded.
-    ingested = _run_ingest(args) if getattr(args, "provider", None) else None
-    prices = ingested.prices if ingested is not None else _load_prices_for(args, config)
-    volumes = ingested.volumes if ingested is not None else None
-    returns = prices_to_returns(prices)
-    if not config.expected_returns:
-        config.expected_returns = {asset: 0.0 for asset in returns.columns}
+    inputs = _prepare_inputs(args)
+    if isinstance(inputs, int):
+        return inputs
+    config, prices, returns, volumes = (
+        inputs.config, inputs.prices, inputs.returns, inputs.volumes
+    )
 
     try:
         spec = BacktestSpec(
@@ -974,7 +1052,10 @@ def _cmd_backtest(args: argparse.Namespace) -> int:
             f"observations; everything after {args.holdout} is withheld."
         )
 
-    run = run_engine(evaluation, config, check_feasibility=False)
+    try:
+        run = run_engine(evaluation, config, check_feasibility=False)
+    except SolverFailure as exc:
+        return _fail(args, f"The initial solve failed: {exc}")
     try:
         walk = run.walk_forward_run(
             lookback=args.lookback,
@@ -1092,32 +1173,25 @@ def _cmd_check(args: argparse.Namespace) -> int:
         covariance_diagnostics,
         covariance_from_config,
     )
-    from optimization_engine.data.quality import analyze_prices
     from optimization_engine.optimizers.factory import (
         constraints_from_config,
         effective_expected_returns,
     )
     from optimization_engine.optimizers.feasibility import analyze_feasibility
 
-    config = load_config(args.config)
-    _apply_estimator_flags(config, args)
-    prices = _load_prices_for(args, config)
-    common = [c for c in prices.columns if c in config.expected_returns]
-    if common:
-        prices = prices[common]
+    inputs = _prepare_inputs(args)
+    if isinstance(inputs, int):
+        return inputs
+    config, prices, returns, quality = (
+        inputs.config, inputs.prices, inputs.returns, inputs.quality
+    )
 
     print("== Data quality ==")
-    quality = analyze_prices(prices, periods_per_year=config.periods_per_year)
     print(quality.describe())
     print(
         f"\nCommon history: {quality.n_common_periods} period(s) "
         f"across {prices.shape[1]} asset(s)."
     )
-
-    returns = prices_to_returns(prices).dropna(how="any")
-    if returns.empty:
-        print("\nNo usable returns after alignment.", file=sys.stderr)
-        return 2
 
     print("\n== Estimation ==")
     cov = covariance_from_config(returns, config)
@@ -1351,10 +1425,15 @@ def _emit_json(
         # A run that raised reports the failure even if it had already
         # captured a payload: emitting that payload under a non-zero exit
         # code would describe a result the command did not finish producing.
+        # A run that *returned* a code carries the reason it printed.
         payload = {
             "schema_version": SCHEMA_VERSION,
             "command": args.command,
-            "error": failure or "the command exited before producing a result",
+            "error": (
+                failure
+                or sink.get("error")
+                or "the command exited before producing a result"
+            ),
             "exit_code": code,
         }
     print(json.dumps(payload, indent=2, default=str))

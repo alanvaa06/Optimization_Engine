@@ -6,9 +6,11 @@ was reproduced with a snippet or the CLI against the sample panel (pandas 3.0.5,
 numpy 2.4.6, cvxpy 1.9.2, CLARABEL/SCS/OSQP/HIGHS installed, ECOS absent).
 The suite passes at the reviewed commit: 824 passed, 4 skipped, 53 s.
 
-**Status.** The five headline items — B1, B2, B4, O1, O2+O3, O5 — are
-fixed on this branch, with tests, and listed under *Unreleased* in the
-changelog. Everything else below is still open.
+**Status.** Fixed on this branch, with tests, and listed under *Unreleased*
+in the changelog: the five headline items (B1, B2, B4, O1, O2+O3, O5) and
+the second tier (E1, E2, E3, E4, E6, I1, I2, I3, I6, I8, the unknown-key
+half of E8, and the `indices.yaml` currency block). Everything else below
+is still open.
 
 Things that checked out and are *not* flagged: HRP quasi-diagonalisation and
 recursive bisection match the reference implementation exactly; the ERC

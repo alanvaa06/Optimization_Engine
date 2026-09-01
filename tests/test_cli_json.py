@@ -190,3 +190,15 @@ def test_the_traceback_survives_on_stderr(capsys):
     json.loads(captured.out)
     assert "Traceback" in captured.err
     assert "FileNotFoundError" in captured.err
+
+
+def test_a_returned_failure_carries_its_reason(capsys, tmp_path):
+    # A command that *returns* a non-zero code, as opposed to raising, used
+    # to emit "the command exited before producing a result" — true, and
+    # useless. The reason it printed to stderr now travels in the payload.
+    config = tmp_path / "wrong.yaml"
+    config.write_text("expected_returns:\n  NOT_IN_PANEL: 0.05\noptimizer: min_variance\n")
+    code, payload = _run(capsys, ["optimize", "--config", str(config), "--sample", "--json"])
+    assert code == 2
+    assert payload["exit_code"] == 2
+    assert "no expected returns" in payload["error"]
