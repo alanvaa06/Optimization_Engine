@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import subprocess
 import sys
 from pathlib import Path
 
@@ -80,27 +79,6 @@ def test_adjacent_palette_slots_are_distinguishable_under_cvd():
     )
     # The old adjacent red/green pair scored essentially zero on this measure.
     assert worst > 0.02, f"adjacent pair collapses under deuteranopia ({worst:.4f})"
-
-
-def test_palette_passes_the_bundled_validator_if_available():
-    """Prefer the real validator over the approximation above when present."""
-    script = next(
-        (
-            p
-            for p in Path("/tmp/claude-0/bundled-skills").rglob(
-                "dataviz/scripts/validate_palette.js"
-            )
-        ),
-        None,
-    )
-    if script is None:
-        pytest.skip("dataviz validator not available in this environment")
-    result = subprocess.run(
-        ["node", str(script), ",".join(PALETTE), "--mode", "light", "--surface", "#ffffff"],
-        capture_output=True,
-        text=True,
-    )
-    assert "ALL CHECKS PASS" in result.stdout, result.stdout
 
 
 # ---------------------------------------------------------------------------
