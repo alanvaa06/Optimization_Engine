@@ -73,6 +73,16 @@ _SUFFIX = ".panel"
 #: Bare arrays do not self-compress the way Parquet does, so the Zip does it.
 _COMPRESSION = zipfile.ZIP_DEFLATED
 
+#: How hard :meth:`PanelCache.store` tries to publish an entry, and how long
+#: it waits between attempts (linear: 10 ms, 20 ms, ...). This exists for
+#: Windows, where ``os.replace`` is refused with ``PermissionError``
+#: (``WinError 5``) while any other process holds the target open — a reader
+#: mid-:meth:`~PanelCache.load`, or a second writer of the same key. POSIX
+#: renames straight over an open file, so there the first attempt always wins
+#: and neither the sleep nor the loop is ever reached.
+_REPLACE_ATTEMPTS = 5
+_REPLACE_BACKOFF_SECONDS = 0.010
+
 
 @dataclass(frozen=True)
 class CacheEntry:
@@ -203,22 +213,33 @@ class PanelCache:
         )
 
     def store(self, key: str, panel: PricePanel) -> bool:
-        """Write a panel to the cache. Returns whether the write succeeded.
+        """Write a panel to the cache. Returns whether the entry is in place.
 
         The entry is built under a temporary name in the same directory — so
         the move below stays on one filesystem — and then moved into place
-        with a single :func:`os.replace`. That call is atomic, which is what
-        lets two runs fetch the same request concurrently without either of
-        them failing and without a reader ever seeing a partial entry.
+        with :func:`os.replace`. That call is atomic, which is what lets two
+        runs fetch the same request concurrently without either of them
+        failing and without a reader ever seeing a partial entry.
+
+        Atomic is not the same as always permitted, though. On Windows
+        ``os.replace`` raises ``PermissionError`` while another process holds
+        the target open — exactly what a reader mid-:meth:`load` or a second
+        writer of this key does — so the publish is retried a few times with a
+        short backoff rather than reported as a failed write on the first
+        refusal.
 
         Args:
             key: The request fingerprint to file it under.
             panel: The panel to write.
 
         Returns:
-            ``True`` on success. Failures are logged and swallowed: a read-only
-            directory or a full disk should slow the next run down, not fail this
-            one.
+            ``True`` when an entry for ``key`` is on disk afterwards, whether
+            this call published it or a concurrent writer of the same key won
+            the race — the fingerprint covers everything that affects the
+            data, so their entry is the one this call would have written.
+            ``False`` otherwise; failures are logged and swallowed, because a
+            read-only directory or a full disk should slow the next run down,
+            not fail this one.
         """
         target = self.path_for(key)
         handle, staging = -1, ""
@@ -232,19 +253,61 @@ class PanelCache:
                 self._write_archive(raw, panel)
 
             # One atomic step. A concurrent writer of the same key simply
-            # wins; a reader holding the old file keeps reading it.
-            os.replace(staging, target)
-            return True
+            # wins; a reader holding the old file keeps reading it. On
+            # Windows an open target makes that step raise instead, so back
+            # off briefly and try again — whoever holds the file is reading an
+            # entry, not doing something long.
+            for attempt in range(1, _REPLACE_ATTEMPTS + 1):
+                try:
+                    os.replace(staging, target)
+                except PermissionError:
+                    if attempt == _REPLACE_ATTEMPTS:
+                        break
+                    time.sleep(_REPLACE_BACKOFF_SECONDS * attempt)
+                else:
+                    staging = ""  # renamed away; nothing left to clean up
+                    return True
+
+            # Every attempt was refused, so this call did not publish. If an
+            # entry is nonetheless there, a racing writer of the same key
+            # published one while we backed off, and by the paragraph above
+            # that is this call's own result — a hit, not a lost write. Note
+            # the check is here rather than above ``os.replace``: a write that
+            # never got that far (a serialization error, a full disk) must
+            # still report False even when a stale entry happens to exist.
+            #
+            # Nothing in production reads this bool — service.py's only call
+            # site discards it — so this contract is for tests and for direct
+            # callers of the cache, not for the ingest path.
+            if target.is_file():
+                _LOG.debug(
+                    "Could not publish cache entry %s (%d attempts refused), "
+                    "but a concurrent writer left one in place",
+                    key,
+                    _REPLACE_ATTEMPTS,
+                )
+                return True
+
+            _LOG.warning(
+                "Could not cache panel %s: publishing was refused %d times "
+                "and no entry is in place",
+                key,
+                _REPLACE_ATTEMPTS,
+            )
+            return False
         except Exception as exc:
             _LOG.warning("Could not cache panel %s: %s", key, exc)
+            return False
+        finally:
+            # Every exit that did not rename the staging file away has to
+            # remove it, including the one where a racing writer published for
+            # us. The temporary name never carried the entry suffix, so even
+            # if this cleanup fails the leftover cannot be read as a hit.
             if handle != -1:
                 os.close(handle)
             if staging:
-                # The temporary name never carried the entry suffix, so even
-                # if this cleanup fails the leftover cannot be read as a hit.
                 with contextlib.suppress(OSError):
                     os.unlink(staging)
-            return False
 
     @staticmethod
     def _write_archive(stream, panel: PricePanel) -> None:
