@@ -63,7 +63,11 @@ from layer_editor import (  # noqa: E402
     seed_layers_from_config,
 )
 
-from optimization_engine.analytics.performance import rolling_metrics, summary_stats  # noqa: E402
+from optimization_engine.analytics.performance import (  # noqa: E402
+    annualize_returns,
+    rolling_metrics,
+    summary_stats,
+)
 from optimization_engine.analytics.relative import (  # noqa: E402
     active_share,
     summary_relative,
@@ -78,12 +82,17 @@ from optimization_engine.backtest import (  # noqa: E402
     cost_by_asset,
 )
 from optimization_engine.benchmark import BenchmarkError, BenchmarkSpec  # noqa: E402
-from optimization_engine.config import EngineConfig, OptimizerSpec  # noqa: E402
+from optimization_engine.config import (  # noqa: E402
+    EngineConfig,
+    OptimizerSpec,
+    expected_return_method_for_estimator,
+)
 from optimization_engine.data.covariance import (  # noqa: E402
     COVARIANCE_DESCRIPTIONS,
     EXPECTED_RETURN_DESCRIPTIONS,
     covariance_from_config,
     covariance_matrix,
+    expected_returns_from_history,
 )
 from optimization_engine.data.fx import (  # noqa: E402
     FXError,
@@ -328,7 +337,14 @@ def _historical_mu_cached(
     periods_per_year: int,
     _returns: pd.DataFrame,
 ) -> pd.Series:
-    return (1 + _returns).prod() ** (periods_per_year / len(_returns)) - 1
+    """Seed the config table's μ column from the library's own estimator.
+
+    The formula used to be written out here as well, which meant the table
+    the analyst edits could disagree with the μ the engine solved against.
+    """
+    return expected_returns_from_history(
+        _returns, method="mean", periods_per_year=periods_per_year
+    )
 
 
 @st.cache_data(show_spinner=False, max_entries=8)
@@ -1043,7 +1059,9 @@ with tab_constraints:
 
     if ws["expected_returns_method"]["enabled"]:
         st.markdown("**Expected returns**")
-        er_options = ["historical_mean", "shrunk_mean", "ema", "capm"]
+        er_options = [
+            "historical_mean", "geometric_mean", "shrunk_mean", "ema", "capm",
+        ]
         er_method = st.radio(
             "Method",
             options=er_options,
@@ -1058,7 +1076,7 @@ with tab_constraints:
         )
         st.caption(
             EXPECTED_RETURN_DESCRIPTIONS.get(
-                "mean" if er_method == "historical_mean" else er_method, ""
+                expected_return_method_for_estimator(er_method), ""
             )
         )
         if er_method == "ema":
@@ -1095,8 +1113,6 @@ with tab_constraints:
             )
 
         if st.button("Reset μ to method default", key="reset_mu_btn"):
-            from optimization_engine.data.covariance import expected_returns_from_history
-
             mw_for_capm = (
                 pd.Series(st.session_state.market_weights_table["Market weight"])
                 if er_method == "capm"
@@ -1106,7 +1122,7 @@ with tab_constraints:
             try:
                 seeded = expected_returns_from_history(
                     returns,
-                    method=("mean" if er_method == "historical_mean" else er_method),
+                    method=expected_return_method_for_estimator(er_method),
                     periods_per_year=int(periods_per_year),
                     span=int(st.session_state.get("ema_span", 180)),
                     market_return=float(st.session_state.get("market_return") or 0.0) or None,
@@ -2178,7 +2194,9 @@ with tab_backtest:
                     "Annualized return (net)",
                     pct(
                         float(
-                            (1 + bt.returns).prod() ** (periods_per_year / len(bt.returns)) - 1
+                            annualize_returns(
+                                bt.returns, periods_per_year=int(periods_per_year)
+                            )
                         )
                     ),
                     None,
@@ -2448,9 +2466,9 @@ with tab_backtest:
                         "OOS annualized return",
                         pct(
                             float(
-                                (1 + wf.returns).prod()
-                                ** (periods_per_year / len(wf.returns))
-                                - 1
+                                annualize_returns(
+                                    wf.returns, periods_per_year=int(periods_per_year)
+                                )
                             )
                         ),
                         None,

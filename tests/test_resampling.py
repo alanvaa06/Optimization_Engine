@@ -19,10 +19,14 @@ from optimization_engine.data.covariance import covariance_matrix
 from optimization_engine.data.loader import prices_to_returns, sample_dataset
 from optimization_engine.frontier import efficient_frontier
 from optimization_engine.resampling import (
+    ResampledFrontier,
     bootstrap_frontier,
     resample_returns,
     resampled_efficient_frontier,
 )
+
+#: Captured before any monkeypatching so a mock can still call the real one.
+_REAL_FRONTIER = efficient_frontier
 
 
 @pytest.fixture(scope="module")
@@ -148,9 +152,12 @@ def test_point_estimate_is_carried_alongside_the_band(returns, config):
 
 
 def test_resampled_frontier_weights_are_valid(returns, config):
-    averaged = resampled_efficient_frontier(
+    result = resampled_efficient_frontier(
         returns, config, n_draws=10, n_points=6, seed=1
     )
+    assert isinstance(result, ResampledFrontier)
+    averaged = result.weights
+    assert result.n_draws + result.n_failed == 10
     assert not averaged.empty
     np.testing.assert_allclose(averaged.sum().values, 1.0, atol=1e-6)
     assert (averaged.values >= -1e-9).all()
@@ -164,7 +171,7 @@ def test_resampled_frontier_is_more_diversified_than_the_point_estimate(
     acting on differences the sample cannot resolve."""
     averaged = resampled_efficient_frontier(
         returns, config, n_draws=12, n_points=8, seed=1
-    )
+    ).weights
     point = efficient_frontier(
         config,
         covariance_matrix(returns),
@@ -181,7 +188,82 @@ def test_resampled_frontier_is_more_diversified_than_the_point_estimate(
 def test_resampled_frontier_is_reproducible(returns, config):
     a = resampled_efficient_frontier(returns, config, n_draws=6, n_points=5, seed=9)
     b = resampled_efficient_frontier(returns, config, n_draws=6, n_points=5, seed=9)
-    pd.testing.assert_frame_equal(a, b)
+    pd.testing.assert_frame_equal(a.weights, b.weights)
+    assert (a.n_draws, a.n_failed) == (b.n_draws, b.n_failed)
+
+
+def _mock_frontier_failures(monkeypatch, fails, message="solver exploded"):
+    """Make ``fails(i)`` decide whether draw ``i`` raises. Counts the raises."""
+    import optimization_engine.resampling as res
+
+    calls = {"i": 0, "raised": 0}
+
+    def flaky(*args, **kwargs):
+        i = calls["i"]
+        calls["i"] += 1
+        if fails(i):
+            calls["raised"] += 1
+            raise RuntimeError(message)
+        return _REAL_FRONTIER(*args, **kwargs)
+
+    monkeypatch.setattr(res, "efficient_frontier", flaky)
+    return calls
+
+
+def test_michaud_reports_failed_draws(returns, config, monkeypatch):
+    """A draw that raised is a draw that did not vote. Say how many."""
+    calls = _mock_frontier_failures(monkeypatch, lambda i: i % 3 == 0)
+    result = resampled_efficient_frontier(
+        returns, config, n_draws=9, n_points=5, seed=2
+    )
+    assert calls["raised"] == 3
+    assert result.n_failed == calls["raised"]
+    assert result.n_draws == 9 - calls["raised"]
+    assert result.first_error is not None
+    assert "solver exploded" in result.first_error
+    assert "3 draw(s) produced nothing to average" in result.summary()
+
+
+def test_michaud_refuses_minority_average(returns, config, monkeypatch):
+    """Averaging the third of draws where the mandate did not bind is not a
+    resampled portfolio, so it refuses rather than returning a number."""
+    # Two of every three draws raise, so six fail and three solve.
+    calls = _mock_frontier_failures(
+        monkeypatch, lambda i: i % 3 != 2, message="mandate infeasible"
+    )
+    with pytest.raises(ValueError, match="is not a resampled portfolio"):
+        resampled_efficient_frontier(returns, config, n_draws=9, n_points=5, seed=2)
+    assert calls["raised"] == 6
+
+
+def test_michaud_counts_draws_that_solved_too_few_ranks(returns, config, monkeypatch):
+    """The second silent drop: no exception, just a frontier too sparse to
+    rank. It must be counted like any other lost draw."""
+    import optimization_engine.resampling as res
+
+    real = res.efficient_frontier
+    calls = {"i": 0}
+
+    def sparse(*args, **kwargs):
+        result = real(*args, **kwargs)
+        i = calls["i"]
+        calls["i"] += 1
+        if i % 3 == 0:
+            # No exception anywhere — the frontier simply did not solve
+            # enough ranks to be placed on the grid.
+            result.summary["status"] = ["failed"] * len(result.summary)
+        return result
+
+    monkeypatch.setattr(res, "efficient_frontier", sparse)
+    result = resampled_efficient_frontier(
+        returns, config, n_draws=9, n_points=5, seed=2
+    )
+    assert result.n_failed == 3
+    assert result.n_draws == 6
+    assert result.first_error is not None
+    assert "frontier ranks" in result.first_error
+    # Nothing raised, so the message cannot be an exception repr.
+    assert "Error" not in result.first_error
 
 
 # ---------------------------------------------------------------------------

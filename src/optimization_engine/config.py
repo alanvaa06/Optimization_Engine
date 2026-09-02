@@ -107,6 +107,30 @@ _CONFIG_KEYS = frozenset(
 )
 _OPTIMIZER_KEYS = frozenset(OptimizerSpec.__dataclass_fields__)
 
+#: Where a config's expected-return vocabulary differs from the estimator's.
+#: ``EngineConfig`` says ``historical_mean``; the estimator in
+#: :mod:`optimization_engine.data.covariance` calls the same thing ``mean``.
+#: Every other name is shared. One entry, but it was written out inline in
+#: four separate places, so a name added on one side quietly failed to reach
+#: the other.
+_EXPECTED_RETURN_METHOD_ALIASES: dict[str, str] = {"historical_mean": "mean"}
+
+
+def expected_return_method_for_estimator(method: str) -> str:
+    """Translate a config's expected-return method into an estimator name.
+
+    Args:
+        method: The value of ``EngineConfig.expected_returns_method``.
+
+    Returns:
+        The corresponding
+        :data:`~optimization_engine.data.covariance.ExpectedReturnMethod`.
+        Unknown names pass through untouched so
+        :func:`~optimization_engine.data.covariance.expected_returns_from_history`
+        raises with its own message rather than this one guessing.
+    """
+    return _EXPECTED_RETURN_METHOD_ALIASES.get(method, method)
+
 
 @dataclass
 class EngineConfig:
@@ -142,8 +166,14 @@ class EngineConfig:
             appropriate for the clustering methods, not for solves that
             invert it.
         expected_returns_method: How to seed expected returns when
-            ``expected_returns`` is empty: ``historical_mean``, ``ema``,
-            or ``capm``.
+            ``expected_returns`` is empty: ``historical_mean`` (the
+            annualized *arithmetic* mean, which is the single-period
+            expectation mean-variance is defined against),
+            ``geometric_mean`` (the compound growth rate — a different
+            question, and inconsistent with an arithmetic covariance),
+            ``ema``, ``shrunk_mean`` or ``capm``. The names map onto
+            :data:`~optimization_engine.data.covariance.EXPECTED_RETURN_DESCRIPTIONS`
+            via :func:`expected_return_method_for_estimator`.
         ema_span: Span for the ``ema`` method.
         market_return: Optional CAPM market return (defaults to estimated).
         market_weights: Optional CAPM market portfolio (defaults to equal).
@@ -192,7 +222,7 @@ class EngineConfig:
     denoise_alpha: float = 0.0
     detone: int = 0
     expected_returns_method: Literal[
-        "historical_mean", "ema", "capm", "shrunk_mean"
+        "historical_mean", "geometric_mean", "ema", "capm", "shrunk_mean"
     ] = "historical_mean"
     ema_span: int = 180
     market_return: float | None = None

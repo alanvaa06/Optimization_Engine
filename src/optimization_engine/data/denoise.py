@@ -229,8 +229,17 @@ class DenoiseReport:
 
     Attributes:
         n_assets: Universe size ``N``.
-        n_observations: Sample length ``T``.
-        q: ``T / N``.
+        n_observations: Nominal sample length — the number of rows the
+            estimator saw.
+        n_observations_effective: The ``T`` the Marchenko-Pastur edge was
+            actually computed from, which is what ``q`` divides. Equal to
+            ``n_observations`` for an equally-weighted estimator; strictly
+            smaller under EWMA, where the exponential decay means the fit
+            rests on roughly ``1 / (1 − λ)`` observations no matter how long
+            the panel is.
+        effective_sample_note: Why the two differ, in words, or empty when
+            they do not.
+        q: ``T_effective / N``.
         noise_variance: Fitted Marchenko-Pastur variance ``σ²``. Well below
             1 means most of the matrix's variance is real structure; close to
             1 means the panel is close to noise.
@@ -272,11 +281,31 @@ class DenoiseReport:
     condition_after: float
     correlation_condition_before: float = float("nan")
     correlation_condition_after: float = float("nan")
+    n_observations_effective: int = -1
+    effective_sample_note: str = ""
+
+    def __post_init__(self) -> None:
+        """Default the effective sample to the nominal one.
+
+        Only a caller that knows the estimator down-weights its own history
+        (EWMA) can tell the two apart, so the sentinel means "nobody said
+        otherwise" rather than "unknown".
+        """
+        if self.n_observations_effective < 0:
+            object.__setattr__(
+                self, "n_observations_effective", int(self.n_observations)
+            )
 
     def describe(self) -> str:
         """One-paragraph summary suitable for a UI panel or a report cell."""
+        sample = f"{self.n_observations} observations"
+        if self.n_observations_effective != self.n_observations:
+            sample = (
+                f"{self.n_observations_effective} effective observations "
+                f"(of {self.n_observations} rows)"
+            )
         line = (
-            f"Marchenko-Pastur fit on {self.n_observations} observations of "
+            f"Marchenko-Pastur fit on {sample} of "
             f"{self.n_assets} assets (T/N = {self.q:.1f}) put the noise edge at "
             f"λ₊ = {self.eigenvalue_cutoff:.3f}. "
             f"{self.n_signal_eigenvalues} of {self.n_assets} eigenvalues sit "
@@ -302,6 +331,8 @@ class DenoiseReport:
             )
         else:
             line += "."
+        if self.effective_sample_note:
+            line += " " + self.effective_sample_note
         if self.detoned_factors:
             line += (
                 f" The top {self.detoned_factors} eigenvector(s) were then "
@@ -451,6 +482,8 @@ def denoise_covariance(
     alpha: float = 0.0,
     detone: int = 0,
     n_signal: int | None = None,
+    n_observations_nominal: int | None = None,
+    effective_sample_note: str = "",
 ) -> tuple[pd.DataFrame, DenoiseReport]:
     """Denoise (and optionally detone) a covariance matrix.
 
@@ -462,15 +495,24 @@ def denoise_covariance(
 
     Args:
         cov: Covariance matrix to filter.
-        n_observations: Number of return observations ``T`` behind it. The
+        n_observations: The **effective** number of return observations ``T``
+            behind it — the sample the estimator actually leant on. The
             Marchenko-Pastur cutoff is a function of ``T / N``, so passing a
-            wrong ``T`` silently moves the cutoff.
+            wrong ``T`` silently moves the cutoff. For an equally-weighted
+            estimator this is the row count; for EWMA it is roughly
+            ``1 / (1 − λ)``, which is far smaller and is the number the
+            cutoff has to be built from.
         method: See :func:`denoise_correlation`.
         bandwidth: Kernel bandwidth for the density fit.
         alpha: Noise-block shrinkage under ``"targeted_shrinkage"``.
         detone: Number of leading eigenvectors to remove after denoising.
             ``0`` (the default) leaves the market component in place.
         n_signal: Override the fitted signal-eigenvalue count.
+        n_observations_nominal: The row count, when it differs from the
+            effective sample. Reported alongside it so the reader can see
+            both, and named in the error when the effective sample is what
+            made the fit impossible.
+        effective_sample_note: One sentence explaining why the two differ.
 
     Returns:
         ``(filtered_covariance, report)``, the covariance carrying the same
@@ -478,19 +520,57 @@ def denoise_covariance(
 
     Raises:
         ValueError: If ``T <= N``, where the Marchenko-Pastur law has no
-            usable support.
+            usable support. See the note below on why this is a refusal
+            rather than a fallback.
+
+    Note:
+        **Why ``q <= 1`` refuses instead of degrading.** The Marchenko-Pastur
+        law is defined for ``q < 1`` too, but not the law this module fits.
+        With ``T < N`` the sample correlation matrix is singular: ``N − T``
+        of its eigenvalues are exactly zero, and the true limiting law puts
+        an atom of mass ``1 − q`` at the origin beside its continuous part.
+        :func:`marchenko_pastur_pdf` models only the continuous part and
+        normalizes it to integrate to one, and
+        :func:`fit_marchenko_pastur` fits it by matching a kernel density of
+        *every* observed eigenvalue against it. Feed that a spectrum whose
+        mass sits on a zero atom the density does not have and the fitted
+        ``σ²`` — and therefore ``λ₊`` — is an artefact of the missing atom
+        rather than an estimate of the noise edge. On top of that,
+        ``"constant_residual"`` would then average a block of exact zeros and
+        hand back a matrix whose conditioning it cannot vouch for. The cutoff
+        is not merely different below ``q = 1``; it is not estimable by this
+        procedure, so the honest answer is to say so and stop.
     """
     assets = list(cov.columns)
     n = len(assets)
+    nominal = int(
+        n_observations if n_observations_nominal is None else n_observations_nominal
+    )
     values = np.asarray(cov.values, dtype=float)
     q = float(n_observations) / n if n else float("nan")
     if q <= 1.0:
-        raise ValueError(
+        message = (
             f"Denoising needs more observations than assets: got "
             f"T = {n_observations}, N = {n} (T/N = {q:.2f}). Below 1 the "
             "sample spectrum is degenerate and the Marchenko-Pastur cutoff is "
             "not defined. Use a shrinkage estimator instead."
         )
+        if nominal != n_observations:
+            message = (
+                f"Denoising needs more observations than assets, and the "
+                f"effective sample is too short: T = {n_observations} "
+                f"effective observations (from {nominal} rows) against "
+                f"N = {n} assets gives T/N = {q:.2f}. "
+                f"{effective_sample_note} "
+                "The Marchenko-Pastur cutoff is not defined below T/N = 1 — "
+                "the sample correlation is singular there and the fit has no "
+                "noise edge to find — so this combination cannot be denoised "
+                "however long the panel is. Either shorten the universe to "
+                f"fewer than {n_observations} assets, raise the decay so the "
+                "estimator leans on more history, or denoise an "
+                "equally-weighted estimator instead."
+            ).replace("  ", " ")
+        raise ValueError(message)
 
     corr, std = cov_to_corr(values)
     denoised, report = denoise_correlation(
@@ -502,6 +582,9 @@ def denoise_covariance(
     report = DenoiseReport(
         **{
             **report.__dict__,
+            "n_observations": nominal,
+            "n_observations_effective": int(n_observations),
+            "effective_sample_note": effective_sample_note,
             "condition_before": _condition(_sorted_eigen(values)[0]),
             "condition_after": _condition(
                 _sorted_eigen(corr_to_cov(denoised, std))[0]
