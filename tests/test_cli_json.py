@@ -202,3 +202,47 @@ def test_a_returned_failure_carries_its_reason(capsys, tmp_path):
     assert code == 2
     assert payload["exit_code"] == 2
     assert "no expected returns" in payload["error"]
+
+
+def test_backtest_notes_carry_their_values_not_only_their_keys():
+    """A note's value must survive serialization.
+
+    ``notes`` went through the same helper as the message lists, which
+    iterates a mapping and keeps only its keys — so a reader of ``--json``
+    learned that ``schedule_dates_moved`` had been recorded but never which
+    dates moved where.
+    """
+    import datetime
+
+    import numpy as np
+    import pandas as pd
+
+    from optimization_engine.reporting.payloads import _notes
+
+    out = _notes(
+        {
+            "periods_in_cash_after_failed_solve": np.int64(3),
+            "schedule_dates_moved": {
+                pd.Timestamp("2020-01-05"): pd.Timestamp("2020-01-06")
+            },
+            "missing_returns": ["AAA", "BBB"],
+            "cutoff": datetime.date(2020, 1, 5),
+            "ratio": np.float64(0.5),
+        }
+    )
+    assert out["periods_in_cash_after_failed_solve"] == 3
+    assert out["schedule_dates_moved"] == {
+        "2020-01-05T00:00:00": "2020-01-06T00:00:00"
+    }
+    assert out["missing_returns"] == ["AAA", "BBB"]
+    assert out["cutoff"] == "2020-01-05T00:00:00"
+    assert out["ratio"] == 0.5
+    # The whole point: it survives a strict encoder.
+    json.dumps(out)
+
+
+def test_backtest_notes_are_empty_rather_than_absent():
+    from optimization_engine.reporting.payloads import _notes
+
+    assert _notes(None) == {}
+    assert _notes({}) == {}

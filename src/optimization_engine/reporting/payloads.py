@@ -25,6 +25,7 @@ worst moment — after a long solve, with the result already computed.
 
 from __future__ import annotations
 
+import datetime
 import math
 from typing import Any
 
@@ -59,6 +60,63 @@ def _series(values: pd.Series | None) -> dict[str, float | None] | None:
     if values is None:
         return None
     return {str(k): _num(v) for k, v in values.items()}
+
+
+def _key(value: Any) -> str:
+    """A mapping key as a string, with dates in the same form as values.
+
+    ``str`` on a Timestamp gives ``"2020-01-05 00:00:00"`` while
+    ``_jsonable`` gives ``"2020-01-05T00:00:00"``, so a note keyed by date
+    would spell its dates one way and its values another.
+    """
+    if isinstance(value, (pd.Timestamp, datetime.date, datetime.datetime)):
+        return pd.Timestamp(value).isoformat()
+    return str(value)
+
+
+def _jsonable(value: Any) -> Any:
+    """Any note value as something ``json.dumps`` will accept.
+
+    Backtest notes are open-ended: the runner records counts, lists of dates
+    and date-to-date mappings there, and nothing constrains what a caller
+    adds. Timestamps become ISO strings, NumPy scalars become Python
+    numbers, and containers are walked; anything left becomes ``str``, on
+    the grounds that a readable approximation beats a document a strict
+    parser rejects.
+    """
+    if value is None or isinstance(value, (bool, int, str)):
+        return value
+    if isinstance(value, float):
+        return _num(value)
+    if isinstance(value, (np.integer,)):
+        return int(value)
+    if isinstance(value, (np.floating,)):
+        return _num(value)
+    if isinstance(value, (np.bool_,)):
+        return bool(value)
+    if isinstance(value, (pd.Timestamp, datetime.date, datetime.datetime)):
+        return pd.Timestamp(value).isoformat()
+    if isinstance(value, dict):
+        return {_key(k): _jsonable(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set, frozenset, pd.Index, np.ndarray)):
+        return [_jsonable(v) for v in value]
+    if isinstance(value, pd.Series):
+        return {_key(k): _jsonable(v) for k, v in value.items()}
+    return str(value)
+
+
+def _notes(notes: Any) -> dict[str, Any]:
+    """Backtest notes as a JSON-safe mapping, values included.
+
+    This used to run through ``_strings``, which iterates a mapping and so
+    kept the keys and silently discarded every value — a reader learned that
+    something had been recorded but never what.
+    """
+    if not notes:
+        return {}
+    if isinstance(notes, dict):
+        return {_key(k): _jsonable(v) for k, v in notes.items()}
+    return {str(n): None for n in notes}
 
 
 def _strings(values: Any) -> list[str]:
@@ -329,7 +387,7 @@ def backtest_payload(
             "is_out_of_sample": bool(getattr(meta, "is_out_of_sample", False)),
         },
         "degradations": _strings(getattr(meta, "degradations", None)),
-        "notes": _strings(getattr(meta, "notes", None)),
+        "notes": _notes(getattr(meta, "notes", None)),
         "alignment": _strings(alignment),
         "metrics": metrics,
         "output_path": output_path,
