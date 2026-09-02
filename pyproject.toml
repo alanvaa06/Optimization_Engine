@@ -24,7 +24,11 @@ classifiers = [
 # are gone rather than moved: nothing in the project imports either one.
 dependencies = [
     "numpy>=1.24",
-    "pandas>=2.0",
+    # 2.1 is the floor because every ``pct_change`` call passes
+    # ``fill_method=None``: 2.0 accepts it but warns, 2.1 is the first
+    # release where it is silent, and it is the only way to get the same
+    # return series out of 2.x and 3.x.
+    "pandas>=2.1",
     "scipy>=1.10",
     "cvxpy>=1.4",
     # Named rather than left to cvxpy because SOLVER_FALLBACK reaches for SCS

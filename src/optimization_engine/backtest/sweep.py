@@ -212,7 +212,10 @@ def _cell_metrics(returns: pd.Series, periods_per_year: int) -> dict[str, float]
     return {
         "annual_return": float(annualize_returns(clean, periods_per_year)),
         "annual_volatility": float(annualize_volatility(clean, periods_per_year)),
-        "sharpe": float(sharpe_ratio(clean, 0.0, periods_per_year)),
+        # Arithmetic, stated rather than defaulted: this column has to match
+        # what ``SweepResults.trial_sharpes`` feeds the deflation, and the
+        # deflation's standard error is derived for the arithmetic estimator.
+        "sharpe": float(sharpe_ratio(clean, 0.0, periods_per_year, method="arithmetic")),
         "max_drawdown": float(drawdown_series(clean).min()),
         "n_periods": float(len(clean)),
     }
@@ -281,14 +284,42 @@ class SweepResults:
         )
         return matrix.dropna(how="any")
 
-    def trial_sharpes(self) -> pd.Series:
-        """Annualized Sharpe of every successful cell, indexed by cell id."""
-        ok = self.frame[self.frame["status"] == "ok"]
-        return pd.Series(
-            ok["sharpe"].to_numpy(dtype=float),
-            index=ok["cell_id"].to_numpy(),
-            name="sharpe",
+    def trial_sharpes(self, *, aligned: bool = True) -> pd.Series:
+        """Annualized Sharpe of every successful cell.
+
+        Args:
+            aligned: Measure the Sharpes on the columns of
+                :meth:`return_matrix` — the dates every surviving cell has in
+                common, which is the block :meth:`overfitting_report` scores.
+                Default, and what the deflation wants: the two diagnostics
+                then describe one sample. When ``False``, read the
+                pre-computed Sharpes off the results frame instead; those are
+                measured over each cell's *own* full history, so a grid that
+                varies an estimation window compares a Sharpe from 2,000
+                observations against one from 1,800.
+
+        Returns:
+            A series named ``"sharpe"``, indexed by :meth:`return_matrix`'s
+            columns when aligned — string cell ids — and by integer cell id
+            otherwise. Empty when no cell produced a return stream.
+        """
+        if not aligned:
+            ok = self.frame[self.frame["status"] == "ok"]
+            return pd.Series(
+                ok["sharpe"].to_numpy(dtype=float),
+                index=ok["cell_id"].to_numpy(),
+                name="sharpe",
+            )
+
+        from optimization_engine.analytics.performance import sharpe_ratio
+
+        matrix = self.return_matrix()
+        if matrix.empty:
+            return pd.Series(dtype=float, name="sharpe")
+        sharpes = sharpe_ratio(
+            matrix, 0.0, self.periods_per_year, method="arithmetic"
         )
+        return pd.Series(sharpes, dtype=float, name="sharpe")
 
     def deflated_sharpe(self, cell_id: int):
         """Deflate one cell's Sharpe for the whole grid behind it.
@@ -296,6 +327,19 @@ class SweepResults:
         The grid *is* the trial count. Deflating against it is the difference
         between "this configuration had a Sharpe of 1.4" and "this
         configuration had a Sharpe of 1.4 after we tried forty-eight of them".
+
+        Every cell counts, including the ones that failed to build or failed
+        to solve — see :attr:`n_failed`. A configuration you tried and threw
+        away is still a draw from the search, and deflating against
+        :attr:`n_ok` would quietly reward a grid for breaking.
+
+        The dispersion comes from :meth:`trial_sharpes`, which measures every
+        surviving cell over the dates they all share — the same block
+        :meth:`overfitting_report` scores. This cell's *own* Sharpe is still
+        taken from its full stream, which is the number the results frame
+        reports and the honest sample size for its standard error; on a grid
+        whose cells span different windows the two are not measured over the
+        same dates, and the deflation is the more conservative for it.
 
         Args:
             cell_id: Which cell to deflate. Must be one that evaluated.
@@ -308,6 +352,9 @@ class SweepResults:
         Raises:
             KeyError: If the cell has no return stream — it failed to build or to
                 solve. The message carries its status.
+            ValueError: If fewer than two cells produce a Sharpe over the dates
+                they share — a one-cell grid, or cells whose streams barely
+                overlap. There is no dispersion to deflate against.
         """
         from optimization_engine.analytics.selection import deflated_sharpe_ratio
 
@@ -316,15 +363,30 @@ class SweepResults:
                 f"Cell {cell_id} has no return stream "
                 f"(status: {self._status(cell_id)!r})."
             )
+        trials = self.trial_sharpes()
+        n_usable = int(trials.notna().sum())
+        if n_usable < 2:
+            raise ValueError(
+                "Deflation needs at least two trial Sharpes to have a "
+                f"dispersion; the grid's {self.n_ok} evaluated cell(s) yield "
+                f"{n_usable} over the {len(self.return_matrix())} date(s) they "
+                "share. Widen the grid, align the cells' return streams, or "
+                "deflate by hand with deflated_sharpe_ratio(..., "
+                "sharpe_variance=...)."
+            )
         return deflated_sharpe_ratio(
             self.returns[cell_id],
-            n_trials=self.n_ok,
-            trial_sharpes=self.trial_sharpes(),
+            n_trials=self.n_cells,
+            trial_sharpes=trials,
             periods_per_year=self.periods_per_year,
         )
 
     def overfitting_report(self, n_partitions: int = 16):
         """CSCV across the grid: does the in-sample winner survive out of sample?
+
+        Scored on :meth:`return_matrix` — the same block :meth:`trial_sharpes`
+        measures, so this report and :meth:`deflated_sharpe` describe one
+        sample rather than two.
 
         Args:
             n_partitions: How many balanced blocks to split the sample into.

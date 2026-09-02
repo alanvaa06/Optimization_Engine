@@ -176,7 +176,11 @@ def analyze_prices(
         )
 
     rows: list[dict[str, object]] = []
-    returns = prices.pct_change()
+    # ``fill_method=None`` explicitly: pandas 2.0-2.2 pad by default and 3.0
+    # does not, and a padded gap shows up here as a fabricated zero return
+    # followed by a fabricated extreme one — the two statistics this function
+    # exists to count.
+    returns = prices.pct_change(fill_method=None)
 
     for asset in prices.columns:
         series = prices[asset]

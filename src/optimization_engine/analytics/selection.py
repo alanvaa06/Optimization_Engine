@@ -27,9 +27,18 @@ Three tools, all from Bailey and López de Prado:
   land in the bottom half out of sample? Above ~50% the selection process is
   no better than picking at random.
 
-All Sharpe ratios in this module are handled **per period** internally. The
-public functions take and return annualized figures where that is the natural
-unit, and say which is which.
+All Sharpe ratios in this module are handled **per period** internally, and
+they are *arithmetic* — the mean excess return over its standard deviation,
+which is the estimator Bailey and López de Prado's standard error is derived
+for. That is exactly
+:func:`~optimization_engine.analytics.performance.sharpe_ratio` with
+``periods_per_year=1``, and this module calls it rather than reimplementing
+it. Annualized figures divide or multiply by ``√periods_per_year``, so an
+annualized Sharpe handed in here — ``trial_sharpes`` in particular — must
+come from the same arithmetic convention; a geometric one deflates a number
+against a distribution measured a different way. The public functions take
+and return annualized figures where that is the natural unit, and say which
+is which.
 
 References:
     Bailey, D. and López de Prado, M. (2012). "The Sharpe Ratio Efficient
@@ -53,6 +62,7 @@ import numpy as np
 import pandas as pd
 import scipy.stats
 
+from optimization_engine.analytics.performance import sharpe_ratio
 from optimization_engine.analytics.risk import kurtosis, skewness
 
 #: Euler-Mascheroni constant, from the expected maximum of N Gaussians.
@@ -60,10 +70,22 @@ EULER_MASCHERONI = 0.5772156649015329
 
 
 def _period_sharpe(returns: pd.Series) -> float:
-    """Per-period Sharpe of an excess-return series."""
+    """Per-period Sharpe of an excess-return series.
+
+    :func:`~optimization_engine.analytics.performance.sharpe_ratio` on a
+    one-period-per-year clock, which is the arithmetic ratio
+    ``mean / std``. Routed through it rather than reimplemented so this
+    module's Sharpe and the library's headline Sharpe cannot drift apart —
+    the deflation below compares one against a distribution of the other.
+
+    A zero-variance stream scores 0.0 rather than ``±inf``: the deflation
+    needs a finite number, and a series that never moved has no risk-adjusted
+    performance to report.
+    """
     series = returns.dropna()
-    std = float(series.std(ddof=1))
-    return float(series.mean() / std) if std > 0 else 0.0
+    if float(series.std(ddof=1)) <= 0:
+        return 0.0
+    return float(sharpe_ratio(series, riskfree_rate=0.0, periods_per_year=1))
 
 
 def _sharpe_standard_error(
@@ -201,7 +223,11 @@ def deflated_sharpe_ratio(
             grid, this is the size of the grid — not the number you reported.
         trial_sharpes: The annualized Sharpe of every trial, if you kept
             them. Their variance is the right dispersion to deflate against
-            and is far better than a guess.
+            and is far better than a guess. They must be *arithmetic*
+            Sharpes — :func:`~optimization_engine.analytics.performance.sharpe_ratio`
+            with its default ``method`` — measured over one common sample;
+            :meth:`~optimization_engine.backtest.sweep.SweepResults.trial_sharpes`
+            produces exactly that.
         sharpe_variance: Variance of the *per-period* trial Sharpes, if you
             would rather supply it directly. Ignored when ``trial_sharpes``
             is given. Defaults to the estimated sampling variance of the

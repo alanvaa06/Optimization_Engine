@@ -106,6 +106,14 @@ def test_the_documented_deflation_figures_still_hold(
     there is deterministic, so these are stable. The point of the test is to
     fail loudly if a change to the Sharpe convention or the standard error
     moves them, rather than leaving the documentation quietly wrong.
+
+    It did exactly that when ``sharpe_ratio`` became arithmetic. The winner is
+    the same trial and its own Sharpe and PSR are unchanged — both were always
+    computed per period, arithmetically, inside this module — but the trial
+    *dispersion* is now measured the same way, which lifts the variance of the
+    50 trial Sharpes from 1.2806e-3 to 1.2864e-3 per period, the benchmark
+    from 1.2931 to 1.2961, and drops the deflated Sharpe from 45.85% to
+    **45.62%**. The verdict does not move: still a coin flip.
     """
     annual = skill_free_trials.apply(sharpe_ratio, periods_per_year=252)
     winner = skill_free_trials[annual.idxmax()]
@@ -113,7 +121,16 @@ def test_the_documented_deflation_figures_still_hold(
 
     assert report.sharpe == pytest.approx(1.24, abs=0.005)
     assert report.probabilistic == pytest.approx(0.993, abs=0.0005)
-    assert report.deflated == pytest.approx(0.459, abs=0.0005)
+    assert report.deflated == pytest.approx(0.456, abs=0.0005)
+    assert report.benchmark_sharpe == pytest.approx(1.296, abs=0.0005)
+
+    # The geometric convention is what produced the old 45.9%. Keeping it
+    # here documents the size of the move and pins the compatibility branch.
+    geometric = skill_free_trials.apply(
+        sharpe_ratio, periods_per_year=252, method="geometric"
+    )
+    old = deflated_sharpe_ratio(winner, n_trials=50, trial_sharpes=geometric)
+    assert old.deflated == pytest.approx(0.459, abs=0.0005)
 
 
 def test_one_trial_deflates_to_the_plain_probabilistic_sharpe(
