@@ -11,6 +11,93 @@ with what to do about it.
 
 ## [Unreleased]
 
+### Fixed
+
+- **A max-diversification mandate the solver could not honour was returned
+  violated with status `optimal`; it now raises.** `_solve` routed every
+  failure — `SolverFailure("infeasible")` included — into the projection
+  fallback, which re-solves unconstrained, projects onto the box, and then
+  reported the *inner* solve's `solver_status="optimal"`. Infeasible and
+  unbounded are properties of the problem, not of the solver, so they now
+  re-raise; only numerical failure earns the fallback, and the fallback
+  reports `solver_status="fallback_projection"` with a `dropped_constraints`
+  list naming what projection cannot represent. A configuration that used to
+  "succeed" with a violated tracking-error budget now raises. That is the fix.
+- **The deflated Sharpe counted only the cells that solved.** `n_trials` came
+  from `n_ok` while `n_failed`'s own docstring said failed cells still count
+  as trials — a configuration you tried and that did not work is still a
+  configuration you tried. It now counts `n_cells`, at both sites (the sweep
+  module and the CLI's walk-forward sweep). Every deflated Sharpe moves toward
+  zero: on fifty skill-free trials, 0.4585 → 0.4562. Separately, the trial
+  distribution was computed on full-length streams while the PBO matrix
+  inner-joined and dropped incomplete rows, so DSR and CSCV scored different
+  samples whenever the grid swept an estimation window; both now read the
+  aligned matrix.
+- **Returns no longer depend on which pandas is installed.** `pct_change` was
+  called with no `fill_method` at four sites. pandas 2.0 through 2.2 pad by
+  default, turning a gap into a zero return followed by a compounded jump,
+  while 3.0 does not fill — the same source produced two different return
+  series depending on the environment. All four now pass `fill_method=None`.
+  Users on pandas below 3 with gappy data will see different returns.
+- **Schedule dates off the returns index now trade.** They were excluded from
+  the decision set, so under `frequency="none"` a weekly schedule stamped on
+  Sundays became buy-and-hold. Every off-index date now maps to the first bar
+  at or after it; exact matches are unchanged, so schedules that already
+  worked cannot move. `meta.notes` records what was moved, what was dropped
+  past the last bar, and — the case the design did not consider — which dates
+  collapsed onto a shared bar.
+- **A failed first walk-forward solve holds cash instead of shortening the
+  evaluation.** The schedule was only written when a previous book existed and
+  the window started at the first row of weights, so a failed opening solve
+  silently deleted every period before the first success, contradicting the
+  module's own promise that a failed solve is a row and never a drop. The
+  window now starts at the first decision. An all-cash track record is still
+  refused rather than returned as a result.
+- **A Black-Litterman view the universe cannot express is refused.** A view
+  whose assets were all outside the universe was dropped whole; a basket view
+  with one leg outside was reduced to the legs that happened to be held,
+  turning "long A against short B" into "long A". Both now raise, naming every
+  missing asset. The Ω floor is the same failure in numerical form: a pick row
+  projecting onto zero prior variance was clamped up to 1e-12, becoming a view
+  of near-infinite confidence that then dominated the posterior. It now raises.
+- **A refused cache publish is retried rather than reported as a failure.**
+  `PanelCache.store` finished with a bare `os.replace`, which on Windows
+  raises `PermissionError` whenever another process holds the target open —
+  exactly what a concurrent reader does. It is now attempted five times with
+  linear backoff, and a target published by another writer of the same key
+  counts as success.
+
+### Changed
+
+- **The headline Sharpe ratio is arithmetic.** Three definitions coexisted:
+  geometric in `sharpe_ratio`, arithmetic in `rolling_metrics`, arithmetic
+  per-period in the selection module — so the deflated Sharpe was deflating an
+  arithmetic figure against a distribution of geometric ones. The per-period
+  arithmetic Sharpe, `mean(excess) · ppy / (σ · √ppy)`, is now canonical,
+  because it is the quantity PSR, DSR and MinTRL are derived on. The geometric
+  form, `annualize_returns(excess) / annualize_volatility`, survives as
+  `sharpe_ratio(..., method="geometric")` and reproduces the old number
+  exactly. `summary_stats` keeps it visible for one release as
+  `"Sharpe Ratio (geometric)"`.
+
+  On the sample panel, equal-weight: **0.5950 → 0.6238**, 4.8% higher. At a 3%
+  risk-free rate the same series moves 0.2441 → 0.2852, 16.8% higher — the gap
+  widens as the excess mean shrinks.
+
+  Sortino, Calmar and Martin keep geometric numerators; changing them was out
+  of scope, but their docstrings and `summary_stats` now say so, because an
+  arithmetic Sharpe standing silently beside a geometric Sortino is the same
+  disagreement this change exists to remove.
+- **The backtest result hash rounds to twelve significant figures and includes
+  the weight path.** It rounded to twelve *absolute* decimals, which is stable
+  at the default `initial_capital=1.0` but sits below float64's resolution
+  once a caller sets realistic capital, so one ulp of BLAS noise flipped it.
+  The digest also ignored holdings, so two runs with identical NAV and trades
+  but different books collided. `RunMeta` gains `hash_version = 2`; hashes
+  stored by earlier versions are not comparable to new ones.
+- **`pandas>=2.1`** — the first release where `fill_method=None` is silent.
+
+
 ## [0.5.3] — 2026-09-01
 
 Five numerical fixes from a full-package review, and the interface fixes
