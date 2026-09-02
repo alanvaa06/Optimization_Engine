@@ -27,6 +27,14 @@ infeasible constraint set on one window, a covariance that will not invert —
 the previous book is carried forward, which is what a desk would actually do,
 and the failure is recorded. Silently skipping the period would remove a real
 cost from the track record and make a fragile process look robust.
+
+When the failure is the *first* solve there is no previous book to carry, and
+the answer is cash, not a shorter window. Starting the evaluation at the first
+success would quietly delete every period the process could not trade —
+exactly the periods a failure-prone process gets wrong — and hand back a track
+record that begins on the strategy's first good day. The window always opens
+at ``min_lookback``, the cash periods are in it at a zero return, and
+``notes["periods_in_cash_after_failed_solve"]`` counts them.
 """
 
 from __future__ import annotations
@@ -48,10 +56,14 @@ class WalkForwardRun:
     Attributes:
         run: The replayed result, tagged out-of-sample.
         weights_history: Target weights by decision date — one row per
-            re-solve, not per trade. With a trading cadence finer than the
-            re-solve cadence the book trades more often than this frame has
-            rows, and ``run.rebalance_dates`` is the record of that.
+            decision, not per trade, and a failed solve is a row like any
+            other: the book it carries forward, or cash when there is none
+            yet. With a trading cadence finer than the re-solve cadence the
+            book trades more often than this frame has rows, and
+            ``run.rebalance_dates`` is the record of that.
         windows: One row per decision — window bounds, length, and status.
+            ``status`` is ``"ok"`` or starts with ``"failed: "`` and carries
+            the exception text, so match it with ``.startswith``.
         failures: Human-readable reasons for each failed solve.
     """
 
@@ -230,6 +242,7 @@ def walk_forward_run(
     window_rows: list[dict[str, Any]] = []
     failures: list[str] = []
     last_weights: pd.Series | None = None
+    first_solved_position: int | None = None
 
     for position in range(min_lookback, n, rebalance_every):
         start = 0 if expanding else max(0, position - lookback)
@@ -239,12 +252,20 @@ def walk_forward_run(
             solved = solve(window).reindex(returns.columns).fillna(0.0)
             schedule[decision_date] = solved
             last_weights = solved
+            if first_solved_position is None:
+                first_solved_position = position
             status = "ok"
         except Exception as exc:  # noqa: BLE001 — a failed solve is a row, never a drop
             failures.append(f"{pd.Timestamp(decision_date).date()}: {exc}")
             status = f"failed: {exc}"
-            if last_weights is not None:
-                schedule[decision_date] = last_weights
+            # No prior book to carry forward means the desk holds cash. It does
+            # not mean the track record starts later: a shortened window would
+            # hide precisely the periods this process could not trade.
+            schedule[decision_date] = (
+                last_weights
+                if last_weights is not None
+                else pd.Series(0.0, index=returns.columns)
+            )
         window_rows.append(
             {
                 "decision_date": decision_date,
@@ -255,14 +276,19 @@ def walk_forward_run(
             }
         )
 
-    if not schedule:
+    if first_solved_position is None:
+        # Every window failed. A book of nothing but cash is not a track record
+        # of this process; it is a track record of the process never running.
         raise ValueError(
             "Every walk-forward solve failed; there is nothing to evaluate. "
             f"First error: {failures[0] if failures else 'unknown'}"
         )
 
     weights_history = pd.DataFrame(schedule).T.sort_index()
-    evaluation = returns.loc[weights_history.index[0]:]
+    # The evaluation always opens at the first decision date, whether or not
+    # that decision produced weights. See the module docstring.
+    evaluation = returns.loc[returns.index[min_lookback]:]
+    periods_in_cash = int(first_solved_position - min_lookback)
     notes = {
         "lookback": int(lookback),
         "rebalance_every": int(rebalance_every),
@@ -272,6 +298,9 @@ def walk_forward_run(
         # The old key, kept so saved runs and reports keep reading.
         "n_rebalances": int(len(weights_history)),
         "n_failed_solves": int(len(failures)),
+        # Evaluated periods the book held cash because the opening solves
+        # failed before there was any book to carry forward.
+        "periods_in_cash_after_failed_solve": periods_in_cash,
     }
     # The cost models see the whole history, not just the evaluated slice:
     # a decision made at the first evaluated date has years of returns behind

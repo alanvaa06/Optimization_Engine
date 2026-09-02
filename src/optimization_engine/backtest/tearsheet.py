@@ -133,6 +133,13 @@ def _caveats(run: RunResult, deflated: Any, overfitting: Any) -> tuple[str, ...]
             f"{len(run.meta.degradations)} cost component(s) could not be computed "
             "and were charged as zero; the reported cost is a lower bound."
         )
+    cash_periods = int(run.meta.notes.get("periods_in_cash_after_failed_solve", 0) or 0)
+    if cash_periods > 0:
+        caveats.append(
+            f"The first {cash_periods} period(s) were held in cash because the "
+            "opening solve failed and there was no book to carry forward. They "
+            "are in this track record at a zero return, not dropped from it."
+        )
     if deflated is None:
         caveats.append(
             "No trial count was supplied, so the Sharpe ratio is undeflated. If "

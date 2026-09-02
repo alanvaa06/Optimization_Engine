@@ -21,10 +21,15 @@ The one thing the loop refuses to do is trade on information it does not yet
 have. A decision taken on date ``t`` executes at ``t + execution_lag``, and
 the volatility that prices its impact is estimated on returns strictly
 before ``t``.
+
+A target dated on a day the market was shut is traded on the next bar, not
+quietly deferred to the next calendar rebalance. Every such move is named in
+``meta.notes`` — see :func:`_place_schedule_on_bars`.
 """
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 import numpy as np
@@ -47,6 +52,8 @@ from optimization_engine.backtest.results import (
     empty_trades,
 )
 from optimization_engine.backtest.spec import MIN_ADV_CAPITAL, BacktestSpec
+
+_LOG = logging.getLogger(__name__)
 
 #: Traded fractions below this are float residue, not orders.
 _TRADE_EPS = 1e-12
@@ -78,6 +85,86 @@ def _as_schedule(
     return schedule.astype(float)
 
 
+def _place_schedule_on_bars(
+    schedule_index: pd.Index, index: pd.DatetimeIndex
+) -> tuple[list[pd.Timestamp], dict[str, Any]]:
+    """Put every schedule date on a bar, and say what that cost.
+
+    A schedule date that is not itself a bar — a Sunday-stamped weekly
+    schedule replayed on a business-day index — used to be no decision at
+    all. The target was not lost: the resolver picks the most recent schedule
+    row on or before each decision, so it still reached the book at whatever
+    calendar mark came next. What was lost was the **timing** the caller
+    asked for, silently. Under ``frequency="none"`` there is exactly one mark
+    — inception — so a whole weekly schedule collapsed into buy-and-hold.
+
+    Every date is therefore executed on the first bar at or after it. The
+    search is ``side="left"``, so a date that is already a bar maps to itself:
+    nothing that works today can move. Dates past the last bar are dropped,
+    because there is no bar left to fill them on.
+
+    Args:
+        schedule_index: The dates the schedule's targets become effective,
+            sorted.
+        index: The simulation's date index.
+
+    Returns:
+        The bar dates that become decisions, and notes naming every date that
+        did not land where it was written: ``schedule_dates_moved``
+        (``{original: executed}``), ``schedule_dates_dropped`` (past the last
+        bar) and ``schedule_dates_collapsed`` (``{bar: [originals]}`` for bars
+        that received more than one row — the last one wins, which is what the
+        resolver has always done, but silently).
+    """
+    if not index.is_monotonic_increasing:
+        # Nothing can be placed on an unordered calendar. Fall back to exact
+        # matches, which is what the runner did before, rather than inventing
+        # an ordering the caller did not ask for.
+        return [date for date in schedule_index if date in set(index)], {}
+
+    positions = np.searchsorted(
+        index.to_numpy(), pd.DatetimeIndex(schedule_index).to_numpy(), side="left"
+    )
+    decisions: list[pd.Timestamp] = []
+    moved: dict[str, str] = {}
+    dropped: list[str] = []
+    landed: dict[int, list[str]] = {}
+    for original, raw_position in zip(schedule_index, positions):
+        label = pd.Timestamp(original).isoformat()
+        position = int(raw_position)
+        if position >= len(index):
+            dropped.append(label)
+            continue
+        executed = index[position]
+        landed.setdefault(position, []).append(label)
+        if executed != original:
+            moved[label] = pd.Timestamp(executed).isoformat()
+        decisions.append(executed)
+
+    collapsed = {
+        pd.Timestamp(index[position]).isoformat(): originals
+        for position, originals in sorted(landed.items())
+        if len(originals) > 1
+    }
+    notes: dict[str, Any] = {}
+    if moved:
+        notes["schedule_dates_moved"] = moved
+    if dropped:
+        notes["schedule_dates_dropped"] = dropped
+    if collapsed:
+        notes["schedule_dates_collapsed"] = collapsed
+    if notes:
+        _LOG.warning(
+            "Weight schedule does not line up with the return index: "
+            "%d date(s) moved to the next bar, %d dropped past the last bar, "
+            "%d bar(s) received more than one target (the latest wins).",
+            len(moved),
+            len(dropped),
+            len(collapsed),
+        )
+    return decisions, notes
+
+
 def run_backtest(
     returns: pd.DataFrame,
     weights: pd.Series | pd.DataFrame,
@@ -101,13 +188,16 @@ def run_backtest(
             same-period-fill, in-sample replay.
         cost_model: Override the model built from ``spec.costs``. Useful for
             testing and for cost models this library does not ship.
-        notes: Free-form annotations to carry on the result metadata. When
-            ``returns`` has missing values the runner adds a
-            ``"missing_returns"`` entry of its own: how many periods had a
-            gap somewhere, and — the part worth reading — which *held*
-            assets had one, and how often. A missing return is replayed as
-            a flat period for that asset alone; it never touches the rest
-            of the book.
+        notes: Free-form annotations to carry on the result metadata. The
+            runner adds entries of its own. ``"missing_returns"`` records how
+            many periods had a gap somewhere, and — the part worth reading —
+            which *held* assets had one, and how often; a missing return is
+            replayed as a flat period for that asset alone and never touches
+            the rest of the book. ``"schedule_dates_moved"``,
+            ``"schedule_dates_dropped"`` and ``"schedule_dates_collapsed"``
+            record every target date that did not fall on a bar. None of
+            these are hashed: they describe the run, they are not part of
+            what it computed.
         context_returns: A longer history the cost models may estimate from.
             A walk-forward evaluation starts partway into the sample, so
             estimating trailing volatility from the evaluation window alone
@@ -180,10 +270,10 @@ def run_backtest(
     marks = rebalance_dates(index, spec.frequency)
     # A schedule date is always a decision: the walk-forward runner only emits
     # one when the optimizer has genuinely re-solved, so ignoring it would
-    # silently discard the re-solve.
-    decisions = pd.DatetimeIndex(
-        sorted(set(marks).union(d for d in schedule.index if d in set(index)))
-    )
+    # silently discard the re-solve. A date that is not a bar is executed on
+    # the next one rather than waiting for the next calendar mark.
+    schedule_marks, schedule_notes = _place_schedule_on_bars(schedule.index, index)
+    decisions = pd.DatetimeIndex(sorted(set(marks).union(schedule_marks)))
     execution = execution_positions(index, decisions, spec.execution_lag)
 
     # Resolve, once, which target each decision is actually asking for: the
@@ -329,9 +419,10 @@ def run_backtest(
         else empty_costs()
     )
     held_frame = pd.DataFrame(held_rows, index=index, columns=assets)
+    run_notes = dict(notes or {})
+    run_notes.update(schedule_notes)
     if missing_periods:
-        notes = dict(notes or {})
-        notes["missing_returns"] = {
+        run_notes["missing_returns"] = {
             "periods": int(missing_periods),
             "held_assets": {k: int(v) for k, v in sorted(missing_held.items())},
         }
@@ -352,7 +443,7 @@ def run_backtest(
             costs=costs,
             weights=held_frame,
             degradations=tuple(degradations),
-            notes=notes,
+            notes=run_notes,
         ),
     )
 

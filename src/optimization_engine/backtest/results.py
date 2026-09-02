@@ -25,12 +25,58 @@ import pandas as pd
 
 from optimization_engine.backtest.spec import BacktestSpec
 
-#: Rounding applied before hashing. Float arithmetic is deterministic given a
-#: fixed operation order, but BLAS threading and platform libm are not
-#: guaranteed to agree in the last bits; twelve decimals is far tighter than
-#: any decision anyone would take on these numbers, and far looser than the
-#: noise those differences introduce.
-_HASH_DECIMALS = 12
+#: Rounding applied before hashing, in **significant figures** — not decimal
+#: places. Float arithmetic is deterministic given a fixed operation order, but
+#: BLAS threading and platform libm are not guaranteed to agree in the last
+#: bits, so the digest has to round before it reads. Twelve *absolute* decimals
+#: does not do that job at the scales this library is actually run at: a NAV
+#: path denominated in real money — ten million, say — has only about nine
+#: fractional decimals of float64 precision left, so rounding to twelve sat
+#: below the noise floor, rounded nothing, and let one ulp of BLAS disagreement
+#: flip the hash. Twelve significant figures is the same tightness at every
+#: scale — far finer than any decision taken on these numbers, far coarser than
+#: the last three or four bits where platforms differ.
+_HASH_SIG_FIGS = 12
+
+#: Hash format version. Bumped when :func:`compute_result_hash` changes what it
+#: reads or how it rounds, so two digests are only ever compared when they were
+#: produced the same way. Version 2 rounds relatively (see ``_HASH_SIG_FIGS``)
+#: and includes the realized weight path.
+HASH_VERSION = 2
+
+
+def _q(value: float) -> str:
+    """One float, rounded to ``_HASH_SIG_FIGS`` significant figures, as text."""
+    return f"{float(value):.{_HASH_SIG_FIGS}g}"
+
+
+def _round_significant(values: np.ndarray, sig_figs: int = _HASH_SIG_FIGS) -> np.ndarray:
+    """``values`` rounded to ``sig_figs`` significant figures, elementwise.
+
+    The array form of :func:`_q`, and the reason the weight path can be hashed
+    at all: formatting a 20-year, 50-asset weight frame cell by cell costs the
+    better part of a second, and a parameter sweep pays that once per cell.
+    Rounding the whole array and hashing its bytes costs microseconds.
+
+    Args:
+        values: Any float array. NaN and infinity pass through untouched.
+        sig_figs: Significant figures to keep.
+
+    Returns:
+        A new float64 array. Negative zero is normalized to positive zero so
+        two runs that agree numerically cannot disagree in the sign bit.
+    """
+    arr = np.asarray(values, dtype=float)
+    out = np.array(arr, dtype=float, copy=True)
+    scalable = np.isfinite(arr) & (arr != 0.0)
+    if scalable.any():
+        magnitude = np.floor(np.log10(np.abs(arr[scalable])))
+        factor = np.power(10.0, sig_figs - 1 - magnitude)
+        out[scalable] = np.round(arr[scalable] * factor) / factor
+    out[out == 0.0] = 0.0
+    out[np.isnan(out)] = np.nan
+    return out
+
 
 #: Columns of the trades frame, in canonical order.
 TRADE_COLUMNS = (
@@ -66,7 +112,15 @@ class RunMeta:
             is the normal case; non-empty means the reported cost is a lower
             bound on the modelled one.
         notes: Free-form annotations added by whatever produced the run —
-            the walk-forward runner records its window geometry here.
+            the walk-forward runner records its window geometry here, and the
+            simulation loop records anything it had to move or drop. Notes are
+            deliberately **not** hashed: they describe the run, they are not
+            part of what it computed.
+        hash_version: Which recipe produced ``result_hash``. Two digests are
+            comparable only when this matches — version 2 rounds relatively
+            and hashes the weight path, version 1 (anything written before
+            this field existed) did neither. Defaults to the current version,
+            which is the only one this release can produce.
     """
 
     spec: dict[str, Any]
@@ -79,6 +133,7 @@ class RunMeta:
     is_out_of_sample: bool
     degradations: tuple[str, ...] = ()
     notes: dict[str, Any] = field(default_factory=dict)
+    hash_version: int = HASH_VERSION
 
 
 @dataclass
@@ -246,37 +301,47 @@ def _trade_dtype(column: str) -> str:
 
 
 def compute_result_hash(
-    nav: pd.Series, trades: pd.DataFrame, costs: pd.DataFrame
+    nav: pd.Series,
+    trades: pd.DataFrame,
+    costs: pd.DataFrame,
+    weights: pd.DataFrame | None = None,
 ) -> str:
     """A deterministic fingerprint of what the run produced.
 
-    Hashes the NAV path and the trade and cost totals — the three things that
-    would have to change for the run to mean something different. Values are
-    rounded first (see ``_HASH_DECIMALS``) and the rows are consumed in their
-    canonical order, so the hash is stable across platforms without being so
-    loose that a real change slips past it.
+    Hashes the NAV path, the trade and cost totals, and the realized weight
+    path — the four things that would have to change for the run to mean
+    something different. The weight path is in there because NAV and trades do
+    not pin it down: two books can hold different assets, trade the same
+    notional and print the same NAV, and without the weights those two runs
+    share a digest.
+
+    Values are rounded to twelve *significant figures* first (see
+    ``_HASH_SIG_FIGS``) and the rows are consumed in their canonical order, so
+    the hash is stable across platforms and across scales — a million-unit book
+    and a one-unit book are rounded equally hard — without being so loose that
+    a real change slips past it.
 
     Args:
         nav: The NAV path.
         trades: The trade frame, in canonical column order.
         costs: The cost frame, in canonical column order.
+        weights: The realized weight path. Optional only so that a caller
+            holding the three frames an older release produced can still hash
+            them; every run this library builds passes it.
 
     Returns:
-        A hex SHA-256 digest.
+        A hex SHA-256 digest. See :data:`HASH_VERSION` for which recipe it is.
     """
     digest = hashlib.sha256()
     for date, value in nav.items():
-        digest.update(
-            f"{pd.Timestamp(date).isoformat()}|{round(float(value), _HASH_DECIMALS)}|".encode()
-        )
+        digest.update(f"{pd.Timestamp(date).isoformat()}|{_q(value)}|".encode())
     if not trades.empty:
         ordered = trades.sort_values(["date", "asset", "side"], kind="mergesort")
         for row in ordered.itertuples(index=False):
             digest.update(
                 (
                     f"{pd.Timestamp(row.date).isoformat()}|{row.asset}|{row.side}|"
-                    f"{round(float(row.traded_weight), _HASH_DECIMALS)}|"
-                    f"{round(float(row.cost), _HASH_DECIMALS)}|"
+                    f"{_q(row.traded_weight)}|{_q(row.cost)}|"
                 ).encode()
             )
     if not costs.empty:
@@ -284,10 +349,23 @@ def compute_result_hash(
             digest.update(
                 (
                     f"{pd.Timestamp(row.date).isoformat()}|"
-                    f"{round(float(row.total), _HASH_DECIMALS)}|"
-                    f"{round(float(row.turnover), _HASH_DECIMALS)}|"
+                    f"{_q(row.total)}|{_q(row.turnover)}|"
                 ).encode()
             )
+    if weights is not None and not weights.empty:
+        # Labels first, values second, and the values as one block of bytes:
+        # formatting a weight frame cell by cell is the difference between a
+        # hash that costs microseconds and one that costs the better part of a
+        # second, paid once per sweep cell.
+        digest.update(b"|weights|")
+        digest.update("|".join(str(column) for column in weights.columns).encode())
+        digest.update(b"|")
+        digest.update(
+            "|".join(pd.Timestamp(date).isoformat() for date in weights.index).encode()
+        )
+        rounded = _round_significant(weights.to_numpy(dtype=float))
+        # Little-endian explicitly: the digest must not depend on the host.
+        digest.update(np.ascontiguousarray(rounded, dtype="<f8").tobytes())
     return digest.hexdigest()
 
 
@@ -308,7 +386,7 @@ def build_meta(
         nav: The NAV path.
         trades: The trade frame.
         costs: The cost frame.
-        weights: The realized weight path.
+        weights: The realized weight path. Hashed, not just measured.
         degradations: Cost-model degradation notes collected during the run.
         notes: Anything else worth recording alongside the result.
 
@@ -320,7 +398,7 @@ def build_meta(
     return RunMeta(
         spec=spec.to_dict(),
         spec_hash=spec.spec_hash,
-        result_hash=compute_result_hash(nav, trades, costs),
+        result_hash=compute_result_hash(nav, trades, costs, weights),
         n_periods=int(len(index)),
         n_assets=int(weights.shape[1]),
         start=index[0] if len(index) else None,
@@ -347,6 +425,7 @@ def sanitize_weights(weights: pd.Series, assets: list[str]) -> np.ndarray:
 
 __all__ = [
     "COST_COLUMNS",
+    "HASH_VERSION",
     "TRADE_COLUMNS",
     "RunMeta",
     "RunResult",
