@@ -608,12 +608,16 @@ def analyze_feasibility(
                             code="target_return_inefficient",
                             message=(
                                 f"Target return of {target:.2%} sits below the "
-                                f"minimum-variance portfolio's {gmv:.2%}."
+                                f"minimum-variance portfolio's {gmv:.2%}, so it "
+                                "will not bind."
                             ),
                             suggestion=(
-                                f"The result will be solvable but dominated — a "
-                                f"target of {gmv:.2%} gives more return at less "
-                                "risk. Raise the target."
+                                f"You will get the minimum-variance portfolio "
+                                f"and its {gmv:.2%} return, not a portfolio "
+                                f"built to {target:.2%}: the return target is a "
+                                "floor, and minimum variance already clears it. "
+                                "Raise the target above the minimum-variance "
+                                "return to have it change the answer."
                             ),
                             fatal=False,
                         )

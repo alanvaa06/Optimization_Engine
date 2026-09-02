@@ -56,6 +56,14 @@ OTHER_COLOR = "#898781"
 #: band sits at whatever index the fold leaves it, not reliably past the slots.
 OTHER_LABEL_PREFIX = "Other ("
 
+#: Frontier-anchor field names, as an analyst reads them. Keyed by the
+#: ``FrontierResult`` field the anchor lands in, which is also how
+#: ``anchor_failures`` is keyed.
+_ANCHOR_LABELS = {
+    "min_variance": "Minimum variance",
+    "tangency": "Maximum Sharpe",
+}
+
 #: Recessive furniture, so the data carries the ink.
 MUTED = "#898781"
 GRIDLINE = "#e1e0d9"
@@ -131,10 +139,14 @@ def plot_efficient_frontier(
 ) -> go.Figure:
     """Draw a frontier with its anchor portfolios and, optionally, the CAL.
 
+    An anchor portfolio that failed to solve is named in a footnote below the
+    legend rather than left off the chart in silence — a missing marker and a
+    marker that was never requested look identical otherwise.
+
     Args:
         frontier: A ``FrontierResult``. A bare summary DataFrame is still
             accepted for backwards compatibility, but then the anchors and
-            the dominated branch cannot be drawn.
+            the anchor-failure footnote cannot be drawn.
         highlight_index: Position within the plotted frame to star. Defaults
             to the highest-Sharpe point.
         title: Chart title.
@@ -146,16 +158,21 @@ def plot_efficient_frontier(
             the frontier. ``risk`` must be measured on the same axis the
             frontier uses — pass ``None`` rather than a volatility when the
             frontier is drawn against CVaR.
-        show_dominated: Also draw the inefficient branch below the
-            minimum-variance point, dashed and greyed.
+        show_dominated: **Deprecated and ignored.** It used to draw the
+            branch below the minimum-variance point. The mean-variance sweep
+            imposes its return target as ``μ'w ≥ R*``, so every target below
+            the minimum-variance return now resolves to the minimum-variance
+            portfolio itself and there is no dominated branch left to draw.
+            Accepted so existing callers keep working; remove after 0.6.x.
     """
     is_result = hasattr(frontier, "plot_frame")
     if is_result:
         df = frontier.plot_frame(efficient_only=True)
-        summary = frontier.summary
     else:
-        summary = frontier
-        df = summary.dropna(
+        # The full summary was also kept here, to filter the dominated branch
+        # out of. There is no dominated branch any more, so the plotted frame
+        # is the only one this function needs.
+        df = frontier.dropna(
             subset=["expected_volatility", "expected_return"]
         ).reset_index(drop=True)
 
@@ -176,27 +193,6 @@ def plot_efficient_frontier(
         show_anchors = True
 
     fig = go.Figure()
-
-    if show_dominated and is_result and "is_efficient" in summary.columns:
-        dominated = summary[
-            (summary["status"] == "ok") & (~summary["is_efficient"])
-        ].dropna(subset=["expected_volatility", "expected_return"])
-        if not dominated.empty:
-            fig.add_trace(
-                go.Scatter(
-                    x=dominated[risk_col],
-                    y=dominated["expected_return"],
-                    mode="markers+lines",
-                    line=dict(dash="dot", color=MUTED),
-                    marker=dict(size=6, color=MUTED),
-                    name="Dominated (below min-variance)",
-                    hovertemplate=(
-                        "Vol: %{x:.2%}<br>Return: %{y:.2%}<br>"
-                        "<i>Inefficient: more return is available at this "
-                        "risk</i><extra></extra>"
-                    ),
-                )
-            )
 
     if not df.empty:
         fig.add_trace(
@@ -307,6 +303,33 @@ def plot_efficient_frontier(
             )
         )
 
+    anchor_failures = getattr(frontier, "anchor_failures", None) if is_result else None
+    if anchor_failures:
+        fig.add_annotation(
+            text="<br>".join(
+                f"<b>{_ANCHOR_LABELS.get(name, name)} not drawn:</b> {reason}"
+                for name, reason in anchor_failures.items()
+            ),
+            xref="paper",
+            yref="paper",
+            # The legend sits at y=-0.18; the footnote has to clear it, or the
+            # one line explaining a missing marker lands underneath the legend
+            # entry for the marker that is there.
+            x=0,
+            y=-0.30,
+            xanchor="left",
+            yanchor="top",
+            showarrow=False,
+            align="left",
+            font=dict(size=11, color=MUTED),
+        )
+
+    # ``_LAYOUT`` is applied last, so the extra bottom margin the footnote
+    # needs has to go in with it rather than in an earlier call it would undo.
+    layout = dict(_LAYOUT)
+    if anchor_failures:
+        layout["margin"] = {**layout["margin"], "b": 120}
+
     fig.update_layout(
         title=title,
         xaxis_title=risk_label,
@@ -314,7 +337,7 @@ def plot_efficient_frontier(
         xaxis_tickformat=".1%",
         yaxis_tickformat=".1%",
         legend=dict(orientation="h", y=-0.18, x=0),
-        **_LAYOUT,
+        **layout,
     )
     return fig
 

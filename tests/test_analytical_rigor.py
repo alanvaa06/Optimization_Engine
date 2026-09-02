@@ -313,7 +313,7 @@ def test_cvar_reports_realized_tail_metrics(returns, mu):
     run = run_engine(returns, cfg)
     assert run.result.extras["cvar_period"] > 0
     assert run.result.extras["tail_observations"] > 0
-    assert run.result.extras["cvar_annualized"] > run.result.extras["cvar_period"]
+    assert run.result.extras["cvar_sqrt_t_scaled"] > run.result.extras["cvar_period"]
 
 
 def test_cvar_rejects_a_confidence_level_passed_as_alpha(returns):
@@ -445,12 +445,25 @@ def test_feasibility_bounds_the_return_target(cov, mu):
 
 
 def test_feasibility_flags_a_dominated_target_without_blocking(cov, mu):
+    """A sub-GMV target is still not fatal, but the advice had to change.
+
+    The message used to promise "solvable but dominated". Since the return
+    target became a floor (``μ'w ≥ R*``) that is no longer what happens:
+    minimum variance already clears the target, so the minimum-variance
+    portfolio is what comes back. Saying "dominated" would now be false.
+    """
     cons = PortfolioConstraints(bounds={a: (0.0, 0.5) for a in cov.columns})
     base = analyze_feasibility(list(cov.columns), cons, mu, cov)
     cons.target_return = base.min_variance_return - 0.01
     report = analyze_feasibility(list(cov.columns), cons, mu, cov)
-    assert report.is_feasible  # solvable, just not efficient
-    assert any(i.code == "target_return_inefficient" for i in report.issues)
+    assert report.is_feasible  # solvable, and it is the minimum-variance book
+    issues = [i for i in report.issues if i.code == "target_return_inefficient"]
+    assert len(issues) == 1
+    issue = issues[0]
+    assert not issue.fatal
+    advice = f"{issue.message} {issue.suggestion}"
+    assert "minimum-variance portfolio" in advice
+    assert "dominated" not in advice.lower()
 
 
 def test_feasibility_reports_are_actionable(cov, mu):
@@ -551,18 +564,90 @@ def test_frontier_marks_the_anchor_portfolios(returns, mu):
     assert fr.efficient["sharpe_ratio"].max() <= fr.tangency["sharpe_ratio"] + 1e-6
 
 
-def test_frontier_excludes_the_dominated_lower_branch(returns, mu):
+def test_frontier_cannot_trace_the_dominated_lower_branch(returns, mu):
+    """Every swept point is efficient — the lower branch is unreachable now.
+
+    This used to assert that the dominated branch was *filtered out* of
+    ``efficient``. Under the mean-variance return floor (``μ'w ≥ R*``) there
+    is nothing to filter: a target below the minimum-variance return returns
+    the minimum-variance portfolio, so no solved point can land below it. The
+    sweep is forced across the whole reachable range with
+    ``efficient_only=False`` — the setting that used to produce the dominated
+    branch — to show it produces none.
+    """
+    from optimization_engine.frontier import efficient_frontier
+
+    cov = covariance_matrix(returns, method="ledoit_wolf")
     cfg = EngineConfig(
         expected_returns=mu.to_dict(),
         bounds={a: [0.0, 0.30] for a in mu.index},
         optimizer=OptimizerSpec(name="mean_variance"),
     )
-    fr = run_engine(returns, cfg, build_frontier=True, n_frontier_points=10).frontier
+    fr = efficient_frontier(
+        cfg, cov, expected_returns=mu, n_points=12, efficient_only=False
+    )
     gmv_return = float(fr.min_variance["expected_return"])
-    assert (fr.efficient["expected_return"] >= gmv_return - 1e-3).all()
+    solved = fr.summary[fr.summary["status"] == "ok"]
+    assert not solved.empty
+    # Targets below the minimum-variance return were swept, and every one of
+    # them still came back at or above it.
+    assert (solved["target"] < gmv_return - 1e-6).any(), "no sub-GMV target swept"
+    assert (solved["expected_return"] >= gmv_return - 1e-3).all()
+    assert solved["is_efficient"].all()
+    assert len(fr.efficient) == len(solved)
     # Volatility rises monotonically along the efficient branch.
     vols = fr.efficient["expected_volatility"].values
     assert (np.diff(vols) >= -1e-6).all()
+
+
+def test_frontier_reports_anchor_failure(returns, mu):
+    """A tangency portfolio that cannot be solved says so, and GMV survives.
+
+    ``_anchor_portfolios`` used to swallow both anchor solves with
+    ``except Exception: pass``. A mandate that makes max-Sharpe infeasible then
+    produced a chart with no tangency marker and nothing to distinguish that
+    from a chart that never asked for one.
+
+    The mandate here: a 5% risk-free rate leaves exactly one asset with a
+    positive excess return, and that asset is capped at 2%. No fully invested
+    portfolio earns more than cash, so the tangency ray has nowhere to go —
+    while minimum variance, which never looks at ``μ``, is untouched.
+    """
+    from optimization_engine.frontier import efficient_frontier
+
+    cov = covariance_matrix(returns, method="ledoit_wolf")
+    risk_free_rate = 0.05
+    assert (mu > risk_free_rate).sum() == 1, "fixture no longer sets up the trap"
+    bounds = {
+        a: ([0.0, 0.02] if mu[a] > risk_free_rate else [0.0, 0.5]) for a in mu.index
+    }
+    cfg = EngineConfig(
+        expected_returns=mu.to_dict(),
+        bounds=bounds,
+        optimizer=OptimizerSpec(
+            name="mean_variance", risk_free_rate=risk_free_rate
+        ),
+    )
+    fr = efficient_frontier(cfg, cov, expected_returns=mu, n_points=6)
+
+    assert fr.tangency is None
+    assert "tangency" in fr.anchor_failures
+    assert "infeasible" in fr.anchor_failures["tangency"].lower()
+    # The anchor that did solve is still drawn, and is not reported as failed.
+    assert fr.min_variance is not None
+    assert "min_variance" not in fr.anchor_failures
+
+
+def test_frontier_with_both_anchors_reports_no_failures(returns, mu):
+    """The failure map is empty when nothing failed — no phantom entries."""
+    cfg = EngineConfig(
+        expected_returns=mu.to_dict(),
+        bounds={a: [0.0, 0.30] for a in mu.index},
+        optimizer=OptimizerSpec(name="mean_variance", risk_free_rate=0.02),
+    )
+    fr = run_engine(returns, cfg, build_frontier=True, n_frontier_points=6).frontier
+    assert fr.min_variance is not None and fr.tangency is not None
+    assert fr.anchor_failures == {}
 
 
 def test_max_sharpe_index_is_nan_safe():

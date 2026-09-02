@@ -50,15 +50,27 @@ class InverseVolatilityOptimizer(_ProjectedOptimizer):
     name = "inverse_vol"
 
     def _solve(self) -> np.ndarray:
+        """Weight each asset by ``1/σ`` and renormalize.
+
+        Raises:
+            ValueError: If any asset has zero variance. ``1/σ`` is undefined
+                there, and the old behaviour — weight 0 — silently dropped the
+                name from the book while still reporting it as part of the
+                universe. A degenerate column is a data problem, so it is
+                named and raised rather than absorbed.
+        """
         sigma = self._sigma_matrix()
         if sigma is None:
             raise ValueError("Covariance matrix required")
         std = np.sqrt(np.diag(sigma))
-        if not (std > 0).any():
-            raise RuntimeError(
-                "Every asset has zero variance; inverse-volatility weights "
-                "are undefined."
+        degenerate = [a for a, s in zip(self.assets, std) if not s > 0]
+        if degenerate:
+            raise ValueError(
+                f"Inverse-volatility weights are undefined for "
+                f"{len(degenerate)} zero-variance asset(s): "
+                f"{', '.join(map(str, degenerate))}. 1/σ does not exist there, "
+                "and weighting them zero would drop them from the book without "
+                "saying so. Drop the asset(s) from the universe, or check the "
+                "price history for a constant series."
             )
-        with np.errstate(divide="ignore"):
-            inv = np.where(std > 0, 1.0 / np.where(std > 0, std, 1.0), 0.0)
-        return self._project(inv / inv.sum())
+        return self._project((1.0 / std) / (1.0 / std).sum())

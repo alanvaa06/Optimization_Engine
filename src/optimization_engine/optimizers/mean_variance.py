@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import warnings
+from typing import Any
 
 import cvxpy as cp
 import numpy as np
+import pandas as pd
 
 from optimization_engine.optimizers._cvxpy_helpers import (
     build_constraints,
@@ -19,6 +21,11 @@ from optimization_engine.optimizers.base import BaseOptimizer
 # from here before solver dispatch moved into ``_cvxpy_helpers``.
 _solve_problem = solve_problem
 _SOLVER_FALLBACK = ["CLARABEL", "ECOS", "SCS", "OSQP"]
+
+#: How close ``μ'w`` has to sit to the return target before the floor counts
+#: as binding. Absolute floor for targets near zero, relative above it.
+_TARGET_SLACK_ATOL = 1e-7
+_TARGET_SLACK_RTOL = 1e-5
 
 
 class MinVarianceOptimizer(BaseOptimizer):
@@ -56,9 +63,18 @@ class MeanVarianceOptimizer(BaseOptimizer):
 
     Three modes determined by ``constraints``:
 
-    * ``target_return`` set        → minimize variance s.t. ``μ'w = R*``
+    * ``target_return`` set        → minimize variance s.t. ``μ'w ≥ R*``
     * ``target_volatility`` set    → maximize ``μ'w`` s.t. ``√(w'Σw) ≤ σ*``
     * neither set                  → maximize ``μ'w − λ·w'Σw`` (utility)
+
+    The return target is an **inequality**, not an equality. With ``μ'w = R*``
+    a target below the global minimum-variance return returns a point on the
+    dominated lower branch — the same volatility with less return — and says
+    nothing about it. Under ``μ'w ≥ R*`` the minimizer sits on the efficient
+    branch by construction: any such target simply returns the
+    minimum-variance portfolio. Whether the target actually bound is reported
+    as ``extras["target_return_binding"]``, with the realized slack in
+    ``extras["target_return_slack"]``.
 
     The volatility target is imposed as ``w'Σw ≤ σ*²`` — a convex quadratic
     constraint, so the solve stays a QP rather than becoming a second-order
@@ -84,6 +100,10 @@ class MeanVarianceOptimizer(BaseOptimizer):
         """
         super().__init__(*args, **kwargs)
         self.risk_aversion = float(risk_aversion)
+        #: μ as the solve saw it, kept so the post-solve slack can be measured
+        #: without calling ``_mu_vector()`` a second time — it warns about
+        #: missing entries, and it should warn once per solve, not twice.
+        self._solved_mu: np.ndarray | None = None
         if self.risk_aversion < 0:
             raise ValueError(
                 f"risk_aversion must be non-negative; got {risk_aversion}. "
@@ -100,10 +120,12 @@ class MeanVarianceOptimizer(BaseOptimizer):
         w = cp.Variable(n)
         sigma_psd = cp.psd_wrap(sigma)
 
+        target_return: float | None = None
         if self.constraints.target_return is not None:
             mode = "target_return"
+            target_return = float(self.constraints.target_return)
             objective = cp.Minimize(cp.quad_form(w, sigma_psd))
-            extra = [mu @ w == float(self.constraints.target_return)]
+            extra = [mu @ w >= target_return]
         elif self.constraints.target_volatility is not None:
             mode = "target_volatility"
             target_vol = float(self.constraints.target_volatility)
@@ -137,7 +159,55 @@ class MeanVarianceOptimizer(BaseOptimizer):
             )
         self._diagnostics.update(info.as_dict())
         self._diagnostics["mode"] = mode
+        self._solved_mu = np.asarray(mu, dtype=float)
         return w.value
+
+    def _post_solve_diagnostics(self, weights: pd.Series) -> dict[str, Any]:
+        """Base diagnostics, plus whether the return floor actually bound.
+
+        Measured here rather than in ``_solve`` because the base class calls
+        this *after* ``_clean_weights``: a slack computed on the raw solver
+        vector would describe a portfolio that is not the one reported.
+        """
+        diag = super()._post_solve_diagnostics(weights)
+        target_return = self.constraints.target_return
+        if target_return is None or self._solved_mu is None:
+            return diag
+        diag.update(
+            self._target_slack(weights.values, float(target_return), self._solved_mu)
+        )
+        return diag
+
+    @staticmethod
+    def _target_slack(
+        weights: np.ndarray, target_return: float, mu: np.ndarray
+    ) -> dict[str, Any]:
+        """Describe the return floor: what it asked for, and what it got.
+
+        A non-binding floor means the answer is the minimum-variance
+        portfolio and the target had no influence on it — worth saying out
+        loud, because the caller asked for a return they did not get.
+        """
+        achieved = float(np.asarray(weights, dtype=float) @ mu)
+        slack = achieved - target_return
+        # Solver tolerance, not economics, decides whether an active floor
+        # lands a hair either side of zero.
+        tol = max(_TARGET_SLACK_ATOL, abs(target_return) * _TARGET_SLACK_RTOL)
+        binding = bool(slack <= tol)
+        diag: dict[str, Any] = {
+            "target_return": target_return,
+            "target_return_achieved": achieved,
+            "target_return_slack": slack,
+            "target_return_binding": binding,
+        }
+        if not binding:
+            diag["target_return_note"] = (
+                f"The {target_return:.2%} return floor never bound: minimum "
+                f"variance alone already earns {achieved:.2%}. This is the "
+                "minimum-variance portfolio, not a portfolio built to that "
+                "target."
+            )
+        return diag
 
 
 class MaxSharpeOptimizer(BaseOptimizer):

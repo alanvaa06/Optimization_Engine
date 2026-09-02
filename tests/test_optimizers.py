@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sys
+import warnings
 from pathlib import Path
 
 import numpy as np
@@ -94,6 +95,14 @@ def test_optimizer_runs(returns: pd.DataFrame, baseline_config: EngineConfig, me
 
 
 def test_target_return(returns: pd.DataFrame, baseline_config: EngineConfig):
+    """A target above the minimum-variance return binds, and says so.
+
+    The target is a floor (``μ'w ≥ R*``), not an equality, so "the target was
+    met" is only the whole story when the floor actually bound — otherwise the
+    answer is minimum variance and the target had no say in it. 6% sits well
+    above this panel's 0.43% minimum-variance return, so it binds and the
+    realized return is the target.
+    """
     target = 0.06
     cfg = EngineConfig(
         expected_returns=baseline_config.expected_returns,
@@ -104,6 +113,171 @@ def test_target_return(returns: pd.DataFrame, baseline_config: EngineConfig):
     )
     run = run_engine(returns, cfg)
     assert run.result.expected_return == pytest.approx(target, abs=1e-3)
+    assert run.result.extras["target_return_binding"] is True
+    assert run.result.extras["target_return_slack"] == pytest.approx(0.0, abs=1e-6)
+
+
+def test_target_return_below_gmv_returns_gmv(
+    returns: pd.DataFrame, baseline_config: EngineConfig
+):
+    """A target under the minimum-variance return buys the GMV portfolio.
+
+    Under the old equality target this returned a point on the *dominated*
+    lower branch — the same volatility for less return — and reported the
+    unreachable target as if it had been achieved. The floor cannot do that:
+    minimum variance already clears it, so minimum variance is the answer, and
+    ``target_return_binding`` says the target never entered into it.
+    """
+    common = dict(
+        expected_returns=baseline_config.expected_returns,
+        bounds=baseline_config.bounds,
+        groups=baseline_config.groups,
+        group_bounds=baseline_config.group_bounds,
+    )
+    gmv = run_engine(
+        returns, EngineConfig(**common, optimizer=OptimizerSpec(name="min_variance"))
+    ).result
+    target = gmv.expected_return - 0.02
+    assert target < gmv.expected_return
+
+    run = run_engine(
+        returns,
+        EngineConfig(
+            **common,
+            optimizer=OptimizerSpec(name="mean_variance", target_return=target),
+        ),
+    )
+    assert run.result.extras["target_return_binding"] is False
+    assert run.result.extras["target_return_slack"] == pytest.approx(0.02, abs=1e-5)
+    # It is the minimum-variance portfolio, to the accuracy the two QPs are
+    # solved to. CLARABEL agrees with itself to ~1e-6 on the weights here (the
+    # 0.5 cap is active, which is where a QP loses digits) and to ~1e-7 on the
+    # summary statistics; both problems are re-solved from scratch, so this is
+    # solver noise, not a difference in the answer.
+    assert run.result.expected_return == pytest.approx(gmv.expected_return, abs=1e-6)
+    assert run.result.expected_volatility == pytest.approx(
+        gmv.expected_volatility, abs=1e-6
+    )
+    np.testing.assert_allclose(
+        run.result.weights.values, gmv.weights.values, atol=5e-5
+    )
+
+
+def test_inverse_vol_zero_variance_raises(returns: pd.DataFrame):
+    """A constant series cannot be inverse-vol weighted, and must not be dropped.
+
+    ``1/σ`` is undefined at σ = 0. The old code gave the asset weight 0 and
+    carried on, so a name the analyst had put in the universe silently left the
+    book — the same failure mode max-diversification already refuses.
+    """
+    from optimization_engine.optimizers.naive import InverseVolatilityOptimizer
+
+    cov = covariance_matrix(returns, method="sample")
+    dead = [cov.columns[0], cov.columns[3]]
+    for asset in dead:
+        cov.loc[asset, :] = 0.0
+        cov.loc[:, asset] = 0.0
+
+    with pytest.raises(ValueError) as excinfo:
+        InverseVolatilityOptimizer(cov_matrix=cov).optimize()
+    message = str(excinfo.value)
+    for asset in dead:
+        assert asset in message, message
+    assert "zero-variance" in message
+
+
+def test_inverse_vol_still_solves_a_healthy_panel(returns: pd.DataFrame):
+    """The guard only fires on a degenerate column, not on ordinary data."""
+    from optimization_engine.optimizers.naive import InverseVolatilityOptimizer
+
+    cov = covariance_matrix(returns, method="sample")
+    weights = InverseVolatilityOptimizer(cov_matrix=cov).optimize().weights
+    assert weights.sum() == pytest.approx(1.0, abs=1e-8)
+    assert (weights > 0).all()
+
+
+def test_cvar_extras_keys(returns: pd.DataFrame, baseline_config: EngineConfig):
+    """``√ppy`` scaling is reported under a name that says what it is.
+
+    ``cvar_annualized`` was the per-period CVaR times ``√252``, which
+    annualizes a tail measure only if returns are iid Gaussian — the
+    assumption a tail measure exists to avoid relying on. Both key pairs are
+    written for one release, and the rename is announced once per solve
+    because a read-shim cannot work: ``**extras`` and ``dict(extras)`` never
+    call ``__getitem__``.
+    """
+    from optimization_engine.optimizers.cvar import DEPRECATED_EXTRAS_KEYS
+
+    cfg = EngineConfig(
+        expected_returns=baseline_config.expected_returns,
+        bounds=baseline_config.bounds,
+        optimizer=OptimizerSpec(name="cvar", cvar_alpha=0.05),
+    )
+    with pytest.warns(DeprecationWarning, match="cvar_annualized"):
+        extras = run_engine(returns, cfg).result.extras
+
+    scale = np.sqrt(252)
+    assert extras["cvar_sqrt_t_scaled"] == pytest.approx(extras["cvar_period"] * scale)
+    assert extras["var_sqrt_t_scaled"] == pytest.approx(extras["var_period"] * scale)
+    # The deprecated names still resolve, to exactly the same numbers.
+    for old, new in DEPRECATED_EXTRAS_KEYS.items():
+        assert extras[old] == extras[new]
+    # ζ keeps its own name; it is the VaR, not the objective.
+    assert "cvar_solver_zeta" in extras
+    assert f"√{252}" in extras["cvar_note"]
+
+
+def test_cvar_deprecation_names_both_renamed_keys(
+    returns: pd.DataFrame, baseline_config: EngineConfig
+):
+    """One warning per solve, naming every key that moved."""
+    cfg = EngineConfig(
+        expected_returns=baseline_config.expected_returns,
+        bounds=baseline_config.bounds,
+        optimizer=OptimizerSpec(name="cvar", cvar_alpha=0.05),
+    )
+    with pytest.warns(DeprecationWarning) as caught:
+        run_engine(returns, cfg)
+    messages = [
+        str(w.message)
+        for w in caught
+        if issubclass(w.category, DeprecationWarning)
+        and "cvar_annualized" in str(w.message)
+    ]
+    assert len(messages) == 1, messages
+    for key in ("cvar_annualized", "var_annualized",
+                "cvar_sqrt_t_scaled", "var_sqrt_t_scaled"):
+        assert key in messages[0]
+
+
+def test_cdar_extras_keys(returns: pd.DataFrame):
+    """ζ and the objective are two different numbers, under two names.
+
+    ``cdar_solver_objective`` used to hold ζ — the drawdown-at-risk threshold,
+    which mean-CVaR already calls ``cvar_solver_zeta``. The objective the LP
+    actually minimizes is ``ζ + Σz/(α·T)``, and it is strictly larger whenever
+    any drawdown exceeds the threshold.
+    """
+    from optimization_engine.optimizers.cdar import CDaROptimizer
+
+    cov = covariance_matrix(returns, method="sample")
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        extras = CDaROptimizer(
+            returns=returns,
+            cov_matrix=cov,
+            alpha=0.05,
+        ).optimize().extras
+
+    assert "cdar_solver_zeta" in extras
+    assert "cdar_solver_objective" in extras
+    # ζ is the threshold; the objective averages the tail beyond it, so it is
+    # the larger of the two on any path with a drawdown worse than ζ.
+    assert extras["cdar_solver_objective"] > extras["cdar_solver_zeta"]
+    # The objective is the solved problem's own value.
+    assert extras["cdar_solver_objective"] == pytest.approx(
+        extras["objective_value"], rel=1e-9
+    )
 
 
 def test_cvar_optimizer(returns: pd.DataFrame, baseline_config: EngineConfig):
