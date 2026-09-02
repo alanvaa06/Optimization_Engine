@@ -72,7 +72,9 @@ EXPECTED_FLAGS = {
         requires_mu=False, requires_cov=True, requires_returns=False,
         supports_target_return=False, supports_target_volatility=False,
         supports_risk_aversion=False, supports_risk_free_rate=False,
-        supports_group_bounds=True, bounds_mode="hard",
+        # The scaled solve carries the bounds exactly; the projection fallback
+        # only holds them approximately, so the declaration admits both.
+        supports_group_bounds=True, bounds_mode="hard_or_projected",
         supports_frontier=False,
     ),
     "equal_weight": dict(

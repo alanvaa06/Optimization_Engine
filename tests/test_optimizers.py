@@ -501,3 +501,62 @@ def test_ray_space_solves_report_an_open_budget_as_ignored(name):
         result = optimizer.optimize()
     assert "fully_invested" in result.extras["ignored_constraints"]
     assert result.weights.sum() == pytest.approx(1.0, abs=1e-6)
+
+
+# ---------------------------------------------------------------------------
+# Registry cross-check: the declared bounds mode is the delivered one
+# ---------------------------------------------------------------------------
+
+#: What a declared ``bounds_mode`` permits a solve to report. Only
+#: ``"hard_or_projected"`` admits two answers, and it does so because the
+#: method takes an exact bounded solve when it can and a projection when the
+#: solver fails — the result says which, per solve.
+_BOUNDS_MODE_ALLOWED = {
+    "hard": {"hard"},
+    "constrained": {"constrained"},
+    "soft_iterated": {"soft_iterated"},
+    "hard_or_projected": {"hard", "soft_iterated"},
+}
+
+
+@pytest.mark.parametrize("name", available_optimizers())
+def test_result_bounds_mode_matches_its_requirements(returns: pd.DataFrame, name: str):
+    """Every method's declared bounds mode must match what its result reports.
+
+    The registry entry is what the CLI prints and the app captions; the
+    result's ``extras["bounds_mode"]`` is what actually happened. A method
+    that declares hard bounds and then projects is mislabelled, which is the
+    bug this cross-check exists to catch.
+
+    The mandate is deliberately binding — a 20% asset cap and a 20% budget on
+    a three-name bucket that 1/N would otherwise overrun — so the projecting
+    methods really do project.
+    """
+    from optimization_engine.benchmark import BenchmarkSpec
+    from optimization_engine.optimizers.requirements import requirements_for
+
+    assets = list(returns.columns)
+    equities = assets[:3]
+    cfg = EngineConfig(
+        expected_returns=(
+            (1 + returns).prod() ** (252 / len(returns)) - 1
+        ).to_dict(),
+        bounds={a: [0.0, 0.20] for a in assets},
+        groups={a: ("Equity" if a in equities else "Other") for a in assets},
+        group_bounds={"Equity": [0.0, 0.20]},
+        # Only active_mean_variance needs one; the others ignore it because no
+        # benchmark-relative budget is set.
+        benchmark=BenchmarkSpec(kind="equal_weight"),
+        optimizer=OptimizerSpec(name=name, risk_free_rate=0.02),
+    )
+
+    result = run_engine(returns, cfg).result
+
+    declared = requirements_for(name).bounds_mode
+    assert declared in _BOUNDS_MODE_ALLOWED, f"{name}: undeclared bounds mode {declared!r}"
+    assert result.extras["bounds_mode"] in _BOUNDS_MODE_ALLOWED[declared], (
+        f"{name} declares bounds_mode={declared!r} but reported "
+        f"{result.extras['bounds_mode']!r}"
+    )
+    equity = sum(v for a, v in result.weights.items() if a in equities)
+    assert equity <= 0.20 + 1e-6, f"{name}: the bucket budget did not bind"
