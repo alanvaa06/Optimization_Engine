@@ -42,10 +42,13 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import pandas as pd
+
+if TYPE_CHECKING:  # pragma: no cover - import cycle guard, typing only
+    from optimization_engine.universe.classification import Classification
 
 #: Bucket limits are read as a share of the total portfolio.
 BASIS_PORTFOLIO = "portfolio"
@@ -244,6 +247,66 @@ class ConstraintLayer:
             limits=limits,
             basis=str(data.get("basis") or BASIS_PORTFOLIO),
             parent=data.get("parent"),
+        )
+
+    @classmethod
+    def from_classification(
+        cls,
+        classification: Classification,
+        as_of: Any,
+        limits: Mapping[str, Any],
+        *,
+        name: str | None = None,
+        basis: str = BASIS_PORTFOLIO,
+        parent: str | None = None,
+    ) -> ConstraintLayer:
+        """Build a layer from a classification **as it stood on a date**.
+
+        This is the point-in-time sibling of :func:`layer_from_mapping`: it
+        resolves the assignments through
+        :meth:`~optimization_engine.universe.classification.Classification.assignments`,
+        so a sector cap applied in 2019 uses the 2019 sector map rather than
+        today's. A name reclassified since — or not yet classified at all on
+        that date — lands in the bucket it was actually in, or in none.
+
+        The layer that comes back is a **snapshot**, not a moving object: it
+        holds the assignments of one date. A backtest that wants the mapping
+        to move builds one layer per decision date.
+
+        Args:
+            classification: Any object exposing ``assignments(as_of)``, which
+                is what :class:`~optimization_engine.universe.classification.Classification`
+                provides.
+            as_of: The date to read the classification as of. Required when
+                the classification is dated; ``None`` is accepted for a static
+                one.
+            limits: ``bucket -> (min, max)`` or ``bucket -> max``, as fractions
+                of the book (or of the parent bucket under
+                ``basis="parent"``). A bare number is read as a cap with a zero
+                floor, exactly as in :func:`layer_from_mapping`.
+            name: The layer's label. Defaults to the classification's own
+                ``name``, or ``"Classification"``.
+            basis: ``"portfolio"`` or ``"parent"``.
+            parent: The layer these limits are relative to, required under
+                ``basis="parent"``.
+
+        Returns:
+            The :class:`ConstraintLayer` for that date.
+
+        Raises:
+            LayerConfigurationError: On an unknown ``basis``, or a
+                parent-relative layer naming no parent.
+            UniverseError: If the classification is dated and ``as_of`` is
+                ``None`` — see
+                :meth:`~optimization_engine.universe.classification.Classification.label`.
+        """
+        label = name or str(getattr(classification, "name", "") or "Classification")
+        return layer_from_mapping(
+            label,
+            classification.assignments(as_of),
+            limits,
+            basis=basis,
+            parent=parent,
         )
 
 

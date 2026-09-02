@@ -35,6 +35,32 @@ exactly the periods a failure-prone process gets wrong — and hand back a track
 record that begins on the strategy's first good day. The window always opens
 at ``min_lookback``, the cash periods are in it at a zero return, and
 ``notes["periods_in_cash_after_failed_solve"]`` counts them.
+
+**The universe, when there is one.** ``universe`` restricts what the optimizer
+is even shown: the solve window's *columns* are masked before ``solve`` sees
+it, which is the only way to do it — ``solve`` is a
+``Callable[[DataFrame], Series]`` and widening that signature to carry
+eligibility would break every closure already written against it. The reindex
+that follows the solve zero-fills the names that were held back, so a book
+never carries a weight in a name the optimizer was not allowed to look at.
+
+Two decisions the runner has to take, and takes out loud:
+
+*A failed solve does not suspend the mandate.* When the optimizer raises and
+the previous book is carried forward, any name in it that has since left the
+universe is still zeroed. Not being able to re-optimize is not a licence to
+keep holding something the mandate no longer permits, and a desk in that
+position sells the ineligible leg and leaves the proceeds in cash rather than
+rescaling the rest. ``notes["n_ineligible_carried_forward"]`` counts it.
+
+*Delisting is a claim about data, so it has to be quantified.* A name that has
+stopped printing looks exactly like one on a long holiday until enough silence
+has passed, and only the caller knows how much is enough — so
+``delisting_grace`` has no default and delisting is simply not diagnosed
+without one. When it is set, staleness is measured on ``returns`` up to **and
+including** the decision date and never past it, and the verdict is sticky: a
+name declared delisted stays out for the rest of the run rather than
+resurrecting on a late print.
 """
 
 from __future__ import annotations
@@ -42,11 +68,13 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
+import numpy as np
 import pandas as pd
 
 from optimization_engine.backtest.results import RunResult
-from optimization_engine.backtest.runner import run_backtest
+from optimization_engine.backtest.runner import resolve_universe_mask, run_backtest
 from optimization_engine.backtest.spec import BacktestSpec, RebalanceFrequency
+from optimization_engine.universe import Eligibility
 
 
 @dataclass
@@ -169,6 +197,25 @@ def _resolve_trading_cadence(
     return "none"
 
 
+def _last_observation_positions(returns: pd.DataFrame) -> np.ndarray:
+    """For each bar and asset, the position of its most recent print at or before it.
+
+    Args:
+        returns: The full return history.
+
+    Returns:
+        An integer ``(periods, assets)`` array. Entry ``[t, i]`` is the row
+        position of asset ``i``'s latest non-missing return on or before bar
+        ``t``, or ``-1`` when it has not printed at all yet. Reading only row
+        ``t`` is what makes the staleness test free of look-ahead: nothing
+        past ``t`` has been consulted to build it.
+    """
+    valid = returns.notna().to_numpy()
+    positions = np.arange(len(returns.index), dtype=int)[:, None]
+    seen = np.where(valid, positions, -1)
+    return np.maximum.accumulate(seen, axis=0)
+
+
 def walk_forward_run(
     returns: pd.DataFrame,
     solve: Callable[[pd.DataFrame], pd.Series],
@@ -181,6 +228,9 @@ def walk_forward_run(
     rebalance_frequency: RebalanceFrequency | None = None,
     prices: pd.DataFrame | None = None,
     volumes: pd.DataFrame | None = None,
+    universe: Eligibility | None = None,
+    universe_policy: str | None = None,
+    delisting_grace: int | None = None,
 ) -> WalkForwardRun:
     """Roll an estimation window forward, re-solving as it goes.
 
@@ -210,6 +260,31 @@ def walk_forward_run(
         volumes: Traded volume per asset and period. Optional: without one the
             impact model uses its fixed participation rate, which is the only
             thing it can do for an index universe.
+        universe: Point-in-time membership. The solve window's columns are
+            restricted to the names eligible **as of the decision date**
+            before ``solve`` is called, so the optimizer is never shown a name
+            the mandate did not permit it to hold — and a name that becomes
+            eligible at ``t`` is absent from every solve before ``t``. The
+            same universe is handed to the replay, so calendar rebalances
+            between re-solves respect it too, and ``run.meta.notes["universe"]``
+            records the breadth at each decision.
+        universe_policy: How a *not evaluable* cell is read — ``"exclude"``,
+            ``"include"`` or ``"raise"``. Required whenever ``universe`` is
+            given; there is no default.
+        delisting_grace: How many bars of silence make a name delisted, or
+            ``None`` (the default) to not diagnose delisting at all. With
+            ``0``, a name that did not print on the decision date is gone;
+            with ``5``, a business week of silence is tolerated first.
+            Staleness is measured on ``returns`` up to and including the
+            decision date, never past it. A delisted name is dropped from the
+            solve window and its target forced to zero, which the replay
+            executes as a sale at its last mark — see
+            :func:`~optimization_engine.backtest.runner.run_backtest`. The
+            verdict is sticky, and ``notes["delistings"]`` records the last
+            print and the decision that liquidated it. A name that has not
+            printed *at all* by a decision is likewise not investable at it,
+            but it is not a delisting and not sticky: it enters on its first
+            print.
 
     Returns:
         The bundle. ``n_resolves`` counts optimizations, ``n_trade_dates``
@@ -217,8 +292,10 @@ def walk_forward_run(
 
     Raises:
         ValueError: If the parameters are degenerate, the history is too
-            short to produce a single out-of-sample period, or every solve
-            failed.
+            short to produce a single out-of-sample period, ``universe`` was
+            given with no ``universe_policy``, or every solve failed.
+        UniverseError: If the universe policy is unknown, or it is ``"raise"``
+            and some name was not evaluable on some bar.
     """
     if lookback < 2:
         raise ValueError(f"lookback must be at least 2 periods; got {lookback}.")
@@ -244,12 +321,63 @@ def walk_forward_run(
     last_weights: pd.Series | None = None
     first_solved_position: int | None = None
 
+    universe_mask: np.ndarray | None = None
+    if universe is not None:
+        universe_mask, _ = resolve_universe_mask(
+            universe, universe_policy, pd.DatetimeIndex(returns.index), list(returns.columns)
+        )
+    last_seen: np.ndarray | None = None
+    grace = 0
+    if delisting_grace is not None:
+        grace = int(delisting_grace)
+        if grace < 0:
+            raise ValueError(
+                f"delisting_grace counts bars of silence and cannot be negative; got {grace}."
+            )
+        last_seen = _last_observation_positions(returns)
+    delisted_ever = np.zeros(returns.shape[1], dtype=bool)
+    delistings: dict[str, dict[str, str]] = {}
+    n_ineligible_carried_forward = 0
+
     for position in range(min_lookback, n, rebalance_every):
         start = 0 if expanding else max(0, position - lookback)
-        window = returns.iloc[start:position]
         decision_date = returns.index[position]
+
+        investable = np.ones(returns.shape[1], dtype=bool)
+        if universe_mask is not None:
+            investable &= universe_mask[position]
+        if last_seen is not None:
+            seen = last_seen[position]
+            never_printed = seen < 0
+            stale = (~never_printed) & ((position - seen) > grace)
+            for column_position in np.flatnonzero(stale & ~delisted_ever):
+                delistings[str(returns.columns[column_position])] = {
+                    "last_print": pd.Timestamp(
+                        returns.index[int(seen[column_position])]
+                    ).isoformat(),
+                    "delisted_at": pd.Timestamp(decision_date).isoformat(),
+                }
+            delisted_ever |= stale
+            investable &= ~(delisted_ever | never_printed)
+        eligible = pd.Series(investable, index=returns.columns)
+
         try:
-            solved = solve(window).reindex(returns.columns).fillna(0.0)
+            if not investable.any():
+                raise ValueError(
+                    "no asset is eligible in the universe on this date, so "
+                    "there is nothing to solve"
+                )
+            window = returns.iloc[start:position]
+            if not investable.all():
+                # Only pay for the column slice when something is masked, so a
+                # run with no universe is byte-for-byte the run it always was.
+                window = window.loc[:, eligible.to_numpy()]
+            solved = (
+                solve(window)
+                .reindex(returns.columns)
+                .fillna(0.0)
+                .where(eligible, 0.0)
+            )
             schedule[decision_date] = solved
             last_weights = solved
             if first_solved_position is None:
@@ -261,17 +389,26 @@ def walk_forward_run(
             # No prior book to carry forward means the desk holds cash. It does
             # not mean the track record starts later: a shortened window would
             # hide precisely the periods this process could not trade.
-            schedule[decision_date] = (
+            carried = (
                 last_weights
                 if last_weights is not None
                 else pd.Series(0.0, index=returns.columns)
             )
+            # Failing to re-optimize is not a licence to keep a name the
+            # mandate no longer permits. The ineligible leg is sold and the
+            # proceeds sit in cash; the rest of the book is untouched, and
+            # nothing is rescaled to hide the gap.
+            n_ineligible_carried_forward += int(
+                ((carried.abs() > 0.0) & ~eligible).sum()
+            )
+            schedule[decision_date] = carried.where(eligible, 0.0)
         window_rows.append(
             {
                 "decision_date": decision_date,
                 "window_start": returns.index[start],
                 "window_end": returns.index[position - 1],
                 "window_length": position - start,
+                "n_eligible": int(investable.sum()),
                 "status": status,
             }
         )
@@ -302,6 +439,15 @@ def walk_forward_run(
         # failed before there was any book to carry forward.
         "periods_in_cash_after_failed_solve": periods_in_cash,
     }
+    if universe is not None or delisting_grace is not None:
+        # (asset, decision) pairs where a carried-forward book still held a
+        # name the universe had dropped, and the runner sold it anyway.
+        notes["n_ineligible_carried_forward"] = int(n_ineligible_carried_forward)
+    if universe is not None:
+        notes["universe_policy"] = str(universe_policy)
+    if delisting_grace is not None:
+        notes["delisting_grace"] = grace
+        notes["delistings"] = delistings
     # The cost models see the whole history, not just the evaluated slice:
     # a decision made at the first evaluated date has years of returns behind
     # it, and pricing its impact off the slice alone would throw them away.
@@ -313,6 +459,8 @@ def walk_forward_run(
         context_returns=returns,
         prices=prices,
         volumes=volumes,
+        universe=universe,
+        universe_policy=universe_policy if universe is not None else None,
     )
 
     return WalkForwardRun(

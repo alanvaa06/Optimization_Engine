@@ -183,6 +183,7 @@ from optimization_engine.optimizers.feasibility import (
 from optimization_engine.resampling import (
     FrontierUncertainty,
     MCOSResult,
+    ResampledFrontier,
     bootstrap_frontier,
     monte_carlo_optimization_selection,
     resample_returns,
@@ -200,6 +201,13 @@ from optimization_engine.scenarios import (
     scenario_from_dict,
     scenario_signature,
     scenario_to_dict,
+)
+from optimization_engine.universe import (
+    Classification,
+    Eligibility,
+    Signal,
+    UniverseError,
+    point_in_time_mask,
 )
 
 __version__ = "0.5.3"
@@ -275,6 +283,7 @@ __all__ = [
     "PricePanel",
     "FrontierUncertainty",
     "MCOSResult",
+    "ResampledFrontier",
     "bootstrap_frontier",
     "monte_carlo_optimization_selection",
     "resample_returns",
@@ -312,6 +321,11 @@ __all__ = [
     "scenario_from_dict",
     "scenario_signature",
     "scenario_to_dict",
+    "Classification",
+    "Eligibility",
+    "Signal",
+    "UniverseError",
+    "point_in_time_mask",
     "BaseOptimizer",
     "BlackLittermanOptimizer",
     "CDaROptimizer",
