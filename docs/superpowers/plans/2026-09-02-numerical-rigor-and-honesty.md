@@ -458,3 +458,71 @@ Genuinely new — nothing point-in-time exists anywhere in the tree.
 
 `pytest -q` green, `ruff check src app tests scripts` clean, and every acceptance test named
 in the spec present and passing — a fix without its test is not done.
+
+---
+
+## Execution log
+
+What actually landed, and what execution taught that the audit did not. Each
+entry names the commit and the corrections found while implementing it — the
+plan above was written from a read of the source, and a read is not a run.
+
+| Task | Commit | Landed |
+| --- | --- | --- |
+| 2.1 cache retry | `7924434` | Retry on `PermissionError`; staging cleanup moved into a `finally` so the new lost-the-race path cannot leak a file |
+| 1.1 max-diversification | `6e2ce4f` | Infeasible re-raises; fallback reports its own status; `hard_or_projected` |
+| 1.6 Black-Litterman | `085ebca` | Out-of-universe and degenerate views raise |
+| 1.3 backtest honesty | `79f39ba` | Off-index dates trade; failed first solve holds cash; relative hashing + weight path |
+| 1.2 one Sharpe | `79dde38` | Arithmetic Sharpe; `n_cells` trials; `fill_method=None` ×4; `pandas>=2.1` |
+| 1.2b second `n_ok` site | `54b77b9` | The CLI's walk-forward sweep carried the same defect |
+| 2.2 NCO + lazy filter | `84e1dc4` | Sub-solves go through `optimize()`; warnings filter installs on first solve |
+| 1.4 anchors, targets, labels | `57004da` | `anchor_failures`; target return is a floor; `cvar_sqrt_t_scaled`; `cdar_solver_zeta` |
+| 2.4 CI | `ff2ff0b` | mypy over 89 modules with a 45-module allowlist; Windows and pandas-2.1 cells |
+
+### Corrections the audit missed, found only by running the code
+
+1. **`dropped_constraints` is narrower than three names.** `max_active_share`
+   is *honoured* by the projection — setting it is what forces the CVXPY
+   branch, and a 5% cap on a 70% weight comes back at exactly 5%. `leverage`
+   is honoured on that branch and lost only on the clip-and-redistribute fast
+   path, so it is reported conditionally. Only `max_tracking_error` is
+   unconditionally dropped. Listing an enforced constraint as dropped would be
+   a false diagnostic in the one field written to be honest.
+2. **The hash was stable by default.** `initial_capital` defaults to `1.0`,
+   not `1e6`, where twelve absolute decimals is well inside float64's
+   resolution. The instability the design describes is real but only reachable
+   once a caller sets realistic capital.
+3. **§1.12's 1e-8 acceptance tolerance is not attainable.** Re-solving GMV as
+   a min-variance QP with a slack inequality agrees with the direct GMV solve
+   to 5e-5 on weights when a box constraint is active — genuine solver
+   tolerance in the raw solve, not weight cleaning. The test asserts 5e-5 on
+   weights and 1e-6 on the reported return, with the measurement in the
+   comment.
+4. **The efficiency flag survives §1.12.** The plan expected the dominated
+   branch to become dead code. It is dead for a mean-variance sweep only: a
+   mean-CVaR sweep minimises CVaR, so its portfolios can genuinely sit below
+   the minimum-*variance* return. `show_dominated` is kept as a documented
+   no-op because the app and the example notebook pass it.
+5. **cvxpy 1.9.2 ships `py.typed`.** The audit said otherwise. mypy therefore
+   parses cvxpy's source, which uses `match` and cannot be parsed at
+   `python_version = "3.9"` — the run aborted before reaching this package.
+6. **mypy 2.x refuses `python_version = "3.9"`** outright, so the dev
+   dependency is capped below 2 until this package's floor rises.
+7. **NCO's numbers barely moved** — cross-sample weight drift shifted 1.0e-07
+   against a margin of 0.44 versus 0.75, because the sub-solves are
+   hard-constrained and the dust threshold finds nothing. The cost is 20–24%
+   per solve, all of it the per-layer diagnostics.
+8. **A sixth swallow site**, invisible to the AST scan because its body is a
+   `return`, not `pass`: `factory.py:286` `except Exception: return
+   expected_returns` swallows Black-Litterman's new validation, so the preview
+   falls back silently while the real solve raises.
+
+### Still open
+
+- `app/streamlit_app.py:1890,:1919` — the dominated-branch checkbox is inert.
+- `reporting/plots.py` still labels the mean-CVaR axis "annualized", the same
+  false claim as the key renamed in §1.14; it coordinates with an app caption.
+- `app/components.py:404 render_frontier_health` shows `failures` but not
+  `anchor_failures`.
+- README's walk-forward Sharpe figures move with §1.10(c) and must be
+  regenerated from `scripts/render_docs_images.py`, not edited by hand.
