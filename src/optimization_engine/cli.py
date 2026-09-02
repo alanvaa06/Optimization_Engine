@@ -1094,7 +1094,7 @@ def _cmd_backtest(args: argparse.Namespace) -> int:
             volumes=volumes,
         )
         print(f"  {sweep_results.describe()}")
-        n_trials = max(sweep_results.n_ok, 1)
+        n_trials = max(sweep_results.n_cells, 1)
         trial_sharpes = sweep_results.trial_sharpes()
         try:
             overfitting = sweep_results.overfitting_report()
