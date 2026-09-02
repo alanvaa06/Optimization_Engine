@@ -135,6 +135,34 @@ later.
 
 ---
 
+## Conventions a caller has to know
+
+These are not errors, but every one of them has been mistaken for one.
+
+**Risk aversion is `μ'w − λ·w'Σw`, with no ½.** The convention is documented
+once, on `OptimizerSpec.risk_aversion`, and repeated here because the other
+common form carries a half in front of the variance term: a `risk_aversion`
+tuned against that form is twice as risk-averse here as intended.
+Black-Litterman passes `δ/2` for exactly this reason.
+
+**CVaR `alpha` is the tail probability**, not the confidence level.
+`alpha=0.05` means the worst 5% of outcomes.
+
+**The Sharpe ratio is arithmetic per period, annualized.** It is the quantity
+the probabilistic and deflated Sharpe ratios and the minimum track-record
+length are derived on, so they now agree with it. The geometric form is
+`sharpe_ratio(..., method="geometric")` and appears in `summary_stats` as
+`"Sharpe Ratio (geometric)"`. Sortino, Calmar and Martin keep geometric
+numerators; their docstrings say so.
+
+**`expected_returns_from_history("mean")` is the arithmetic mean.**
+Mean-variance is a single-period model, so a geometric μ against an
+arithmetic Σ is a mismatch. The geometric form is `"geometric_mean"`.
+
+**`cvar_sqrt_t_scaled` is a √T scaling, not an annualization.** It holds
+under iid-Gaussian returns and not otherwise, which is why the key no longer
+says "annualized".
+
 ## Infeasible mandates
 
 The difference between these three matters.
