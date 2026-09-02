@@ -149,9 +149,50 @@ class NCOOptimizer(BaseOptimizer):
         )
 
     def _sub_solve(
-        self, cov: pd.DataFrame, mu: pd.Series | None
+        self, cov: pd.DataFrame, mu: pd.Series | None, layer: str = "sub-problem"
     ) -> pd.Series:
-        """Solve one layer of the nest with the engine's own optimizers."""
+        """Solve one layer of the nest with the engine's own optimizers.
+
+        The sub-problem goes through the optimizer's public
+        :meth:`~optimization_engine.optimizers.base.BaseOptimizer.optimize`
+        rather than its raw ``_solve``, so a nested layer gets the same
+        treatment as a top-level solve: the non-finite check, dust removal
+        and budget restoration of ``_clean_weights``, ``bounds_mode``
+        recorded on the result, and the post-solve compliance diagnostics.
+        Reaching past ``optimize`` was how the two layers came to be the only
+        weights in the engine that nothing ever validated.
+
+        Note that each layer is checked against :meth:`_sub_constraints` --
+        budget and sign -- and *not* against the mandate, whose per-asset and
+        group limits are applied to the combined book by projection in
+        :meth:`_solve`. Auditing a cluster against a portfolio-level cap would
+        measure the wrong quantity, which is the whole reason the sub-problem
+        drops those limits in the first place.
+
+        Running the check once per cluster plus once for the inter-cluster
+        layer costs roughly a fifth of an NCO solve (measured at 15 and 64
+        assets; the compliance sweep is most of it, the weight cleaning the
+        rest). It is kept rather than short-circuited because what it verifies
+        -- the weights sum to one, and stay non-negative under a long-only
+        mandate -- is exactly the invariant the outer product in :meth:`_solve`
+        depends on. A per-solve opt-out, if one is wanted, belongs on
+        ``optimize`` itself rather than as a private hook here.
+
+        Args:
+            cov: Covariance of this layer's universe — one cluster's assets,
+                or the synthetic cluster assets of the inter-cluster layer.
+            mu: Expected returns for the same universe, or ``None`` under the
+                ``min_variance`` objective.
+            layer: Which layer is being solved, used only in error messages.
+
+        Returns:
+            Weights indexed by ``cov``'s columns, summing to one.
+
+        Raises:
+            ValueError: If the layer's weights net to approximately zero, so
+                they cannot be rescaled to the unit budget the nesting
+                assumes. Reachable only with ``long_only=False`` — see below.
+        """
         from optimization_engine.optimizers.mean_variance import (
             MaxSharpeOptimizer,
             MinVarianceOptimizer,
@@ -173,7 +214,44 @@ class NCOOptimizer(BaseOptimizer):
             optimizer = MinVarianceOptimizer(
                 cov_matrix=cov, constraints=constraints
             )
-        return pd.Series(np.asarray(optimizer._solve(), dtype=float), index=assets)
+        weights = optimizer.optimize().weights.reindex(assets)
+        return self._unit_budget(weights, layer)
+
+    @staticmethod
+    def _unit_budget(weights: pd.Series, layer: str) -> pd.Series:
+        """Restore the unit budget the nesting assumes, or say why it cannot.
+
+        ``_clean_weights`` normalizes a fully-invested solve back to one after
+        zeroing dust — except when the weights net to approximately zero,
+        where it returns them *unnormalized* because rescaling is meaningless
+        there. That escape hatch is unreachable in a long-only nest (every
+        weight is non-negative and the budget is imposed inside the convex
+        program) but is live under ``long_only=False``, where a market-neutral
+        cluster can net out. Letting an unnormalized layer through would break
+        the invariant the outer product at :meth:`_solve` depends on — each
+        cluster's weights sum to one, so ``loadings @ inter`` sums to one —
+        and the book would silently stop being fully invested.
+
+        Args:
+            weights: One layer's solved weights.
+            layer: Which layer produced them, for the error message.
+
+        Returns:
+            ``weights`` rescaled to sum to one.
+
+        Raises:
+            ValueError: If the weights net to approximately zero.
+        """
+        total = float(weights.sum())
+        if abs(total) < 1e-9:
+            raise ValueError(
+                f"NCO: the weights for {layer} net to {total:.3g}, so they "
+                "cannot be rescaled to the unit budget the nesting assumes. "
+                "A cluster whose long and short legs cancel has no meaningful "
+                "share of the book to allocate to. Force a different cluster "
+                "count with n_clusters=, or run long-only."
+            )
+        return weights / total
 
     def _solve(self) -> np.ndarray:
         if self.cov_matrix is None:
@@ -203,7 +281,9 @@ class NCOOptimizer(BaseOptimizer):
         intra: dict[int, pd.Series] = {}
         for label, members in assignment.members.items():
             sub_mu = mu.loc[members] if mu is not None else None
-            intra[label] = self._sub_solve(cov.loc[members, members], sub_mu)
+            intra[label] = self._sub_solve(
+                cov.loc[members, members], sub_mu, layer=f"cluster {label}"
+            )
 
         # -- collapse each cluster into one synthetic asset -----------------
         labels = sorted(intra)
@@ -222,7 +302,9 @@ class NCOOptimizer(BaseOptimizer):
         )
 
         # -- layer 2: optimize across the synthetic assets ------------------
-        inter = self._sub_solve(reduced_cov, reduced_mu)
+        inter = self._sub_solve(
+            reduced_cov, reduced_mu, layer="the inter-cluster layer"
+        )
 
         combined = pd.Series(
             loadings.values @ inter.reindex(labels).values, index=assets

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 import time
 import warnings
 from dataclasses import dataclass
@@ -34,9 +35,44 @@ _OK_STATUSES = ("optimal", "optimal_inaccurate")
 # matched on the exact message so nothing else is silenced; ``module`` is not
 # usable here because CVXPY raises with a stacklevel that attributes the
 # warning to this file rather than to its own.
-warnings.filterwarnings(
-    "ignore", message="Solution may be inaccurate", category=UserWarning
-)
+#
+# That argument is unchanged, and so is the filter: it is still installed on
+# the interpreter's global filter list and still outlives the solve that put
+# it there. What moved is *when* it goes on. Installing it at import time made
+# ``import optimization_engine`` -- a statement that solves nothing -- mutate a
+# process-global belonging to the host application, which is not a library's
+# to change until the library is actually asked to do something. So the install
+# happens on the first ``solve_problem`` call instead, once, behind
+# ``_FILTER_LOCK`` because that first call may well be N pool threads at once.
+#
+# One residual behaviour difference, deliberate: a consumer who calls
+# ``warnings.resetwarnings()`` after solving wipes the filter, and under the
+# lazy scheme the next solve reinstalls it, where the eager scheme would have
+# left it off for the rest of the process. Reinstalling is the better of the
+# two -- the filter exists to keep a solve quiet, and every solve should get
+# the same treatment -- but it does mean ``resetwarnings()`` no longer holds
+# against this module.
+_FILTER_LOCK = threading.Lock()
+_filter_installed = False
+
+
+def _install_inaccurate_warning_filter() -> None:
+    """Silence CVXPY's ``optimal_inaccurate`` warning, once per process.
+
+    Idempotent and thread-safe: concurrent first solves add exactly one entry
+    to ``warnings.filters`` between them. See the comment above for why the
+    filter is process-wide rather than scoped to the solve.
+    """
+    global _filter_installed
+    if _filter_installed:
+        return
+    with _FILTER_LOCK:
+        if _filter_installed:
+            return
+        warnings.filterwarnings(
+            "ignore", message="Solution may be inaccurate", category=UserWarning
+        )
+        _filter_installed = True
 
 
 @dataclass(frozen=True)
@@ -145,6 +181,10 @@ def solve_problem(
     the first solver's inaccurate result is how a portfolio ends up a few
     basis points outside its own constraints for no reason.
 
+    The first call in a process also installs the process-wide warnings filter
+    described at the top of this module. Importing the package does not; only
+    asking it to solve something does.
+
     Args:
         problem: The CVXPY problem to solve.
         solvers: Fallback chain, tried in order. Missing solvers are skipped.
@@ -157,6 +197,7 @@ def solve_problem(
             are impossible) from *unbounded* and from numerical failure,
             because the analyst's next action differs in each case.
     """
+    _install_inaccurate_warning_filter()
     attempts: list[str] = []
     last_status = "unknown"
     last_error: Exception | None = None
