@@ -1235,7 +1235,10 @@ def _cmd_check(args: argparse.Namespace) -> int:
         constraints_from_config,
         effective_expected_returns,
     )
-    from optimization_engine.optimizers.feasibility import analyze_feasibility
+    from optimization_engine.optimizers.feasibility import (
+        STAGE_STRUCTURAL,
+        analyze_feasibility,
+    )
 
     inputs = _prepare_inputs(args)
     if isinstance(inputs, int):
@@ -1280,18 +1283,41 @@ def _cmd_check(args: argparse.Namespace) -> int:
         expected_returns=effective_expected_returns(config, cov, mu),
         cov_matrix=cov,
     )
-    print(report.describe())
-    if report.min_return is not None:
-        line = (
-            f"Reachable expected return: {report.min_return:.2%} to "
-            f"{report.max_return:.2%}"
-        )
+    # Fatal findings and warnings print differently on purpose: the whole
+    # point of the two-stage analysis is that "no allocation satisfies these
+    # constraints" and "the solver could not answer" are different answers,
+    # and a reader who cannot tell them apart is back where they started.
+    for issue in report.fatal_issues:
+        print(f"  x {issue.message}")
+        if issue.suggestion:
+            print(f"    -> {issue.suggestion}")
+    for issue in report.warnings:
+        print(f"  ! {issue.message}")
+        if issue.suggestion:
+            print(f"    -> {issue.suggestion}")
+    if not report.issues:
+        print("  Constraints are satisfiable.")
+
+    if report.reachable_return is not None:
+        low, high = report.reachable_return
+        line = f"Reachable expected return: {low:.2%} to {high:.2%}"
         if report.min_variance_return is not None:
             line += f" (efficient above {report.min_variance_return:.2%})"
         print(line)
+    elif report.stage_reached == STAGE_STRUCTURAL and not report.fatal_issues:
+        # Saying nothing here would let "Ready to optimize." read as though a
+        # return target had been validated against a reachable range that was
+        # never computed.
+        print(
+            "Reachable expected return: not computed — "
+            "the range needs a solver and none answered."
+        )
 
     _capture(args, check_payload(quality, report, diag, alignment=alignment))
-    if quality.errors or not report.is_feasible:
+    if report.fatal_issues:
+        print("\nNot ready to optimize.", file=sys.stderr)
+        return 2
+    if quality.errors:
         print("\nNot ready to optimize.", file=sys.stderr)
         return 1
     print("\nReady to optimize.")

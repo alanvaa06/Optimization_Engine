@@ -183,7 +183,10 @@ except InfeasibleConstraintsError as exc:
 Note `raise_on_infeasible`. It defaults to `False`, in which case the engine
 reports the problem in `run.warnings` and proceeds. Pass `True` — the CLI's
 `--strict` — when you would rather stop. `optengine check` runs the same
-analysis without solving and exits `1` if the mandate is not ready.
+analysis without solving. It exits `2` when the mandate itself is impossible
+and `1` when the data is unusable — different problems, so a script can tell
+them apart. A finding that only says the solver could not answer is a warning,
+not a fatal: a solver that crashed is not a mandate that has no solution.
 
 **`InfeasibleBoundsError`** is narrower and comes from the projection step
 rather than the mandate analysis. Three ways in: the minima sum above 1 or the

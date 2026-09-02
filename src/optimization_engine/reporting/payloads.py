@@ -35,7 +35,7 @@ import pandas as pd
 #: Bumped major on a breaking change to any payload below, minor when keys
 #: are added. Consumers should check the major and refuse a version they do
 #: not know rather than parsing optimistically.
-SCHEMA_VERSION = "1.1"
+SCHEMA_VERSION = "2.0"
 
 
 def _num(value: Any) -> float | None:
@@ -204,13 +204,29 @@ def feasibility_payload(report: Any) -> dict[str, Any] | None:
     """
     if report is None:
         return None
-    issues = _strings(getattr(report, "issues", None))
+    # Structured, not stringified. This used to run through `_strings`, which
+    # put the dataclass repr into the document — a consumer wanting the code
+    # had to parse `FeasibilityIssue(code='...', ...)` out of prose.
+    issues = [
+        {
+            "code": str(getattr(issue, "code", "")),
+            "severity": str(getattr(issue, "severity", "")),
+            "message": str(getattr(issue, "message", "")),
+            "suggestion": str(getattr(issue, "suggestion", "") or ""),
+        }
+        for issue in (getattr(report, "issues", None) or ())
+    ]
     # `is_feasible` is the report's own verdict; deriving it from an empty
-    # issue list would silently disagree the day the two stop coinciding.
+    # issue list would silently disagree the day the two stop coinciding —
+    # and they already do, now that a warning is an issue that does not
+    # make the mandate impossible.
     feasible = getattr(report, "is_feasible", None)
+    reachable = getattr(report, "reachable_return", None)
     return {
         "feasible": bool(feasible) if feasible is not None else not issues,
         "issues": issues,
+        "stage_reached": str(getattr(report, "stage_reached", "structural")),
+        "reachable_return": [_num(reachable[0]), _num(reachable[1])] if reachable else None,
         "min_return": _num(getattr(report, "min_return", None)),
         "max_return": _num(getattr(report, "max_return", None)),
         "min_variance_return": _num(getattr(report, "min_variance_return", None)),

@@ -75,7 +75,8 @@ def test_check_passes_on_a_feasible_config(feasible_config, capsys):
 
 
 def test_check_fails_and_names_the_constraint(infeasible_config, capsys):
-    assert main(["check", "--config", str(infeasible_config), "--sample"]) == 1
+    # 2 is the mandate-is-impossible code; 1 stays for unusable data.
+    assert main(["check", "--config", str(infeasible_config), "--sample"]) == 2
     captured = capsys.readouterr()
     assert "cannot reach 100% invested" in captured.out
     assert "Raise the caps" in captured.out
@@ -400,7 +401,9 @@ def test_check_honours_the_benchmark_flags_optimize_does(feasible_config, capsys
         ]
     )
     captured = capsys.readouterr()
-    assert code == 1, captured.out + captured.err
+    # 2, not 1: an impossible mandate and unusable data are different
+    # problems and a script should be able to tell them apart.
+    assert code == 2, captured.out + captured.err
     assert "Not ready to optimize." in captured.err
 
 
