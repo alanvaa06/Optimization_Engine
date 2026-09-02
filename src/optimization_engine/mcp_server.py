@@ -100,13 +100,22 @@ def _build() -> tuple[Any, type[Exception]]:
 mcp, ToolError = _build()
 
 
-def _panel(sample: bool, prices_path: str | None) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Resolve a price panel and its returns from exactly one source.
+def _panel(
+    sample: bool, prices_path: str | None
+) -> tuple[pd.DataFrame, pd.DataFrame, list[str]]:
+    """Resolve a price panel, its returns, and how the two were aligned.
 
-    Both are returned because the two are used for different things —
-    data-quality analysis reads prices, the optimizers read returns — and
-    reconstructing one from the other would introduce a rounding difference
-    between what was checked and what was solved.
+    Prices and returns are both returned because the two are used for
+    different things — data-quality analysis reads prices, the optimizers
+    read returns — and reconstructing one from the other would introduce a
+    rounding difference between what was checked and what was solved.
+
+    The third element is the alignment log. A panel is made rectangular
+    before it is differenced, and the asset that listed last decides where
+    every other series starts; a client that only ever sees weights has no
+    way to find that out. It travels in the payload rather than on a
+    stream: this server speaks the protocol over stdio, so there is no
+    stdout to narrate on.
 
     Every entry point here takes *prices*, because that is what a data file
     holds and differencing them in one place keeps the two from being
@@ -114,6 +123,7 @@ def _panel(sample: bool, prices_path: str | None) -> tuple[pd.DataFrame, pd.Data
     second differences, so the parameter is named for what it wants.
     """
     from optimization_engine.data.loader import load_prices, prices_to_returns, sample_dataset
+    from optimization_engine.data.quality import align_panel
 
     if sample and prices_path:
         raise ToolError(
@@ -136,7 +146,21 @@ def _panel(sample: bool, prices_path: str | None) -> tuple[pd.DataFrame, pd.Data
             "No data given. Pass sample=True for the built-in panel, or "
             "prices_path pointing at a CSV, Excel or Parquet file of prices."
         )
-    return prices, prices_to_returns(prices).dropna(how="any")
+    # `method="common"` is the CLI's choice, for the CLI's reasons — and
+    # the two surfaces must not disagree about what the same file means.
+    # See `cli._prepare_inputs`, including the note on why an interior gap
+    # is treated differently from the bare `dropna(how="any")` this
+    # replaced.
+    aligned, actions = align_panel(prices, method="common")
+    returns = prices_to_returns(aligned)
+    n_rows = len(returns)
+    returns = returns.dropna(how="any")
+    if len(returns) < n_rows:
+        actions.append(
+            f"Dropped {n_rows - len(returns)} period(s) whose return could "
+            "not be computed from the aligned prices."
+        )
+    return aligned, returns, actions
 
 
 def _config(config_path: str | None, optimizer: str | None) -> Any:
@@ -244,6 +268,8 @@ def check_mandate(
 
     Returns:
         A payload whose ``ready`` field is the single boolean to branch on.
+        ``alignment`` says what the panel lost to become rectangular — an
+        empty list means nothing was dropped.
     """
     from optimization_engine.data.covariance import (
         covariance_diagnostics,
@@ -258,7 +284,7 @@ def check_mandate(
     from optimization_engine.optimizers.feasibility import analyze_feasibility
 
     config = _config(config_path, optimizer)
-    prices, returns = _panel(sample, prices_path)
+    prices, returns, alignment = _panel(sample, prices_path)
 
     quality = analyze_prices(prices, periods_per_year=config.periods_per_year)
     cov = covariance_from_config(returns, config)
@@ -275,7 +301,7 @@ def check_mandate(
         expected_returns=effective_expected_returns(config, cov, mu),
         cov_matrix=cov,
     )
-    return check_payload(quality, feasibility, diagnostics)
+    return check_payload(quality, feasibility, diagnostics, alignment=alignment)
 
 
 @mcp.tool(
@@ -304,7 +330,8 @@ def optimize(
     Returns:
         Weights under ``weights``, and the evidence under ``diagnostics``,
         ``covariance`` and ``feasibility``. Reporting the weights alone
-        discards what distinguishes this engine.
+        discards what distinguishes this engine. ``alignment`` names every
+        change made to the panel before it was differenced.
 
     Raises:
         ToolError: If the mandate has no solution, or no solver could
@@ -316,7 +343,7 @@ def optimize(
     from optimization_engine.optimizers.feasibility import InfeasibleConstraintsError
 
     config = _config(config_path, optimizer)
-    _, returns = _panel(sample, prices_path)
+    _, returns, alignment = _panel(sample, prices_path)
     try:
         run = run_engine(returns, config, raise_on_infeasible=True)
     except InfeasibleConstraintsError as exc:
@@ -328,7 +355,7 @@ def optimize(
         raise ToolError(f"The mandate has no solution: {exc}") from exc
     except SolverFailure as exc:
         raise ToolError(f"No solver could produce an allocation: {exc}") from exc
-    return optimization_payload(run)
+    return optimization_payload(run, alignment=alignment)
 
 
 @mcp.tool(
@@ -372,14 +399,15 @@ def backtest(
     Returns:
         ``spec_hash`` and ``result_hash`` identify the run; ``degradations``
         names anywhere the simulation had to fall back, which is where its
-        costs are optimistic.
+        costs are optimistic. ``alignment`` says how much history the panel
+        lost before the walk started.
     """
     from optimization_engine.backtest.spec import BacktestSpec, CostSpec
     from optimization_engine.engine import run_engine
     from optimization_engine.optimizers._cvxpy_helpers import SolverFailure
 
     config = _config(config_path, optimizer)
-    _, returns = _panel(sample, prices_path)
+    _, returns, alignment = _panel(sample, prices_path)
     spec = BacktestSpec(
         costs=CostSpec(commission_bps=commission_bps, slippage_bps=slippage_bps),
         periods_per_year=config.periods_per_year,
@@ -399,7 +427,9 @@ def backtest(
         raise ToolError(f"The initial solve failed: {exc}") from exc
     except ValueError as exc:
         raise ToolError(f"The walk-forward could not run: {exc}") from exc
-    return backtest_payload(walk.run, tearsheet=run.tearsheet(walk.run))
+    return backtest_payload(
+        walk.run, tearsheet=run.tearsheet(walk.run), alignment=alignment
+    )
 
 
 def main() -> None:

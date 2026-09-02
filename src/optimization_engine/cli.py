@@ -376,6 +376,7 @@ def _cmd_optimize(args: argparse.Namespace) -> int:
     if isinstance(inputs, int):
         return inputs
     config, returns, quality = inputs.config, inputs.returns, inputs.quality
+    alignment = inputs.alignment
     for issue in quality.errors:
         print(f"Data error — {issue.describe()}", file=sys.stderr)
     for issue in quality.warnings:
@@ -501,7 +502,9 @@ def _cmd_optimize(args: argparse.Namespace) -> int:
                     f"worst position {row['max_weight_drift']:.2%}"
                 )
     print(f"Wrote {out} ({len(sheets)} sheets)")
-    _capture(args, optimization_payload(run, output_path=str(out)))
+    _capture(
+        args, optimization_payload(run, output_path=str(out), alignment=alignment)
+    )
     return 0
 
 
@@ -854,6 +857,9 @@ class _Inputs:
     returns: pd.DataFrame
     quality: object
     volumes: pd.DataFrame | None
+    #: One sentence per change alignment made to the panel. Empty means
+    #: nothing was dropped, which is a claim worth being able to make.
+    alignment: list[str]
 
 
 def _fail(args: argparse.Namespace, message: str, code: int = 2) -> int:
@@ -879,16 +885,26 @@ def _prepare_inputs(args: argparse.Namespace) -> _Inputs | int:
     ``resolve_expected_returns`` would otherwise have estimated.
 
     The order of operations: estimator flags, then the panel, then currency
-    conversion, then the universe, then the benchmark flags. Currency before
-    universe because a conversion needs every column it is told about;
-    universe before benchmark because a single-asset benchmark has to name
-    an asset that survived.
+    conversion, then the universe, then alignment, then the benchmark flags.
+    Currency before universe because a conversion needs every column it is
+    told about; universe before alignment because an asset the config never
+    asked for must not be allowed to truncate the sample; alignment before
+    benchmark because a single-asset benchmark has to name an asset that
+    survived.
+
+    Missing data is resolved by :func:`~optimization_engine.data.quality.align_panel`
+    rather than by dropping incomplete rows in passing. The operation is
+    the same one; what changes is that the caller is told. One asset that
+    listed three years after the rest truncates the sample for every other
+    asset, and a covariance estimated on three years of a twenty-year
+    panel is not the estimate the config asked for.
 
     Returns:
-        The inputs, or an exit code when something the caller can fix is
-        wrong — printed on stderr, and carried into the ``--json`` payload.
+        The inputs — including the alignment log — or an exit code when
+        something the caller can fix is wrong: printed on stderr, and
+        carried into the ``--json`` payload.
     """
-    from optimization_engine.data.quality import analyze_prices
+    from optimization_engine.data.quality import align_panel, analyze_prices
 
     config = load_config(args.config)
     _apply_estimator_flags(config, args)
@@ -938,8 +954,43 @@ def _prepare_inputs(args: argparse.Namespace) -> _Inputs | int:
             )
         prices = prices[common]
 
+    # Quality is read off the *raw* panel on purpose: aligning first would
+    # hide the very gaps the report exists to name.
     quality = analyze_prices(prices, periods_per_year=config.periods_per_year)
-    returns = prices_to_returns(prices).dropna(how="any")
+
+    # `method="common"` keeps the dates on which every asset is present.
+    # The alternatives were rejected deliberately: `"ffill"` fabricates
+    # prices, and a fabricated flat period understates volatility and
+    # correlation in exactly the sample the covariance is estimated on;
+    # `"drop_assets"` silently edits the *universe*, which is a mandate
+    # decision the config makes and the CLI must not make for it. Losing
+    # history is the least dishonest of the three, so long as the loss is
+    # stated. The app offers all three (`app/streamlit_app.py`) and defaults
+    # to the same one; a non-interactive run does not get to guess.
+    #
+    # For a late listing — the case this replaced — the surviving sample is
+    # identical to what the bare `dropna(how="any")` produced, so no number
+    # moves. An *interior* gap does differ, and deliberately: differencing
+    # first left NaN at the gap and at the period after it, quietly costing
+    # two observations, whereas aligning first drops the gap date and books
+    # the move across it as one period. That is the split `prices_to_returns`
+    # documents and hands to "the alignment step"; this is that step.
+    prices, alignment = align_panel(prices, method="common")
+    returns = prices_to_returns(prices)
+    # Nothing is missing after alignment, so a NaN surviving here is a
+    # degenerate price rather than a listing date. Counting it keeps the
+    # guard without restoring the silence.
+    n_rows = len(returns)
+    returns = returns.dropna(how="any")
+    if len(returns) < n_rows:
+        alignment.append(
+            f"Dropped {n_rows - len(returns)} period(s) whose return could "
+            "not be computed from the aligned prices."
+        )
+    # Unconditionally on stderr: stdout is the parsed stream under
+    # `--json`, and a truncated sample is not an advanced-mode detail.
+    for action in alignment:
+        print(f"  Alignment: {action}", file=sys.stderr)
     if returns.empty:
         return _fail(args, "No usable returns after alignment.")
     if config.expected_returns:
@@ -951,7 +1002,12 @@ def _prepare_inputs(args: argparse.Namespace) -> _Inputs | int:
         return _fail(args, f"Benchmark error: {exc}")
 
     return _Inputs(
-        config=config, prices=prices, returns=returns, quality=quality, volumes=volumes
+        config=config,
+        prices=prices,
+        returns=returns,
+        quality=quality,
+        volumes=volumes,
+        alignment=alignment,
     )
 
 
@@ -1014,6 +1070,7 @@ def _cmd_backtest(args: argparse.Namespace) -> int:
     config, prices, returns, volumes = (
         inputs.config, inputs.prices, inputs.returns, inputs.volumes
     )
+    alignment = inputs.alignment
 
     try:
         spec = BacktestSpec(
@@ -1162,6 +1219,7 @@ def _cmd_backtest(args: argparse.Namespace) -> int:
             walk.run,
             tearsheet=sheet,
             output_path=str(out) if out is not None else None,
+            alignment=alignment,
         ),
     )
     return 0
@@ -1185,6 +1243,7 @@ def _cmd_check(args: argparse.Namespace) -> int:
     config, prices, returns, quality = (
         inputs.config, inputs.prices, inputs.returns, inputs.quality
     )
+    alignment = inputs.alignment
 
     print("== Data quality ==")
     print(quality.describe())
@@ -1231,7 +1290,7 @@ def _cmd_check(args: argparse.Namespace) -> int:
             line += f" (efficient above {report.min_variance_return:.2%})"
         print(line)
 
-    _capture(args, check_payload(quality, report, diag))
+    _capture(args, check_payload(quality, report, diag, alignment=alignment))
     if quality.errors or not report.is_feasible:
         print("\nNot ready to optimize.", file=sys.stderr)
         return 1

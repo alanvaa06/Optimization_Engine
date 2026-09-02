@@ -34,7 +34,7 @@ import pandas as pd
 #: Bumped major on a breaking change to any payload below, minor when keys
 #: are added. Consumers should check the major and refuse a version they do
 #: not know rather than parsing optimistically.
-SCHEMA_VERSION = "1.0"
+SCHEMA_VERSION = "1.1"
 
 
 def _num(value: Any) -> float | None:
@@ -159,12 +159,22 @@ def feasibility_payload(report: Any) -> dict[str, Any] | None:
     }
 
 
-def optimization_payload(run: Any, *, output_path: str | None = None) -> dict[str, Any]:
+def optimization_payload(
+    run: Any,
+    *,
+    output_path: str | None = None,
+    alignment: Any = None,
+) -> dict[str, Any]:
     """The full result of one solve: weights, and what they rest on.
 
     Args:
         run: An :class:`~optimization_engine.engine.EngineRun`.
         output_path: Where the workbook was written, when one was.
+        alignment: The action log from
+            :func:`~optimization_engine.data.quality.align_panel` — one
+            sentence per change made to the panel before it was
+            differenced. Empty means the panel needed no changes, which
+            is a different claim from "nobody looked".
 
     Returns:
         A JSON-serialisable dict. ``weights`` maps asset name to weight;
@@ -194,6 +204,10 @@ def optimization_payload(run: Any, *, output_path: str | None = None) -> dict[st
         ),
         "feasibility": feasibility_payload(getattr(run, "feasibility", None)),
         "warnings": _strings(getattr(run, "warnings", None)),
+        # What the sample the numbers above were computed on had to lose
+        # to become rectangular. A late-listing asset truncates every
+        # other series, and that is invisible in the weights.
+        "alignment": _strings(alignment),
         "output_path": output_path,
     }
 
@@ -202,6 +216,8 @@ def check_payload(
     quality: Any,
     feasibility: Any,
     covariance: Any = None,
+    *,
+    alignment: Any = None,
 ) -> dict[str, Any]:
     """A pre-flight verdict: can this mandate be solved, and on what data.
 
@@ -217,6 +233,8 @@ def check_payload(
         quality: A :class:`~optimization_engine.data.quality.DataQualityReport`.
         feasibility: A ``FeasibilityReport`` from ``analyze_feasibility``.
         covariance: Covariance diagnostics, when they were computed.
+        alignment: The action log from
+            :func:`~optimization_engine.data.quality.align_panel`.
     """
     feas = feasibility_payload(feasibility)
     quality_errors = _strings(getattr(quality, "errors", None))
@@ -232,6 +250,10 @@ def check_payload(
             "common_start": str(getattr(quality, "common_start", None) or "") or None,
             "common_end": str(getattr(quality, "common_end", None) or "") or None,
         },
+        # `data_quality` describes the panel as it arrived; `alignment`
+        # describes what was done to it afterwards. Reading the first
+        # without the second says what was wrong, not what was kept.
+        "alignment": _strings(alignment),
         "feasibility": feas,
         "covariance": covariance_diagnostics_payload(covariance),
     }
@@ -260,6 +282,7 @@ def backtest_payload(
     *,
     tearsheet: Any = None,
     output_path: str | None = None,
+    alignment: Any = None,
 ) -> dict[str, Any]:
     """What a simulated run of the process actually produced.
 
@@ -278,6 +301,10 @@ def backtest_payload(
         result: A :class:`~optimization_engine.backtest.results.RunResult`.
         tearsheet: The built tearsheet, when one was.
         output_path: Where the workbook was written, when one was.
+        alignment: The action log from
+            :func:`~optimization_engine.data.quality.align_panel`. A
+            simulated track record that starts three years late because
+            one asset listed late is not the same track record.
     """
     meta = getattr(result, "meta", None)
     metrics = None
@@ -303,6 +330,7 @@ def backtest_payload(
         },
         "degradations": _strings(getattr(meta, "degradations", None)),
         "notes": _strings(getattr(meta, "notes", None)),
+        "alignment": _strings(alignment),
         "metrics": metrics,
         "output_path": output_path,
     }

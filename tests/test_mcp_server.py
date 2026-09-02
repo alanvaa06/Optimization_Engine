@@ -196,3 +196,38 @@ def test_backtest_is_shaped_by_the_config_it_is_handed(tmp_path):
     # a monthly config used to be simulated as daily, so the two agreed.
     assert daily["spec_hash"] != monthly["spec_hash"]
     assert daily["window"]["n_periods"] > 0
+
+
+def test_every_payload_carries_the_alignment_log(tmp_path):
+    """The transport promise: the same payload the CLI's `--json` emits.
+
+    `_panel` used to make the panel rectangular with a bare
+    `dropna(how="any")`, so a client that handed over a file with one
+    late-listing asset got a book estimated on a truncated sample with no
+    way to find that out. There is no stdout to narrate on here — this
+    server speaks the protocol over stdio — so the log has to be in the
+    payload or nowhere.
+    """
+    import pandas as pd
+
+    from optimization_engine.data.loader import sample_dataset
+    from optimization_engine.data.quality import align_panel
+
+    prices = sample_dataset()
+    prices.loc[prices.index[:500], prices.columns[0]] = float("nan")
+    csv = tmp_path / "late_listing.csv"
+    prices.to_csv(csv)
+    _, expected = align_panel(pd.read_csv(csv, index_col=0, parse_dates=True), "common")
+    assert expected, "the fixture is only useful if something is dropped"
+
+    args = {"prices_path": str(csv), "optimizer": "risk_parity"}
+    assert call("check_mandate", args)["alignment"] == expected
+    assert call("optimize", args)["alignment"] == expected
+    assert call("backtest", {**args, "lookback": 504, "rebalance_every": 252})[
+        "alignment"
+    ] == expected
+
+
+def test_a_complete_panel_reports_an_empty_alignment_log():
+    """Present and empty, so a client can test the value rather than the key."""
+    assert call("check_mandate", {"sample": True})["alignment"] == []
