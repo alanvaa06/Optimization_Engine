@@ -1293,14 +1293,15 @@ def analyze_feasibility(
                 )
             )
 
-    if wants_vol_floor and gmv_result is not None:
+    target_vol = constraints.target_volatility
+    if wants_vol_floor and gmv_result is not None and target_vol is not None:
         floor_vol = float(gmv_result.expected_volatility)
-        if constraints.target_volatility < floor_vol - 1e-8:
+        if target_vol < floor_vol - 1e-8:
             issues.append(
                 FeasibilityIssue(
                     code="target_vol_below_gmv",
                     message=(
-                        f"Target volatility of {constraints.target_volatility:.2%} "
+                        f"Target volatility of {target_vol:.2%} "
                         f"is below the {floor_vol:.2%} floor set by the "
                         "minimum-variance portfolio."
                     ),
