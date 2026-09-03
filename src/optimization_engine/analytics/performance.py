@@ -164,10 +164,19 @@ def sharpe_ratio(
     number against a distribution of geometric ones. Every Sharpe in the tree
     now routes through here; the only thing that varies is ``method``.
 
-    The two conventions differ by roughly half the variance of the return
-    series, which is not a rounding error: on the eight-year sample panel,
-    equal-weighted, the geometric Sharpe is 0.5950 and the arithmetic one
-    0.6238 — 4.8% higher.
+    The gap between the two is not a rounding error: on the eight-year sample
+    panel, equal-weighted, the geometric Sharpe is 0.5950 and the arithmetic
+    one 0.6238 — 4.8% higher.
+
+    The usual shorthand, that the geometric numerator is the arithmetic one
+    less half the variance, holds for the volatilities most return series
+    have but is not a rule. Compounding is convex, and its second-order term
+    pushes the geometric numerator back up; it wins whenever the per-period
+    volatility falls below roughly ``sqrt(periods_per_year - 1)`` times the
+    mean — about 15.8x on daily data. On a low-volatility, high-mean series
+    the geometric Sharpe is therefore the *higher* of the two. This is the
+    same effect that makes the sample panel's cash column the one asset whose
+    arithmetic mean sits below its geometric one.
 
     Args:
         r: A return stream, or a frame of them.
