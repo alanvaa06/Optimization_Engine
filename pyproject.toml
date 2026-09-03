@@ -108,6 +108,7 @@ dev = [
     "ruff>=0.5",
     "mypy>=1.11,<2; python_version >= '3.11'",
     "pandas-stubs>=2.2; python_version >= '3.11'",
+    "types-PyYAML>=6.0; python_version >= '3.11'",
 ]
 
 [project.scripts]
@@ -148,6 +149,12 @@ no_implicit_optional = true
 # Most of the scientific stack ships no type information at all — scs,
 # clarabel, statsmodels, yfinance, sklearn. Without this every one of those
 # imports is an error before a line of this project's own code is read.
+#
+# It does *not* cover PyYAML, and that is deliberate on mypy's part: stubs for
+# it exist on PyPI, so mypy reports ``import-untyped`` and names the package to
+# install rather than silently treating it as Any. Hence ``types-PyYAML`` in the
+# ``dev`` extra — dropping it does not make the error go away, it makes the
+# typecheck job fail.
 ignore_missing_imports = true
 
 # cvxpy 1.9 *does* ship ``py.typed`` — the plan that added this section says it
