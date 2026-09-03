@@ -1,0 +1,108 @@
+# Illustrative stress scenarios for the sample panel.
+#
+#   optengine optimize --config config/example_multi_asset.yaml --sample \
+#       --stress config/shocks.yaml
+#
+# Each scenario is a **one-period** simple return per asset, applied to the
+# solved book: P&L = Σ wᵢ·rᵢ, and the report decomposes that sum back onto the
+# positions that produced it. There is no horizon and no distribution here —
+# these are named bad days, not a simulation. The numbers are round figures
+# chosen to be recognisable, not a capital-market assumption and not anyone's
+# house view.
+#
+# An asset a scenario does not name is shocked by 0.0. An asset a scenario
+# *does* name that the book cannot hold is refused rather than dropped, so
+# these are written against the thirteen names in example_multi_asset.yaml;
+# run them against a narrower universe and the engine will say so.
+#
+# ``covariance_scale`` is the scenario's effect on *risk*: a scalar multiplies
+# the base covariance, so 4.0 doubles every volatility with correlations
+# unchanged. It is what lets the report say what the book's volatility becomes
+# under the scenario, not only what it loses on the day.
+
+schema_version: 1
+
+shocks:
+  - name: Global equity drawdown
+    notes: >-
+      A 2008-shaped risk-asset repricing compressed into a single period.
+      Government bonds rally, credit does not, and gold behaves as a reserve
+      asset rather than as a commodity.
+    covariance_scale: 4.0        # volatilities double
+    returns:
+      US_Equity:     -0.32
+      Intl_Equity:   -0.35
+      EM_Equity:     -0.42
+      Real_Estate:   -0.38
+      Infra:         -0.22
+      Commodities:   -0.25
+      Gold:           0.05
+      US_Treasuries:  0.08
+      TIPS:           0.03
+      IG_Credit:     -0.06
+      HY_Credit:     -0.18
+      EM_Debt:       -0.15
+      Cash:           0.00
+
+  - name: Rates repricing
+    notes: >-
+      A 2022-shaped shock: the discount rate moves and everything long-duration
+      falls with it. The scenario a 60/40 book is least prepared for, because
+      the hedge and the risk asset lose together.
+    covariance_scale: 2.25       # volatilities ×1.5
+    returns:
+      US_Equity:     -0.18
+      Intl_Equity:   -0.17
+      EM_Equity:     -0.20
+      Real_Estate:   -0.25
+      Infra:         -0.13
+      Commodities:    0.15
+      Gold:          -0.03
+      US_Treasuries: -0.14
+      TIPS:          -0.11
+      IG_Credit:     -0.16
+      HY_Credit:     -0.11
+      EM_Debt:       -0.17
+      Cash:           0.00
+
+  - name: Inflation surprise
+    notes: >-
+      A supply-driven commodity spike. Real assets gain, nominal duration
+      loses, and equities give up a multiple rather than an earnings number.
+    covariance_scale: 1.5
+    returns:
+      US_Equity:     -0.08
+      Intl_Equity:   -0.09
+      EM_Equity:     -0.10
+      Real_Estate:   -0.06
+      Infra:         -0.02
+      Commodities:    0.30
+      Gold:           0.12
+      US_Treasuries: -0.06
+      TIPS:           0.02
+      IG_Credit:     -0.05
+      HY_Credit:     -0.05
+      EM_Debt:       -0.07
+      Cash:           0.00
+
+  - name: Liquidity squeeze
+    notes: >-
+      Every diversifier stops diversifying at once: the moves are modest but
+      they are all the same sign, gold included, because it is what can be
+      sold. Small P&L, large risk multiple — the scenario a correlation matrix
+      estimated in calm markets cannot produce.
+    covariance_scale: 6.25       # volatilities ×2.5
+    returns:
+      US_Equity:     -0.11
+      Intl_Equity:   -0.12
+      EM_Equity:     -0.14
+      Real_Estate:   -0.12
+      Infra:         -0.08
+      Commodities:   -0.10
+      Gold:          -0.06
+      US_Treasuries: -0.02
+      TIPS:          -0.03
+      IG_Credit:     -0.05
+      HY_Credit:     -0.09
+      EM_Debt:       -0.10
+      Cash:           0.00

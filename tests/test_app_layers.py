@@ -253,3 +253,361 @@ def test_the_backtest_tab_prices_the_trading_it_shows():
     assert panel.total_cost > 0
     # Impact rides on top of the linear charge, so the realized rate exceeds it.
     assert panel.cost_bps_of_notional > 20.0
+
+
+# ---------------------------------------------------------------------------
+# 💥 Stress and 🌍 Universe
+# ---------------------------------------------------------------------------
+#
+# The pure halves of both tabs live in ``test_ui_stress_universe``; what these
+# protect is the wiring — that a scenario typed into the grid reaches
+# ``stress_test`` on the solved book, that the library's refusals arrive as
+# messages instead of stack traces, and that the collapse policy the page
+# offers is the one the run is actually made under.
+
+
+@pytest.fixture(scope="module")
+def solved_app() -> AppTest:
+    """A fresh page with one solve behind it, shared by the tabs below.
+
+    Both tabs need a book: a scenario is applied to weights, and a universe is
+    applied to a run. Solving once and reusing it keeps the integration checks
+    to a handful of seconds.
+    """
+    at = AppTest.from_file(str(APP), default_timeout=900)
+    at.run()
+    _no_exception(at)
+    next(b for b in at.button if b.label == "Optimize portfolio").click().run()
+    _no_exception(at)
+    assert at.session_state["last_run"] is not None
+    return at
+
+
+def _set_shocks(at: AppTest, rows: list[tuple[str, str, float]]) -> None:
+    """Put a long-form scenario grid into the page and rerun it."""
+    import pandas as pd
+
+    at.session_state["stress_shock_table"] = pd.DataFrame(
+        {
+            "Scenario": [r[0] for r in rows],
+            "Asset": [r[1] for r in rows],
+            "Shock return": [r[2] for r in rows],
+        }
+    )
+    at.run()
+
+
+def _metrics(at: AppTest) -> dict[str, str]:
+    return {m.label: m.value for m in at.metric}
+
+
+def _plotly_specs(at: AppTest) -> list[dict]:
+    """Every Plotly figure the page emitted, as the JSON it emitted.
+
+    ``AppTest`` does not model ``st.plotly_chart``, so the figure is read back
+    off the element's proto — which is the serialized figure itself, and
+    therefore exactly what a browser would draw.
+    """
+    import json
+
+    return [
+        json.loads(chart.proto.spec)
+        for chart in at.get("plotly_chart")
+        if chart.proto.spec
+    ]
+
+
+def test_the_stress_tab_reports_the_worst_scenario_and_what_drove_it(solved_app):
+    """A scenario typed into the grid reaches the solved book."""
+    held = [
+        a
+        for a, w in solved_app.session_state["last_run"].result.weights.items()
+        if abs(w) > 1e-4
+    ]
+    assert len(held) >= 2, "the default solve holds too little to stress"
+    worst_name, mild_name = "Deep drawdown", "Mild wobble"
+    _set_shocks(
+        solved_app,
+        [
+            (worst_name, held[0], -0.40),
+            (worst_name, held[1], -0.20),
+            (mild_name, held[0], -0.02),
+        ],
+    )
+    _no_exception(solved_app)
+
+    cards = _metrics(solved_app)
+    assert cards["Worst scenario"] == worst_name
+    assert cards["Largest contributor"] in held
+    # The number on the card is the report's, not a re-derivation of it.
+    from optimization_engine.stress import stress_test
+
+    run = solved_app.session_state["last_run"]
+    report = stress_test(
+        run.result.weights,
+        list(run.config.stress) or [],
+        cov_matrix=run.cov_matrix,
+    ) if run.config.stress else None
+    assert report is None or report.worst.name == worst_name
+
+
+def test_a_shock_on_a_name_the_book_cannot_hold_is_a_message_not_a_crash(solved_app):
+    """And the scenario is still there afterwards — refused, not deleted."""
+    _set_shocks(
+        solved_app,
+        [("Wider than the book", "US_Equity", -0.30),
+         ("Wider than the book", "NOT_IN_THIS_BOOK", -0.50)],
+    )
+    _no_exception(solved_app)
+
+    errors = [e.value for e in solved_app.error]
+    assert any("does not hold" in message for message in errors), errors
+    assert any("NOT_IN_THIS_BOOK" in message for message in errors), errors
+
+    # Not silently dropped: the leg is still in the grid, and it still reaches
+    # the mandate, so saving the preset saves the scenario as written.
+    table = solved_app.session_state["stress_shock_table"]
+    assert "NOT_IN_THIS_BOOK" in set(table["Asset"])
+    solved_app.text_input(key="scn_new_name").set_value("Refused scenario").run()
+    solved_app.button(key="scn_save").click().run()
+    _no_exception(solved_app)
+    saved = solved_app.session_state["scenarios"]["Refused scenario"].config
+    assert [s.name for s in saved.stress] == ["Wider than the book"]
+    assert "NOT_IN_THIS_BOOK" in saved.stress[0].returns
+
+
+def test_applying_it_anyway_records_what_was_dropped(solved_app):
+    """The library's escape hatch, wired to a control that says what it costs."""
+    _set_shocks(
+        solved_app,
+        [("Wider than the book", "EM_Equity", -0.30),
+         ("Wider than the book", "NOT_IN_THIS_BOOK", -0.50)],
+    )
+    solved_app.radio(key="stress_unknown_assets").set_value("ignore").run()
+    _no_exception(solved_app)
+
+    assert not [e.value for e in solved_app.error]
+    warnings = [w.value for w in solved_app.warning]
+    assert any("NOT_IN_THIS_BOOK" in w for w in warnings), warnings
+    assert any("smaller than the scenario" in w for w in warnings), warnings
+    solved_app.radio(key="stress_unknown_assets").set_value("raise").run()
+
+
+def test_scenarios_survive_a_saved_preset(solved_app):
+    """`EngineConfig.stress` is part of the mandate, so it must reopen."""
+    from components import empty_scenario_table, empty_shock_table
+
+    _set_shocks(
+        solved_app,
+        [("Rates repricing", "IG_Credit", -0.16),
+         ("Rates repricing", "EM_Equity", -0.20)],
+    )
+    meta = solved_app.session_state["stress_scenario_table"]
+    meta.loc["Rates repricing", "Covariance ×"] = 2.25
+    meta.loc["Rates repricing", "Notes"] = "2022-shaped"
+    solved_app.session_state["stress_scenario_table"] = meta
+    solved_app.run()
+
+    solved_app.text_input(key="scn_new_name").set_value("Stressed mandate").run()
+    solved_app.button(key="scn_save").click().run()
+    _no_exception(solved_app)
+    saved = solved_app.session_state["scenarios"]["Stressed mandate"].config
+    assert [s.to_dict() for s in saved.stress] == [
+        {
+            "name": "Rates repricing",
+            "returns": {"IG_Credit": -0.16, "EM_Equity": -0.20},
+            "covariance_scale": 2.25,
+            "notes": "2022-shaped",
+        }
+    ]
+
+    solved_app.session_state["stress_shock_table"] = empty_shock_table()
+    solved_app.session_state["stress_scenario_table"] = empty_scenario_table()
+    solved_app.run()
+    solved_app.selectbox(key="scn_select").set_value("Stressed mandate").run()
+    solved_app.button(key="scn_load").click().run()
+    solved_app.run()
+    _no_exception(solved_app)
+
+    restored = solved_app.session_state["stress_shock_table"]
+    assert sorted(restored["Asset"]) == ["EM_Equity", "IG_Credit"]
+    restored_meta = solved_app.session_state["stress_scenario_table"]
+    assert float(restored_meta.loc["Rates repricing", "Covariance ×"]) == 2.25
+    assert restored_meta.loc["Rates repricing", "Notes"] == "2022-shaped"
+
+    # Leave the page as the other tests expect to find it.
+    solved_app.session_state["stress_shock_table"] = empty_shock_table()
+    solved_app.session_state["stress_scenario_table"] = empty_scenario_table()
+    solved_app.run()
+
+
+def test_the_shipped_shock_file_loads_into_the_page(solved_app):
+    """`config/shocks.yaml` is what the README's --stress line points at.
+
+    Uploading it is the same journey a desk takes: a scenario library written
+    once, run from the CLI and read in the app, with neither one having to be
+    retyped into the other.
+    """
+    from components import empty_scenario_table, empty_shock_table
+
+    payload = (ROOT / "config" / "shocks.yaml").read_bytes()
+    solved_app.file_uploader(key="stress_upload").set_value(
+        ("shocks.yaml", payload, "text/yaml")
+    ).run()
+    _no_exception(solved_app)
+
+    from optimization_engine.stress import load_shocks
+
+    expected = load_shocks(ROOT / "config" / "shocks.yaml")
+    rows = solved_app.session_state["stress_shock_table"]
+    assert set(rows["Scenario"]) == {s.name for s in expected}
+    meta = solved_app.session_state["stress_scenario_table"]
+    assert list(meta.index) == [s.name for s in expected]
+
+    # And they reach the book: every scenario names only assets the sample
+    # panel carries, so the report renders rather than being refused.
+    assert not [e.value for e in solved_app.error]
+    cards = _metrics(solved_app)
+    assert cards["Worst scenario"] in {s.name for s in expected}
+
+    solved_app.file_uploader(key="stress_upload").set_value(None).run()
+    solved_app.session_state["stress_shock_table"] = empty_shock_table()
+    solved_app.session_state["stress_scenario_table"] = empty_scenario_table()
+    solved_app.run()
+
+
+def test_the_universe_tab_draws_three_states_not_two(solved_app):
+    """The heatmap has to say "nobody evaluated this", or it says nothing."""
+    from components import ELIGIBILITY_COLORS, ELIGIBILITY_STATES
+
+    cards = _metrics(solved_app)
+    for state in ELIGIBILITY_STATES:
+        assert state in cards, cards
+        assert int(cards[state].split()[0].replace(",", "")) > 0, (state, cards)
+
+    # Read the figure the page actually emitted, not one rebuilt here: the
+    # question is whether the *page* draws three states, and a two-colour
+    # scale would still pass every assertion made off a fresh figure.
+    heatmaps = [
+        trace
+        for spec in _plotly_specs(solved_app)
+        for trace in spec["data"]
+        if trace.get("type") == "heatmap"
+        and {str(color).lower() for _, color in trace.get("colorscale", [])}
+        == {c.lower() for c in ELIGIBILITY_COLORS}
+    ]
+    assert heatmaps, "the eligibility heatmap is not on the page"
+    trace = heatmaps[0]
+    # Three flat bands rather than a ramp: each colour repeats at both ends of
+    # its third of the scale, so nothing is interpolated between two states
+    # that have no midpoint between them.
+    assert len(trace["colorscale"]) == 2 * len(ELIGIBILITY_COLORS)
+    # And all three states are really on the figure. Read off ``customdata``,
+    # which is the hover text: the state is named in words as well as
+    # coloured, so the distinction survives a reader who cannot see the hue.
+    drawn = {cell for row in trace["customdata"] for cell in row}
+    assert drawn == set(ELIGIBILITY_STATES), drawn
+
+
+def test_the_policy_is_not_chosen_for_the_reader(solved_app):
+    """No default, and the page says what a choice would cost before it is made."""
+    assert solved_app.radio(key="universe_policy").value is None
+    prompts = [i.value for i in solved_app.info]
+    assert any("Choose a policy above" in p for p in prompts), prompts
+    assert any(
+        "Choose a collapse policy above" in p for p in prompts
+    ), prompts
+
+
+def test_the_policy_selector_changes_what_the_collapse_costs(solved_app):
+    """Same rules, same book, different policy — and a different run."""
+    solved_app.radio(key="universe_policy").set_value("exclude").run()
+    _no_exception(solved_app)
+    excluded_line = [
+        i.value for i in solved_app.info if "not evaluable" in i.value
+    ]
+    assert excluded_line and "'exclude'" in excluded_line[0]
+    assert "reads them as ineligible" in excluded_line[0]
+
+    solved_app.button(key="run_universe").click().run()
+    _no_exception(solved_app)
+    under_exclude = solved_app.session_state["universe_run_notes"]["universe"]
+
+    solved_app.radio(key="universe_policy").set_value("include").run()
+    included_line = [
+        i.value for i in solved_app.info if "not evaluable" in i.value
+    ]
+    assert included_line and "admits them" in included_line[0]
+
+    solved_app.button(key="run_universe").click().run()
+    _no_exception(solved_app)
+    under_include = solved_app.session_state["universe_run_notes"]["universe"]
+
+    assert under_exclude["policy"] == "exclude"
+    assert under_include["policy"] == "include"
+    # The warm-up is where the two disagree: 'exclude' has nothing eligible
+    # there, 'include' has everything.
+    assert under_include["min_breadth"] > under_exclude["min_breadth"]
+    assert under_include["n_liquidations"] < under_exclude["n_liquidations"]
+
+
+def test_the_universe_run_surfaces_the_notes_only_it_records(solved_app):
+    """Breadth, forced liquidations and delistings, from the run's own notes."""
+    solved_app.radio(key="universe_policy").set_value("exclude").run()
+    solved_app.radio(key="universe_mode").set_value("walk_forward").run()
+    solved_app.button(key="run_universe").click().run()
+    _no_exception(solved_app)
+
+    notes = solved_app.session_state["universe_run_notes"]
+    assert set(notes["universe"]) >= {
+        "policy", "breadth", "liquidated", "unknown_assets", "n_liquidations"
+    }
+    # Delisting is a separate opt-in and only the re-solving path diagnoses it.
+    assert "delistings" in notes
+    cards = _metrics(solved_app)
+    assert cards["Collapse policy"] == "exclude"
+    assert "Forced liquidations" in cards
+    assert any(
+        "kept printing for the whole run" in c.value for c in solved_app.caption
+    )
+    solved_app.radio(key="universe_mode").set_value("replay").run()
+
+
+def test_the_explain_inspector_answers_for_one_name_on_one_date(solved_app):
+    asset = solved_app.selectbox(key="universe_explain_asset").value
+    answers = [
+        i.value
+        for i in solved_app.info
+        if i.value.startswith(f"{asset} on ")
+    ]
+    assert answers, [i.value for i in solved_app.info]
+    assert any(
+        verdict in answers[0]
+        for verdict in ("eligible", "not eligible", "not evaluable")
+    )
+
+
+@pytest.mark.parametrize(
+    "rules_text",
+    [
+        # A misspelt key. Refused rather than defaulted: a rules file that
+        # loads cleanly with a typo in it is a *different mandate* silently
+        # substituted for the one that was signed off.
+        "schema_version: 1\nrules:\n  - {kind: rolling, panel: returns, windwo: 63}\n",
+        # Not YAML at all — an unterminated flow mapping, the shape a
+        # half-typed rule takes.
+        "rules:\n  - {kind: rolling,\n",
+        # Empty, and a list where a mapping belongs.
+        "",
+        "- just\n- a\n- list\n",
+    ],
+)
+def test_broken_rules_are_a_message_beside_the_box_that_broke_them(
+    solved_app, rules_text
+):
+    """Every way of getting the document wrong ends on the page, not in a trace."""
+    solved_app.session_state["universe_rules_text"] = rules_text
+    solved_app.run()
+    _no_exception(solved_app)
+    errors = [e.value for e in solved_app.error]
+    assert any("do not describe a universe" in message for message in errors), errors

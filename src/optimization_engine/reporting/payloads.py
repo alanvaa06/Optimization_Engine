@@ -39,7 +39,13 @@ import pandas as pd
 #: ``2.1`` adds ``audit`` to the optimize payload — the mandate audit, as
 #: structured violations rather than the sentences ``diagnostics.violations``
 #: has always carried.
-SCHEMA_VERSION = "2.1"
+#:
+#: ``2.2`` adds ``stress`` to the optimize and backtest payloads. ``--stress``
+#: already reached the console and the workbook; a machine caller reading
+#: ``--json`` could not see the scenarios at all, which made the one number
+#: worth automating an alert on — the worst case — the one number the
+#: structured output omitted.
+SCHEMA_VERSION = "2.2"
 
 
 def _num(value: Any) -> float | None:
@@ -215,6 +221,98 @@ def audit_payload(report: Any) -> dict[str, Any] | None:
     }
 
 
+def stress_payload(report: Any, *, as_of: Any = None) -> dict[str, Any] | None:
+    """What each named scenario does to the book, worst case first.
+
+    Structured for the same reason ``feasibility.issues`` and
+    ``audit.violations`` are: the console prints
+    :meth:`~optimization_engine.stress.StressReport.describe`, and a consumer
+    that wanted the worst scenario's loss had to parse it back out of a
+    sentence. Here every scenario is an object, ``pnl`` is a number, and
+    ``contributions`` carries the per-asset decomposition that sums to it —
+    the identity that makes the report auditable is preserved in the payload
+    rather than only in the prose.
+
+    ``worst`` is lifted to the top, like ``feasible`` and ``clean`` above, so a
+    consumer can threshold on one number without sorting the list itself.
+
+    ``scenarios`` is ordered worst-first, matching
+    :meth:`~optimization_engine.stress.StressReport.by_severity` and the
+    printed report; a consumer that wants the scenario's own declaration order
+    has it in the config it supplied.
+
+    Args:
+        report: A :class:`~optimization_engine.stress.StressReport`, or
+            ``None`` when no scenarios were configured or the run was not
+            asked to apply them. The two are different claims, and neither is
+            "the book is safe".
+        as_of: The date of the book that was stressed, when it is a book from
+            a point in a simulation rather than the solve's own weights.
+            ``null`` means the weights this payload already carries.
+
+    Returns:
+        A JSON-serializable dict, or ``None`` when nothing was supplied.
+    """
+    if report is None:
+        return None
+    ordered = list(report.by_severity())
+    worst = ordered[0] if ordered else None
+    metadata = dict(getattr(report, "metadata", None) or {})
+    stamp = as_of
+    if isinstance(stamp, str):
+        # The tearsheet records this date as ``str(Timestamp)``, which spells
+        # it "2020-01-05 00:00:00" while every other date in these documents
+        # is ISO. One document, one date format.
+        try:
+            stamp = pd.Timestamp(stamp)
+        except (TypeError, ValueError):
+            pass
+    return {
+        # Which book this is about. A tearsheet stresses the holdings the run
+        # ended on, not the ones a solve produced, and a consumer comparing
+        # two documents needs to know that before it compares the numbers.
+        "as_of": _key(stamp) if stamp is not None else None,
+        # The scenario that decides whether anyone reads the rest.
+        "worst_scenario": str(worst.name) if worst is not None else None,
+        "worst_pnl": _num(worst.pnl) if worst is not None else None,
+        "worst_contributor": (
+            str(worst.largest_contributor)
+            if worst is not None and worst.largest_contributor is not None
+            else None
+        ),
+        "base_volatility": _num(getattr(report, "base_volatility", None)),
+        # What the run was told to do with a shock naming an asset the book
+        # cannot hold: "raise" (nothing was dropped, because a scenario that
+        # named an unheld name would have stopped the run) or "ignore" (some
+        # may have been, and `ignored_assets` below says which).
+        "unknown_asset_policy": str(metadata.get("unknown_assets", "raise")),
+        "n_scenarios": len(ordered),
+        "scenarios": [
+            {
+                "name": str(scenario.name),
+                # A fraction of book value: -0.18 is "the book loses 18%".
+                "pnl": _num(scenario.pnl),
+                "stressed_volatility": _num(scenario.stressed_volatility),
+                "base_volatility": _num(scenario.base_volatility),
+                "volatility_ratio": _num(scenario.volatility_ratio),
+                "largest_contributor": (
+                    str(scenario.largest_contributor)
+                    if scenario.largest_contributor is not None
+                    else None
+                ),
+                "largest_contribution": _num(scenario.largest_contribution),
+                # wᵢ·rᵢ per asset. Sums to `pnl` by construction, which is
+                # what makes the number attributable rather than merely
+                # reported.
+                "contributions": _series(scenario.contributions),
+                "ignored_assets": _strings(scenario.ignored_assets),
+                "notes": str(scenario.notes or ""),
+            }
+            for scenario in ordered
+        ],
+    }
+
+
 def covariance_diagnostics_payload(diagnostics: Any) -> dict[str, Any] | None:
     """Whether the covariance estimate is worth the weights built on it.
 
@@ -338,6 +436,9 @@ def optimization_payload(
             getattr(run, "covariance_diagnostics", None)
         ),
         "feasibility": feasibility_payload(getattr(run, "feasibility", None)),
+        # What named bad days do to this book, when the run was asked. `null`
+        # means no scenarios were applied — not that none of them hurt.
+        "stress": stress_payload(getattr(run, "stress", None)),
         "warnings": _strings(getattr(run, "warnings", None)),
         # What the sample the numbers above were computed on had to lose
         # to become rectangular. A late-listing asset truncates every
@@ -442,6 +543,12 @@ def backtest_payload(
             one asset listed late is not the same track record.
     """
     meta = getattr(result, "meta", None)
+    sheet_metadata = getattr(tearsheet, "metadata", None)
+    stress_as_of = (
+        sheet_metadata.get("stress_as_of")
+        if isinstance(sheet_metadata, dict)
+        else None
+    )
     metrics = None
     if tearsheet is not None:
         performance = getattr(tearsheet, "performance", None)
@@ -467,6 +574,12 @@ def backtest_payload(
         "notes": _notes(getattr(meta, "notes", None)),
         "alignment": _strings(alignment),
         "metrics": metrics,
+        # The tearsheet applies the configured shocks to the book the run
+        # ended on, so this is the stress of what would actually be held
+        # tomorrow rather than of the average of the whole track record.
+        "stress": stress_payload(
+            getattr(tearsheet, "stress", None), as_of=stress_as_of
+        ),
         "output_path": output_path,
     }
 
