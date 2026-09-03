@@ -15,6 +15,7 @@ absence is stated, not filled in.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -28,6 +29,7 @@ from optimization_engine.backtest.positions import (
 )
 from optimization_engine.backtest.results import RunResult
 from optimization_engine.backtest.tca import TcaPanel, compute_tca, cost_by_asset
+from optimization_engine.stress import Shock, StressReport, stress_test
 
 
 @dataclass
@@ -44,6 +46,11 @@ class Tearsheet:
         episodes: The episodes themselves.
         deflated_sharpe: Selection-bias correction, when trials were counted.
         overfitting: CSCV report, when a grid was run.
+        stress: What the supplied shocks do to the book the run ended on,
+            when any were supplied. A backward-looking track record says
+            nothing about a shock that has not happened yet; this is the one
+            forward-looking panel here, and its absence is stated in
+            ``describe()`` by simply not appearing.
         caveats: What a reader must know before quoting any number here.
     """
 
@@ -56,11 +63,18 @@ class Tearsheet:
     episodes: pd.DataFrame
     deflated_sharpe: Any = None
     overfitting: Any = None
+    stress: StressReport | None = None
     caveats: tuple[str, ...] = ()
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def to_frames(self) -> dict[str, pd.DataFrame]:
-        """Every panel as a frame, ready for the Excel exporter."""
+        """Every panel as a frame, ready for the Excel exporter.
+
+        Returns:
+            One frame per panel. ``stress`` and ``stress_contributions``
+            appear only when the tearsheet was built with shocks, so a run
+            with none exports the same sheets it always did.
+        """
         frames = {
             "performance": self.performance,
             "drawdowns": self.drawdowns,
@@ -73,6 +87,9 @@ class Tearsheet:
             "trades": self.run.trades,
             "caveats": pd.DataFrame({"caveat": list(self.caveats)}),
         }
+        if self.stress is not None:
+            frames["stress"] = self.stress.to_frame()
+            frames["stress_contributions"] = self.stress.contributions_frame()
         return frames
 
     def describe(self) -> str:
@@ -87,6 +104,8 @@ class Tearsheet:
             lines.append(self.deflated_sharpe.describe())
         if self.overfitting is not None:
             lines.append(self.overfitting.describe())
+        if self.stress is not None:
+            lines.append(self.stress.describe())
         lines.extend(f"Caveat: {caveat}" for caveat in self.caveats)
         return "\n".join(lines)
 
@@ -133,6 +152,13 @@ def _caveats(run: RunResult, deflated: Any, overfitting: Any) -> tuple[str, ...]
             f"{len(run.meta.degradations)} cost component(s) could not be computed "
             "and were charged as zero; the reported cost is a lower bound."
         )
+    cash_periods = int(run.meta.notes.get("periods_in_cash_after_failed_solve", 0) or 0)
+    if cash_periods > 0:
+        caveats.append(
+            f"The first {cash_periods} period(s) were held in cash because the "
+            "opening solve failed and there was no book to carry forward. They "
+            "are in this track record at a zero return, not dropped from it."
+        )
     if deflated is None:
         caveats.append(
             "No trial count was supplied, so the Sharpe ratio is undeflated. If "
@@ -155,6 +181,8 @@ def build_tearsheet(
     trial_sharpes: pd.Series | None = None,
     overfitting: Any = None,
     top_drawdowns: int = 5,
+    shocks: Sequence[Shock] = (),
+    stress_cov_matrix: pd.DataFrame | None = None,
 ) -> Tearsheet:
     """Assemble the full reading of a run.
 
@@ -169,6 +197,22 @@ def build_tearsheet(
             dispersion is what the deflation actually uses.
         overfitting: A pre-computed CSCV report from a sweep.
         top_drawdowns: How many drawdown episodes to table.
+        shocks: Stress scenarios to apply to the book the run ended on — the
+            last row of ``run.weights``, which is the only book a reader can
+            still trade. Leave it empty and the tearsheet carries no stress
+            panel rather than an empty one.
+        stress_cov_matrix: The covariance the stressed volatilities are
+            measured against, in whatever annualization the caller works in.
+            Omit it and the stress panel reports P&L only: this function will
+            not silently estimate a covariance from ``returns`` and present
+            the result as if it had been given one.
+
+    Returns:
+        The assembled :class:`Tearsheet`.
+
+    Raises:
+        StressError: If ``shocks`` name an asset the final book does not hold,
+            or ``stress_cov_matrix`` does not cover it.
     """
     from optimization_engine.analytics.risk import drawdown_table
 
@@ -191,6 +235,14 @@ def build_tearsheet(
             deflated = None
 
     episodes = position_episodes(run.weights, returns)
+
+    stress = None
+    stress_as_of = None
+    if len(shocks) and not run.weights.empty:
+        final_book = run.weights.iloc[-1]
+        stress_as_of = str(run.weights.index[-1])
+        stress = stress_test(final_book, list(shocks), cov_matrix=stress_cov_matrix)
+
     return Tearsheet(
         run=run,
         performance=performance,
@@ -201,11 +253,13 @@ def build_tearsheet(
         episodes=episodes_frame(episodes),
         deflated_sharpe=deflated,
         overfitting=overfitting,
+        stress=stress,
         caveats=_caveats(run, deflated, overfitting),
         metadata={
             "spec_hash": run.meta.spec_hash,
             "result_hash": run.meta.result_hash,
             "n_trials": n_trials,
+            "stress_as_of": stress_as_of,
         },
     )
 

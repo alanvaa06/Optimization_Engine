@@ -17,7 +17,7 @@ reference** — generated from the docstrings, so every exported name carries
 its signature, parameters, units and errors — is published to GitHub Pages
 from `main`, and builds locally with `pip install "finport-optengine[docs]"`
 then `python scripts/build_api_docs.py`. **[`docs/ERRORS.md`](docs/ERRORS.md)**
-is the refusal contract: which of the twenty-one exception types to catch,
+is the refusal contract: which of the twenty-four exception types to catch,
 which are recoverable, the CLI's exit codes, and — the part that catches
 people — the failures that are *reported* rather than raised.
 
@@ -69,6 +69,32 @@ different numbers on different machines. Removed in 0.4.1. Prefer
 **The default covariance estimator is Ledoit-Wolf, not the sample
 covariance.** `covariance_matrix(returns)` shrinks unless told otherwise.
 
+**An inaccurate solve now raises.** `solve_problem` used to settle for an
+`optimal_inaccurate` answer with a logged warning. It refuses by default.
+Pass `accept_inaccurate=True`, set `OptimizerSpec.accept_inaccurate`, or use
+`--accept-inaccurate` when you genuinely want the degraded answer — and read
+`analyze_feasibility` first, because the usual cause is a mandate that barely
+has a solution.
+
+**The Sharpe ratio is arithmetic, and so is the historical mean.** Both were
+geometric. `sharpe_ratio(..., method="geometric")` and
+`expected_returns_from_history(..., method="geometric_mean")` reproduce the
+old numbers exactly. Sortino, Calmar and Martin keep geometric numerators —
+that is deliberate and their docstrings say so.
+
+**`extras["cvar_annualized"]` is deprecated.** It is a √T scaling, not an
+annualization; the honest key is `cvar_sqrt_t_scaled`. The old keys are still
+written for one release and warn at solve time. Same for
+`cdar_solver_objective`, which held ζ and is now `cdar_solver_zeta`.
+
+**`optengine check` exits 2 for an impossible mandate**, 1 for unusable data.
+A finding that only says the solver could not answer is a warning, not a
+fatal — a solver that crashed is not a mandate with no solution.
+
+**`scenarios` is now `presets`.** The module was configuration persistence,
+not stress testing; the old import path works for one release and warns.
+Stress scenarios live in `stress.py`.
+
 ## Where things live
 
 | You want | Import from `optimization_engine` |
@@ -83,6 +109,9 @@ covariance.** `covariance_matrix(returns)` shrinks unless told otherwise.
 | Load data | `load_prices`, `prices_to_returns`, `sample_dataset`, `load_prices_yahoo`, `load_fred_series` |
 | Multi-provider ingestion | `optimization_engine.ingest` (subpackage), plus `IngestRequest`, `IngestResult`, `PricePanel`, `IngestError` at top level |
 | Constraints | `ConstraintLayer`, `layer_from_mapping`, `currency_layer`, `effective_layers` |
+| Restrict the investable set | `optimization_engine.universe` (subpackage): `Signal`, `Eligibility`, `Classification` |
+| Shock a book | `Shock`, `stress_test`, `StressReport` |
+| Save and reload a configuration | `Preset`, `save_presets`, `load_presets` |
 
 `optimization_engine.ingest` is a subpackage with its own 44-name API. Its
 field constants (`CLOSE`, `OPEN`, `VOLUME`) stay there on purpose — they are

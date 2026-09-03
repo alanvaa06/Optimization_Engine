@@ -21,10 +21,26 @@ The one thing the loop refuses to do is trade on information it does not yet
 have. A decision taken on date ``t`` executes at ``t + execution_lag``, and
 the volatility that prices its impact is estimated on returns strictly
 before ``t``.
+
+A target dated on a day the market was shut is traded on the next bar, not
+quietly deferred to the next calendar rebalance. Every such move is named in
+``meta.notes`` — see :func:`_place_schedule_on_bars`.
+
+**What "liquidation" means here.** With a ``universe``, a name that is not
+eligible on a decision date has its target weight forced to zero on that
+decision. The return matrix is fixed-column, so there is no other thing it
+could mean: the position is not removed from the panel, it is *sold*, at the
+decision's execution bar, priced by the same cost model as every other trade —
+and if the name has stopped printing, that bar's return for it is missing,
+which the loop replays as flat, so the sale happens at the name's last mark.
+The freed weight becomes cash. The runner never renormalises what is left; a
+book whose targets no longer sum to one is a book with a cash line, and
+inventing a rescaling here would silently overwrite the optimizer's sizing.
 """
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 import numpy as np
@@ -47,6 +63,13 @@ from optimization_engine.backtest.results import (
     empty_trades,
 )
 from optimization_engine.backtest.spec import MIN_ADV_CAPITAL, BacktestSpec
+from optimization_engine.universe import (
+    MASK_POLICIES,
+    Eligibility,
+    point_in_time_mask,
+)
+
+_LOG = logging.getLogger(__name__)
 
 #: Traded fractions below this are float residue, not orders.
 _TRADE_EPS = 1e-12
@@ -78,6 +101,144 @@ def _as_schedule(
     return schedule.astype(float)
 
 
+def _place_schedule_on_bars(
+    schedule_index: pd.Index, index: pd.DatetimeIndex
+) -> tuple[list[pd.Timestamp], dict[str, Any]]:
+    """Put every schedule date on a bar, and say what that cost.
+
+    A schedule date that is not itself a bar — a Sunday-stamped weekly
+    schedule replayed on a business-day index — used to be no decision at
+    all. The target was not lost: the resolver picks the most recent schedule
+    row on or before each decision, so it still reached the book at whatever
+    calendar mark came next. What was lost was the **timing** the caller
+    asked for, silently. Under ``frequency="none"`` there is exactly one mark
+    — inception — so a whole weekly schedule collapsed into buy-and-hold.
+
+    Every date is therefore executed on the first bar at or after it. The
+    search is ``side="left"``, so a date that is already a bar maps to itself:
+    nothing that works today can move. Dates past the last bar are dropped,
+    because there is no bar left to fill them on.
+
+    Args:
+        schedule_index: The dates the schedule's targets become effective,
+            sorted.
+        index: The simulation's date index.
+
+    Returns:
+        The bar dates that become decisions, and notes naming every date that
+        did not land where it was written: ``schedule_dates_moved``
+        (``{original: executed}``), ``schedule_dates_dropped`` (past the last
+        bar) and ``schedule_dates_collapsed`` (``{bar: [originals]}`` for bars
+        that received more than one row — the last one wins, which is what the
+        resolver has always done, but silently).
+    """
+    if not index.is_monotonic_increasing:
+        # Nothing can be placed on an unordered calendar. Fall back to exact
+        # matches, which is what the runner did before, rather than inventing
+        # an ordering the caller did not ask for.
+        return [date for date in schedule_index if date in set(index)], {}
+
+    positions = np.searchsorted(
+        index.to_numpy(), pd.DatetimeIndex(schedule_index).to_numpy(), side="left"
+    )
+    decisions: list[pd.Timestamp] = []
+    moved: dict[str, str] = {}
+    dropped: list[str] = []
+    landed: dict[int, list[str]] = {}
+    for original, raw_position in zip(schedule_index, positions):
+        label = pd.Timestamp(original).isoformat()
+        position = int(raw_position)
+        if position >= len(index):
+            dropped.append(label)
+            continue
+        executed = index[position]
+        landed.setdefault(position, []).append(label)
+        if executed != original:
+            moved[label] = pd.Timestamp(executed).isoformat()
+        decisions.append(executed)
+
+    collapsed = {
+        pd.Timestamp(index[position]).isoformat(): originals
+        for position, originals in sorted(landed.items())
+        if len(originals) > 1
+    }
+    notes: dict[str, Any] = {}
+    if moved:
+        notes["schedule_dates_moved"] = moved
+    if dropped:
+        notes["schedule_dates_dropped"] = dropped
+    if collapsed:
+        notes["schedule_dates_collapsed"] = collapsed
+    if notes:
+        _LOG.warning(
+            "Weight schedule does not line up with the return index: "
+            "%d date(s) moved to the next bar, %d dropped past the last bar, "
+            "%d bar(s) received more than one target (the latest wins).",
+            len(moved),
+            len(dropped),
+            len(collapsed),
+        )
+    return decisions, notes
+
+
+def resolve_universe_mask(
+    universe: Eligibility,
+    universe_policy: str | None,
+    index: pd.DatetimeIndex,
+    assets: list[str],
+) -> tuple[np.ndarray, list[str]]:
+    """The eligibility in force on every bar, as a hard boolean array.
+
+    The one place a simulation turns a three-valued universe into something a
+    weight vector can be multiplied by. Each bar reads the most recent
+    evaluation at or before it, so a universe defined on a coarser calendar
+    than the run — monthly reconstitutions against daily bars — never reaches
+    forward for the next one.
+
+    Args:
+        universe: The membership definition.
+        universe_policy: One of
+            :data:`~optimization_engine.universe.eligibility.MASK_POLICIES`.
+            There is no default, here or anywhere: ``"exclude"`` silently
+            shrinks the book over every warm-up, ``"include"`` silently admits
+            names nothing screened, and ``"raise"`` stops any run whose rules
+            warm up at all.
+        index: The simulation's bars.
+        assets: The return frame's columns, in order.
+
+    Returns:
+        A ``(bars, assets)`` array of NumPy ``bool``, and the assets the
+        universe has never heard of — those resolve through the policy like
+        any other unknown, and are worth naming because a typo in an
+        identifier otherwise empties the book in silence.
+
+    Raises:
+        ValueError: If ``universe_policy`` is ``None``.
+        UniverseError: On an unknown policy, or under ``"raise"`` when
+            anything on any bar was not evaluable.
+    """
+    if universe_policy is None:
+        raise ValueError(
+            "A universe needs a universe_policy: one of "
+            f"{list(MASK_POLICIES)}. 'exclude' reads a name nothing has "
+            "evaluated as ineligible, 'include' admits it, 'raise' refuses to "
+            "guess. There is no safe default, so this one is not chosen for you."
+        )
+    known = {str(a) for a in universe.assets}
+    unknown = [a for a in assets if a not in known]
+    if unknown:
+        _LOG.warning(
+            "The universe says nothing about %d of the %d assets in the return "
+            "frame (%s); they are resolved by the %r policy.",
+            len(unknown),
+            len(assets),
+            ", ".join(unknown[:5]) + (" …" if len(unknown) > 5 else ""),
+            universe_policy,
+        )
+    mask = point_in_time_mask(universe, universe_policy, index, assets)
+    return mask.to_numpy(dtype=bool), unknown
+
+
 def run_backtest(
     returns: pd.DataFrame,
     weights: pd.Series | pd.DataFrame,
@@ -88,6 +249,8 @@ def run_backtest(
     context_returns: pd.DataFrame | None = None,
     prices: pd.DataFrame | None = None,
     volumes: pd.DataFrame | None = None,
+    universe: Eligibility | None = None,
+    universe_policy: str | None = None,
 ) -> RunResult:
     """Replay a weight schedule over a return history.
 
@@ -101,13 +264,19 @@ def run_backtest(
             same-period-fill, in-sample replay.
         cost_model: Override the model built from ``spec.costs``. Useful for
             testing and for cost models this library does not ship.
-        notes: Free-form annotations to carry on the result metadata. When
-            ``returns`` has missing values the runner adds a
-            ``"missing_returns"`` entry of its own: how many periods had a
-            gap somewhere, and — the part worth reading — which *held*
-            assets had one, and how often. A missing return is replayed as
-            a flat period for that asset alone; it never touches the rest
-            of the book.
+        notes: Free-form annotations to carry on the result metadata. The
+            runner adds entries of its own. ``"missing_returns"`` records how
+            many periods had a gap somewhere, and — the part worth reading —
+            which *held* assets had one, and how often; a missing return is
+            replayed as a flat period for that asset alone and never touches
+            the rest of the book. ``"schedule_dates_moved"``,
+            ``"schedule_dates_dropped"`` and ``"schedule_dates_collapsed"``
+            record every target date that did not fall on a bar.
+            ``"universe"`` records the collapse policy, the breadth at each
+            decision, which held names the universe liquidated and how often,
+            and any asset the universe had never heard of. None of these are
+            hashed: they describe the run, they are not part of what it
+            computed.
         context_returns: A longer history the cost models may estimate from.
             A walk-forward evaluation starts partway into the sample, so
             estimating trailing volatility from the evaluation window alone
@@ -124,14 +293,34 @@ def run_backtest(
             its fixed participation rate and records that it did so. Supplying
             one only matters when
             ``spec.costs.impact_participation_source == "adv"``.
+        universe: Point-in-time membership of the investable set. At every
+            decision — calendar mark or schedule date alike — a name that is
+            not eligible **as of that date** has its target forced to zero; if
+            it was held, that zero is a sale at the decision's execution bar,
+            priced like any other trade. See the module docstring for what
+            liquidation means when the panel has fixed columns. Eligibility is
+            read as of the decision date and never later, so this cannot
+            introduce look-ahead. Weights are *not* renormalised: what the
+            excluded names held becomes cash, and only the optimizer decides
+            how a book is sized.
+        universe_policy: How a *not evaluable* cell is read — ``"exclude"``,
+            ``"include"`` or ``"raise"``. Required whenever ``universe`` is
+            given, and deliberately not defaulted; see
+            :func:`resolve_universe_mask`.
 
     Returns:
         The full result bundle. See :class:`~optimization_engine.backtest.results.RunResult`.
+        ``targets`` is the schedule as handed in — what was *asked for*. What
+        the universe did to it is in ``meta.notes["universe"]`` and in the
+        realized ``weights``.
 
     Raises:
-        ValueError: If ``returns`` is empty, the weight schedule is, or the
-            cost model prices impact from volume while ``spec.initial_capital``
-            is too small for that to mean anything.
+        ValueError: If ``returns`` is empty, the weight schedule is, the cost
+            model prices impact from volume while ``spec.initial_capital`` is
+            too small for that to mean anything, or a ``universe`` was given
+            with no ``universe_policy``.
+        UniverseError: If the universe policy is unknown, or it is ``"raise"``
+            and some name was not evaluable on some bar.
 
     """
     if returns is None or returns.empty:
@@ -180,10 +369,10 @@ def run_backtest(
     marks = rebalance_dates(index, spec.frequency)
     # A schedule date is always a decision: the walk-forward runner only emits
     # one when the optimizer has genuinely re-solved, so ignoring it would
-    # silently discard the re-solve.
-    decisions = pd.DatetimeIndex(
-        sorted(set(marks).union(d for d in schedule.index if d in set(index)))
-    )
+    # silently discard the re-solve. A date that is not a bar is executed on
+    # the next one rather than waiting for the next calendar mark.
+    schedule_marks, schedule_notes = _place_schedule_on_bars(schedule.index, index)
+    decisions = pd.DatetimeIndex(sorted(set(marks).union(schedule_marks)))
     execution = execution_positions(index, decisions, spec.execution_lag)
 
     # Resolve, once, which target each decision is actually asking for: the
@@ -191,17 +380,44 @@ def run_backtest(
     schedule_positions = np.searchsorted(
         schedule.index.to_numpy(), index.to_numpy(), side="right"
     )
+    universe_mask: np.ndarray | None = None
+    unknown_assets: list[str] = []
+    if universe is not None:
+        universe_mask, unknown_assets = resolve_universe_mask(
+            universe, universe_policy, index, assets
+        )
+    elif universe_policy is not None:
+        _LOG.warning(
+            "universe_policy=%r was given with no universe, so it decides "
+            "nothing. Pass the universe too, or drop the policy.",
+            universe_policy,
+        )
+    breadth_at_decision: dict[str, int] = {}
+    liquidated: dict[str, int] = {}
+
     targets_at_execution: dict[int, np.ndarray] = {}
     for decision_pos in sorted(execution):
         row = int(schedule_positions[decision_pos]) - 1
         if row < 0:
             # A calendar mark before the first target exists: nothing to trade to.
             continue
+        target = schedule.iloc[row].to_numpy(dtype=float)
+        if universe_mask is not None:
+            # Eligibility as of the *decision*, never the execution: the desk
+            # acts on the universe it could see when it chose the target.
+            eligible = universe_mask[decision_pos]
+            breadth_at_decision[
+                pd.Timestamp(index[decision_pos]).isoformat()
+            ] = int(eligible.sum())
+            for asset_position in np.flatnonzero(
+                ~eligible & (np.abs(target) > _TRADE_EPS)
+            ):
+                name = assets[asset_position]
+                liquidated[name] = liquidated.get(name, 0) + 1
+            target = np.where(eligible, target, 0.0)
         # A later decision landing on the same execution date supersedes an
         # earlier one — the desk trades the freshest target it holds.
-        targets_at_execution[execution[decision_pos]] = schedule.iloc[row].to_numpy(
-            dtype=float
-        )
+        targets_at_execution[execution[decision_pos]] = target
 
     returns_matrix = returns.to_numpy(dtype=float)
     held = np.zeros(len(assets))
@@ -329,11 +545,22 @@ def run_backtest(
         else empty_costs()
     )
     held_frame = pd.DataFrame(held_rows, index=index, columns=assets)
+    run_notes = dict(notes or {})
+    run_notes.update(schedule_notes)
     if missing_periods:
-        notes = dict(notes or {})
-        notes["missing_returns"] = {
+        run_notes["missing_returns"] = {
             "periods": int(missing_periods),
             "held_assets": {k: int(v) for k, v in sorted(missing_held.items())},
+        }
+    if universe_mask is not None:
+        run_notes["universe"] = {
+            "policy": str(universe_policy),
+            "n_decisions": len(breadth_at_decision),
+            "breadth": breadth_at_decision,
+            "min_breadth": min(breadth_at_decision.values(), default=0),
+            "liquidated": {k: int(v) for k, v in sorted(liquidated.items())},
+            "n_liquidations": int(sum(liquidated.values())),
+            "unknown_assets": unknown_assets,
         }
 
     return RunResult(
@@ -352,9 +579,9 @@ def run_backtest(
             costs=costs,
             weights=held_frame,
             degradations=tuple(degradations),
-            notes=notes,
+            notes=run_notes,
         ),
     )
 
 
-__all__ = ["run_backtest"]
+__all__ = ["resolve_universe_mask", "run_backtest"]

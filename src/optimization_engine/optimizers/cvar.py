@@ -34,6 +34,21 @@ from optimization_engine.optimizers.base import BaseOptimizer
 #: Fewer scenarios than this in the tail and the CVaR estimate is anecdote.
 MIN_TAIL_SCENARIOS = 10
 
+#: ``extras`` keys kept alive for one release. ``cvar_annualized`` and
+#: ``var_annualized`` never annualized anything: they are the per-period figure
+#: times ``√ppy``, which is only an annualization if returns are iid Gaussian —
+#: and the tail measures they scale are the statistics that assumption fails on
+#: hardest. The honest names are the ``_sqrt_t_scaled`` pair.
+#:
+#: Both pairs are written for now. A read-shim would not work: ``**extras``
+#: (``base.py``) and ``dict(extras)`` (``reporting/payloads.py``) both take the
+#: C-level fast path and never call ``__getitem__``, so a ``dict`` subclass
+#: would warn on nothing. The warning therefore fires once per solve instead.
+DEPRECATED_EXTRAS_KEYS = {
+    "cvar_annualized": "cvar_sqrt_t_scaled",
+    "var_annualized": "var_sqrt_t_scaled",
+}
+
 
 class CVaROptimizer(BaseOptimizer):
     """Mean-CVaR optimizer.
@@ -175,6 +190,10 @@ class CVaROptimizer(BaseOptimizer):
                 "cvar_period": cvar_hist,
                 "var_period": var_hist,
                 "cvar_solver_zeta": zeta,
+                "cvar_sqrt_t_scaled": cvar_hist * scale,
+                "var_sqrt_t_scaled": var_hist * scale,
+                # Deprecated aliases, removed after 0.6.x. See
+                # DEPRECATED_EXTRAS_KEYS.
                 "cvar_annualized": cvar_hist * scale,
                 "var_annualized": var_hist * scale,
                 "tail_observations": int(len(tail)),
@@ -184,4 +203,21 @@ class CVaROptimizer(BaseOptimizer):
                     f"averaged over {len(tail)} tail scenario(s)."
                 ),
             }
+        )
+        self._warn_deprecated_extras_keys()
+
+    @staticmethod
+    def _warn_deprecated_extras_keys() -> None:
+        """Announce the ``_annualized`` → ``_sqrt_t_scaled`` rename, once per solve."""
+        renames = ", ".join(
+            f"{old!r} -> {new!r}" for old, new in DEPRECATED_EXTRAS_KEYS.items()
+        )
+        warnings.warn(
+            f"CVaR extras keys {renames}: the old names claimed an "
+            "annualization that was never performed — the value is the "
+            "per-period figure multiplied by √ppy, which only annualizes a "
+            "tail measure under iid Gaussian returns. Both key pairs are "
+            "written for this release; the old names are removed after 0.6.x.",
+            DeprecationWarning,
+            stacklevel=5,
         )

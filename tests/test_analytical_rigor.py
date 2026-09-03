@@ -6,6 +6,7 @@ future refactor cannot quietly reintroduce it.
 
 from __future__ import annotations
 
+import logging
 import sys
 import warnings
 from pathlib import Path
@@ -313,7 +314,7 @@ def test_cvar_reports_realized_tail_metrics(returns, mu):
     run = run_engine(returns, cfg)
     assert run.result.extras["cvar_period"] > 0
     assert run.result.extras["tail_observations"] > 0
-    assert run.result.extras["cvar_annualized"] > run.result.extras["cvar_period"]
+    assert run.result.extras["cvar_sqrt_t_scaled"] > run.result.extras["cvar_period"]
 
 
 def test_cvar_rejects_a_confidence_level_passed_as_alpha(returns):
@@ -445,12 +446,25 @@ def test_feasibility_bounds_the_return_target(cov, mu):
 
 
 def test_feasibility_flags_a_dominated_target_without_blocking(cov, mu):
+    """A sub-GMV target is still not fatal, but the advice had to change.
+
+    The message used to promise "solvable but dominated". Since the return
+    target became a floor (``μ'w ≥ R*``) that is no longer what happens:
+    minimum variance already clears the target, so the minimum-variance
+    portfolio is what comes back. Saying "dominated" would now be false.
+    """
     cons = PortfolioConstraints(bounds={a: (0.0, 0.5) for a in cov.columns})
     base = analyze_feasibility(list(cov.columns), cons, mu, cov)
     cons.target_return = base.min_variance_return - 0.01
     report = analyze_feasibility(list(cov.columns), cons, mu, cov)
-    assert report.is_feasible  # solvable, just not efficient
-    assert any(i.code == "target_return_inefficient" for i in report.issues)
+    assert report.is_feasible  # solvable, and it is the minimum-variance book
+    issues = [i for i in report.issues if i.code == "target_return_inefficient"]
+    assert len(issues) == 1
+    issue = issues[0]
+    assert not issue.fatal
+    advice = f"{issue.message} {issue.suggestion}"
+    assert "minimum-variance portfolio" in advice
+    assert "dominated" not in advice.lower()
 
 
 def test_feasibility_reports_are_actionable(cov, mu):
@@ -551,18 +565,90 @@ def test_frontier_marks_the_anchor_portfolios(returns, mu):
     assert fr.efficient["sharpe_ratio"].max() <= fr.tangency["sharpe_ratio"] + 1e-6
 
 
-def test_frontier_excludes_the_dominated_lower_branch(returns, mu):
+def test_frontier_cannot_trace_the_dominated_lower_branch(returns, mu):
+    """Every swept point is efficient — the lower branch is unreachable now.
+
+    This used to assert that the dominated branch was *filtered out* of
+    ``efficient``. Under the mean-variance return floor (``μ'w ≥ R*``) there
+    is nothing to filter: a target below the minimum-variance return returns
+    the minimum-variance portfolio, so no solved point can land below it. The
+    sweep is forced across the whole reachable range with
+    ``efficient_only=False`` — the setting that used to produce the dominated
+    branch — to show it produces none.
+    """
+    from optimization_engine.frontier import efficient_frontier
+
+    cov = covariance_matrix(returns, method="ledoit_wolf")
     cfg = EngineConfig(
         expected_returns=mu.to_dict(),
         bounds={a: [0.0, 0.30] for a in mu.index},
         optimizer=OptimizerSpec(name="mean_variance"),
     )
-    fr = run_engine(returns, cfg, build_frontier=True, n_frontier_points=10).frontier
+    fr = efficient_frontier(
+        cfg, cov, expected_returns=mu, n_points=12, efficient_only=False
+    )
     gmv_return = float(fr.min_variance["expected_return"])
-    assert (fr.efficient["expected_return"] >= gmv_return - 1e-3).all()
+    solved = fr.summary[fr.summary["status"] == "ok"]
+    assert not solved.empty
+    # Targets below the minimum-variance return were swept, and every one of
+    # them still came back at or above it.
+    assert (solved["target"] < gmv_return - 1e-6).any(), "no sub-GMV target swept"
+    assert (solved["expected_return"] >= gmv_return - 1e-3).all()
+    assert solved["is_efficient"].all()
+    assert len(fr.efficient) == len(solved)
     # Volatility rises monotonically along the efficient branch.
     vols = fr.efficient["expected_volatility"].values
     assert (np.diff(vols) >= -1e-6).all()
+
+
+def test_frontier_reports_anchor_failure(returns, mu):
+    """A tangency portfolio that cannot be solved says so, and GMV survives.
+
+    ``_anchor_portfolios`` used to swallow both anchor solves with
+    ``except Exception: pass``. A mandate that makes max-Sharpe infeasible then
+    produced a chart with no tangency marker and nothing to distinguish that
+    from a chart that never asked for one.
+
+    The mandate here: a 5% risk-free rate leaves exactly one asset with a
+    positive excess return, and that asset is capped at 2%. No fully invested
+    portfolio earns more than cash, so the tangency ray has nowhere to go —
+    while minimum variance, which never looks at ``μ``, is untouched.
+    """
+    from optimization_engine.frontier import efficient_frontier
+
+    cov = covariance_matrix(returns, method="ledoit_wolf")
+    risk_free_rate = 0.05
+    assert (mu > risk_free_rate).sum() == 1, "fixture no longer sets up the trap"
+    bounds = {
+        a: ([0.0, 0.02] if mu[a] > risk_free_rate else [0.0, 0.5]) for a in mu.index
+    }
+    cfg = EngineConfig(
+        expected_returns=mu.to_dict(),
+        bounds=bounds,
+        optimizer=OptimizerSpec(
+            name="mean_variance", risk_free_rate=risk_free_rate
+        ),
+    )
+    fr = efficient_frontier(cfg, cov, expected_returns=mu, n_points=6)
+
+    assert fr.tangency is None
+    assert "tangency" in fr.anchor_failures
+    assert "infeasible" in fr.anchor_failures["tangency"].lower()
+    # The anchor that did solve is still drawn, and is not reported as failed.
+    assert fr.min_variance is not None
+    assert "min_variance" not in fr.anchor_failures
+
+
+def test_frontier_with_both_anchors_reports_no_failures(returns, mu):
+    """The failure map is empty when nothing failed — no phantom entries."""
+    cfg = EngineConfig(
+        expected_returns=mu.to_dict(),
+        bounds={a: [0.0, 0.30] for a in mu.index},
+        optimizer=OptimizerSpec(name="mean_variance", risk_free_rate=0.02),
+    )
+    fr = run_engine(returns, cfg, build_frontier=True, n_frontier_points=6).frontier
+    assert fr.min_variance is not None and fr.tangency is not None
+    assert fr.anchor_failures == {}
 
 
 def test_max_sharpe_index_is_nan_safe():
@@ -716,28 +802,136 @@ def test_solver_chain_prefers_an_exact_solution_over_an_inaccurate_one():
     assert info.status == "optimal"
 
 
-def test_solver_chain_falls_back_to_the_inaccurate_answer_if_nothing_better():
+def _always_inaccurate_problem():
+    """A feasible QP plus a patch making every solver report it inaccurate.
+
+    Returns the variable, the problem and the patch function; the caller
+    installs the patch so it can choose the scope.
+    """
     import cvxpy as cp
 
-    from optimization_engine.optimizers._cvxpy_helpers import solve_problem
-
     real_solve = cp.Problem.solve
-    seen: list[str] = []
 
     def always_inaccurate(self, *args, **kwargs):
-        seen.append(str(kwargs.get("solver", "default")))
         real_solve(self, *args, **kwargs)
         self._status = "optimal_inaccurate"
 
     w = cp.Variable(2)
     problem = cp.Problem(cp.Minimize(cp.sum_squares(w)), [cp.sum(w) == 1])
+    return w, problem, always_inaccurate
+
+
+def test_inaccurate_refused_by_default():
+    """Nothing verified the answer, so nothing hands it back as if verified."""
+    import cvxpy as cp
+
+    from optimization_engine.optimizers._cvxpy_helpers import SolverFailure, solve_problem
+
+    _w, problem, patch = _always_inaccurate_problem()
     with pytest.MonkeyPatch.context() as mp:
-        mp.setattr(cp.Problem, "solve", always_inaccurate)
-        info = solve_problem(problem, solvers=("CLARABEL", "SCS"))
+        mp.setattr(cp.Problem, "solve", patch)
+        with pytest.raises(SolverFailure) as excinfo:
+            solve_problem(problem, solvers=("CLARABEL", "SCS"))
+
+    exc = excinfo.value
+    # Not the last solver's verdict -- the one that describes what happened.
+    assert exc.status == "optimal_inaccurate"
+    assert exc.attempts == ("CLARABEL", "SCS")
+    # The message has to name the way out, or the refusal is just a wall.
+    assert "accept_inaccurate=True" in str(exc)
+    assert "analyze_feasibility" in str(exc)
+
+
+def test_inaccurate_refused_reports_inaccurate_not_the_last_solvers_verdict():
+    """A later solver disagreeing must not relabel the failure.
+
+    A chain that goes inaccurate and then hits a solver claiming the problem
+    is infeasible used to raise with ``status="infeasible"`` and the message
+    "no allocation satisfies every constraint at once" -- about a problem
+    where a solver had already found an allocation.
+    """
+    import cvxpy as cp
+
+    from optimization_engine.optimizers._cvxpy_helpers import SolverFailure, solve_problem
+
+    real_solve = cp.Problem.solve
+    calls: list[str] = []
+
+    def inaccurate_then_infeasible(self, *args, **kwargs):
+        calls.append(str(kwargs.get("solver", "default")))
+        real_solve(self, *args, **kwargs)
+        self._status = "optimal_inaccurate" if len(calls) == 1 else "infeasible"
+
+    w = cp.Variable(2)
+    problem = cp.Problem(cp.Minimize(cp.sum_squares(w)), [cp.sum(w) == 1])
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(cp.Problem, "solve", inaccurate_then_infeasible)
+        with pytest.raises(SolverFailure) as excinfo:
+            solve_problem(problem, solvers=("CLARABEL", "SCS"))
+
+    assert excinfo.value.status == "optimal_inaccurate"
+    assert "no allocation satisfies" not in str(excinfo.value)
+
+
+def test_inaccurate_accepted_on_opt_in(caplog):
+    """The opt-in returns the loose answer, and says out loud that it did."""
+    import cvxpy as cp
+
+    from optimization_engine.optimizers._cvxpy_helpers import solve_problem
+
+    w, problem, patch = _always_inaccurate_problem()
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(cp.Problem, "solve", patch)
+        with caplog.at_level(
+            logging.WARNING, logger="optimization_engine.optimizers._cvxpy_helpers"
+        ):
+            info = solve_problem(
+                problem, solvers=("CLARABEL", "SCS"), accept_inaccurate=True
+            )
+
     assert info.status == "optimal_inaccurate"
-    # And the weights from the first usable attempt are still on the variable.
+    assert info.attempts == ("CLARABEL", "SCS")
+    assert "approximate solution" in caplog.text
+    # And the weights from the first usable attempt are still on the variable:
+    # the later solver in the chain overwrote them, so they were restored.
     assert w.value is not None
     assert float(np.sum(w.value)) == pytest.approx(1.0, abs=1e-4)
+
+
+def test_inaccurate_opt_in_travels_with_the_scope():
+    """``accepting_inaccurate`` is how the setting reaches a nested solve.
+
+    ``solve_problem`` is called with no keyword from inside every optimizer's
+    ``_solve``; the scope is the only thing that carries a caller's decision
+    that far down.
+    """
+    import cvxpy as cp
+
+    from optimization_engine.optimizers._cvxpy_helpers import (
+        SolverFailure,
+        accepting_inaccurate,
+        solve_problem,
+    )
+
+    _w, problem, patch = _always_inaccurate_problem()
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(cp.Problem, "solve", patch)
+        with accepting_inaccurate(True):
+            assert solve_problem(problem, solvers=("CLARABEL",)).status == (
+                "optimal_inaccurate"
+            )
+            # None inherits rather than resetting: that is what lets NCO's
+            # per-cluster optimizers run under the outer solve's settings.
+            with accepting_inaccurate(None):
+                assert solve_problem(problem, solvers=("CLARABEL",)).status == (
+                    "optimal_inaccurate"
+                )
+            with accepting_inaccurate(False):
+                with pytest.raises(SolverFailure):
+                    solve_problem(problem, solvers=("CLARABEL",))
+        # And the scope is closed again on the way out.
+        with pytest.raises(SolverFailure):
+            solve_problem(problem, solvers=("CLARABEL",))
 
 
 def test_solver_failure_distinguishes_infeasible_from_numerical():

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "finport-optengine"
-version = "0.5.3"
+version = "0.7.0"
 description = "Multi-asset portfolio optimization engine with mean-variance, risk parity, HRP, Black-Litterman, CVaR and more."
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -24,7 +24,11 @@ classifiers = [
 # are gone rather than moved: nothing in the project imports either one.
 dependencies = [
     "numpy>=1.24",
-    "pandas>=2.0",
+    # 2.1 is the floor because every ``pct_change`` call passes
+    # ``fill_method=None``: 2.0 accepts it but warns, 2.1 is the first
+    # release where it is silent, and it is the only way to get the same
+    # return series out of 2.x and 3.x.
+    "pandas>=2.2",
     "scipy>=1.10",
     "cvxpy>=1.4",
     # Named rather than left to cvxpy because SOLVER_FALLBACK reaches for SCS
@@ -87,7 +91,25 @@ all = [
 # is an extra and not a dev dependency — a contributor running the tests has no
 # reason to install a documentation renderer.
 docs = ["pdoc>=14.0"]
-dev = ["pytest>=7.4", "pytest-cov>=4.1", "ruff>=0.5"]
+# ``mypy`` and ``pandas-stubs`` are what the ``typecheck`` CI job runs on. Both
+# carry a marker rather than being listed bare, for two reasons that agree:
+# the 3.9 and 3.10 test cells never run mypy, and pandas-stubs' current releases
+# declare ``requires-python >= 3.11``, so a bare listing would send pip
+# backtracking through years of stub releases on those cells to find one that
+# installs. The typecheck job pins 3.11, so it gets both.
+#
+# The ``<2`` cap on mypy is not caution, it is arithmetic: mypy 2.x refuses
+# ``python_version = "3.9"`` outright — "Python 3.9 is not supported (must be
+# 3.10 or higher)" — and this package still declares 3.9 in requires-python.
+# Lift the cap when that floor rises; do not lift it before.
+dev = [
+    "pytest>=7.4",
+    "pytest-cov>=4.1",
+    "ruff>=0.5",
+    "mypy>=1.11,<2; python_version >= '3.11'",
+    "pandas-stubs>=2.2; python_version >= '3.11'",
+    "types-PyYAML>=6.0; python_version >= '3.11'",
+]
 
 [project.scripts]
 optengine = "optimization_engine.cli:main"
@@ -114,3 +136,93 @@ ignore = ["E501"]
 "app/*.py" = ["E402"]
 "tests/*.py" = ["E402"]
 "src/optimization_engine/ui_state.py" = ["E402"]
+
+# Type checking runs in CI's ``typecheck`` job, which installs the project so
+# that mypy resolves real imports instead of guessing at them.
+[tool.mypy]
+# The floor declared in requires-python, not the version mypy happens to run
+# on. A 3.10-only construct that reaches ``src/`` is a broken install for every
+# 3.9 user, and the test matrix only catches the ones a test actually executes.
+python_version = "3.9"
+warn_unused_ignores = true
+no_implicit_optional = true
+# Most of the scientific stack ships no type information at all — scs,
+# clarabel, statsmodels, yfinance, sklearn. Without this every one of those
+# imports is an error before a line of this project's own code is read.
+#
+# It does *not* cover PyYAML, and that is deliberate on mypy's part: stubs for
+# it exist on PyPI, so mypy reports ``import-untyped`` and names the package to
+# install rather than silently treating it as Any. Hence ``types-PyYAML`` in the
+# ``dev`` extra — dropping it does not make the error go away, it makes the
+# typecheck job fail.
+ignore_missing_imports = true
+
+# cvxpy 1.9 *does* ship ``py.typed`` — the plan that added this section says it
+# does not — so mypy reads cvxpy's own source instead of treating it as
+# untyped. That source uses ``match``, which cannot be parsed under
+# ``python_version = "3.9"``: the run ends on a syntax error inside a
+# dependency ("errors prevented further checking"), having said nothing about
+# this project at all. Skipping the follow puts cvxpy back where every other
+# solver dependency already is — typed as ``Any``.
+[[tool.mypy.overrides]]
+module = ["cvxpy.*"]
+follow_imports = "skip"
+
+# Modules whose type errors are deferred rather than fixed. The list is a
+# burn-down: it may shrink, and it may not grow. Nothing in mypy enforces
+# that — appending here silences a new failure just as effectively as fixing
+# one — so ``tests/test_typecheck_allowlist.py`` holds it to a ceiling, and
+# adding a module costs a red test instead of nothing. Everything under
+# ``src/optimization_engine`` that is *not* named below type-checks clean,
+# which is what keeps the ``typecheck`` job a check rather than a formality.
+# To remove an entry: make the module clean, delete its line, lower the
+# ceiling in that test by one.
+[[tool.mypy.overrides]]
+module = [
+    "optimization_engine.analytics.backtest",
+    "optimization_engine.analytics.performance",
+    "optimization_engine.analytics.relative",
+    "optimization_engine.analytics.report",
+    "optimization_engine.analytics.risk",
+    "optimization_engine.analytics.selection",
+    "optimization_engine.backtest.calendar",
+    "optimization_engine.backtest.positions",
+    "optimization_engine.backtest.results",
+    "optimization_engine.backtest.runner",
+    "optimization_engine.backtest.sweep",
+    "optimization_engine.backtest.walkforward",
+    "optimization_engine.benchmark",
+    "optimization_engine.cli",
+    "optimization_engine.config",
+    "optimization_engine.data.covariance",
+    "optimization_engine.data.loader",
+    "optimization_engine.data.quality",
+    "optimization_engine.data.yahoo",
+    "optimization_engine.engine",
+    "optimization_engine.frontier",
+    "optimization_engine.ingest.fields",
+    "optimization_engine.ingest.panel",
+    "optimization_engine.ingest.providers.file",
+    "optimization_engine.ingest.providers.fmp",
+    "optimization_engine.ingest.providers.fred",
+    "optimization_engine.ingest.providers.sample",
+    "optimization_engine.ingest.providers.tiingo",
+    "optimization_engine.ingest.spec",
+    "optimization_engine.optimizers._cvxpy_helpers",
+    "optimization_engine.optimizers.base",
+    "optimization_engine.optimizers.black_litterman",
+    "optimization_engine.optimizers.cdar",
+    "optimization_engine.optimizers.cvar",
+    "optimization_engine.optimizers.diagnostics",
+    "optimization_engine.optimizers.factory",
+    "optimization_engine.optimizers.herc",
+    "optimization_engine.optimizers.hrp",
+    "optimization_engine.optimizers.mean_variance",
+    "optimization_engine.optimizers.nco",
+    "optimization_engine.reporting.plots",
+    "optimization_engine.resampling",
+    "optimization_engine.scenarios",
+    "optimization_engine.ui_state",
+    "optimization_engine.universe.eligibility",
+]
+ignore_errors = true

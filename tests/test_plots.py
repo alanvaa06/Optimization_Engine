@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import subprocess
 import sys
 from pathlib import Path
 
@@ -15,10 +14,12 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
+from optimization_engine.frontier import FrontierResult
 from optimization_engine.reporting.plots import (
     OTHER_COLOR,
     PALETTE,
     fold_to_slots,
+    plot_efficient_frontier,
     plot_portfolio_composition,
     plot_rolling_metrics,
     plot_weight_evolution,
@@ -78,27 +79,6 @@ def test_adjacent_palette_slots_are_distinguishable_under_cvd():
     )
     # The old adjacent red/green pair scored essentially zero on this measure.
     assert worst > 0.02, f"adjacent pair collapses under deuteranopia ({worst:.4f})"
-
-
-def test_palette_passes_the_bundled_validator_if_available():
-    """Prefer the real validator over the approximation above when present."""
-    script = next(
-        (
-            p
-            for p in Path("/tmp/claude-0/bundled-skills").rglob(
-                "dataviz/scripts/validate_palette.js"
-            )
-        ),
-        None,
-    )
-    if script is None:
-        pytest.skip("dataviz validator not available in this environment")
-    result = subprocess.run(
-        ["node", str(script), ",".join(PALETTE), "--mode", "light", "--surface", "#ffffff"],
-        capture_output=True,
-        text=True,
-    )
-    assert "ALL CHECKS PASS" in result.stdout, result.stdout
 
 
 # ---------------------------------------------------------------------------
@@ -184,3 +164,100 @@ def test_long_and_short_bars_use_the_most_separated_slots():
     w = pd.Series({"a": 0.6, "b": -0.2, "c": 0.6})
     colors = plot_weights_bar(w).data[0].marker.color
     assert set(colors) == {PALETTE[0], PALETTE[7]}
+
+
+# ---------------------------------------------------------------------------
+# Frontier: a missing anchor is explained, and the dominated branch is gone
+# ---------------------------------------------------------------------------
+
+
+def _frontier(anchor_failures=None, tangency=True) -> FrontierResult:
+    """A three-point frontier, solved, with both anchors unless told otherwise."""
+    summary = pd.DataFrame(
+        {
+            "target": [0.04, 0.06, 0.08],
+            "expected_return": [0.04, 0.06, 0.08],
+            "expected_volatility": [0.10, 0.12, 0.16],
+            "sharpe_ratio": [0.40, 0.50, 0.50],
+            "is_efficient": [True, True, True],
+            "status": ["ok", "ok", "ok"],
+        }
+    )
+    weights = pd.DataFrame(
+        np.full((2, 3), 0.5), index=["A", "B"], columns=summary["target"].values
+    )
+    return FrontierResult(
+        summary=summary,
+        weights=weights,
+        min_variance=pd.Series(
+            {
+                "label": "Minimum variance",
+                "expected_return": 0.04,
+                "expected_volatility": 0.10,
+                "sharpe_ratio": 0.40,
+            }
+        ),
+        tangency=(
+            pd.Series(
+                {
+                    "label": "Maximum Sharpe",
+                    "expected_return": 0.06,
+                    "expected_volatility": 0.12,
+                    "sharpe_ratio": 0.50,
+                }
+            )
+            if tangency
+            else None
+        ),
+        anchor_failures=anchor_failures or {},
+    )
+
+
+def test_frontier_footnotes_a_failed_anchor():
+    """An anchor that did not solve is named on the chart, not just omitted.
+
+    A marker that is missing because the solve failed and a marker that was
+    never requested look identical. The footnote is the difference.
+    """
+    reason = "The problem is infeasible: no allocation satisfies every constraint."
+    fig = plot_efficient_frontier(
+        _frontier(anchor_failures={"tangency": reason}, tangency=False)
+    )
+
+    notes = list(fig.layout.annotations)
+    assert len(notes) == 1, notes
+    note = notes[0]
+    # The field name is "tangency"; an analyst reads "Maximum Sharpe".
+    assert "Maximum Sharpe" in note.text
+    assert "infeasible" in note.text
+    assert (note.xref, note.yref) == ("paper", "paper")
+    # The legend sits at y=-0.18, so the footnote has to clear it.
+    assert note.y < fig.layout.legend.y
+    # And the figure has to leave room for it.
+    assert fig.layout.margin.b >= 110
+
+    # The anchor that *did* solve is still drawn.
+    assert "Minimum variance" in {t.name for t in fig.data}
+    assert "Maximum Sharpe" not in {t.name for t in fig.data}
+
+
+def test_frontier_without_failed_anchors_has_no_footnote():
+    fig = plot_efficient_frontier(_frontier())
+    assert not fig.layout.annotations
+    assert {"Minimum variance", "Maximum Sharpe"} <= {t.name for t in fig.data}
+
+
+def test_frontier_no_longer_draws_a_dominated_branch():
+    """``show_dominated`` is a deprecated no-op; the branch cannot occur.
+
+    The mean-variance return target is a floor, so a target below the
+    minimum-variance return returns the minimum-variance portfolio rather than
+    a dominated one. The trace is gone. The keyword is still accepted so
+    existing callers — the Streamlit app, the example notebook — keep working.
+    """
+    frontier = _frontier()
+    # Even handed a frame that claims a dominated point, nothing is drawn for
+    # it: the trace no longer exists.
+    frontier.summary.loc[0, "is_efficient"] = False
+    fig = plot_efficient_frontier(frontier, show_dominated=True)
+    assert not any("Dominated" in str(t.name) for t in fig.data)

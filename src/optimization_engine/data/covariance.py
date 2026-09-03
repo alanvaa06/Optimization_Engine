@@ -29,7 +29,9 @@ CovarianceMethod = Literal[
     "sample", "ledoit_wolf", "oas", "shrink", "ewma", "semi", "denoised"
 ]
 
-ExpectedReturnMethod = Literal["mean", "ema", "capm", "shrunk_mean"]
+ExpectedReturnMethod = Literal[
+    "mean", "geometric_mean", "ema", "capm", "shrunk_mean"
+]
 
 #: Human-facing description of each estimator, surfaced by the UI so the
 #: analyst can see the assumption they are buying into.
@@ -116,7 +118,11 @@ class CovarianceDiagnostics:
         condition_number: Ratio of largest to smallest eigenvalue.
         min_eigenvalue: Smallest eigenvalue of the estimate.
         is_psd: Whether every eigenvalue is non-negative (within tolerance).
-        effective_observations: For EWMA, ``1/(1−λ)``; otherwise ``T``.
+        effective_observations: The sample the estimator actually leans on —
+            for EWMA ``1/(1−λ)`` (see
+            :func:`effective_sample_size`), otherwise ``T``. Unrounded here;
+            the denoiser rounds it because the Marchenko-Pastur ratio needs
+            an observation count.
         warnings: Human-facing warnings, ordered most severe first.
     """
 
@@ -133,6 +139,62 @@ class CovarianceDiagnostics:
     def is_reliable(self) -> bool:
         """True when nothing worth warning the analyst about was found."""
         return not self.warnings
+
+
+def _ewma_effective_observations(ewma_lambda: float) -> float:
+    """Observations an EWMA estimator effectively leans on: ``1 / (1 − λ)``.
+
+    **The single definition of the EWMA effective sample in this library.**
+    The geometric weights ``(1 − λ)λ^k`` put almost all their mass on the
+    recent past, so the estimate rests on about ``1 / (1 − λ)`` observations —
+    roughly 17 at the RiskMetrics default λ = 0.94 — however long the panel
+    is. Two places need that number and they used to compute it separately,
+    which meant the diagnostics could warn about a 17-observation sample
+    while the denoiser was told it had two thousand.
+
+    Args:
+        ewma_lambda: The decay factor, in ``[0, 1)``.
+
+    Returns:
+        The effective observation count, unrounded.
+    """
+    return 1.0 / (1.0 - float(ewma_lambda))
+
+
+def effective_sample_size(
+    n_observations: int,
+    method: str = "sample",
+    ewma_lambda: float = 0.94,
+) -> tuple[int, str]:
+    """How many observations an estimator actually leans on, and why.
+
+    An equally-weighted estimator uses every row exactly once, so its
+    effective sample *is* the row count. EWMA does not, and anything
+    downstream that reasons about sampling error — a T/N ratio, the
+    Marchenko-Pastur noise edge — has to be handed the smaller number or it
+    will treat two thousand rows of exponentially-decayed history as two
+    thousand independent observations.
+
+    Args:
+        n_observations: Rows the estimator saw.
+        method: The covariance estimator's name.
+        ewma_lambda: The decay, used only when ``method == "ewma"``.
+
+    Returns:
+        ``(n_effective, note)``. ``note`` is empty when the effective sample
+        is the row count, and one sentence naming the decay when it is not.
+    """
+    if method != "ewma" or not 0.0 <= float(ewma_lambda) < 1.0:
+        return int(n_observations), ""
+    exact = _ewma_effective_observations(ewma_lambda)
+    effective = min(int(n_observations), max(1, int(round(exact))))
+    if effective == int(n_observations):
+        return effective, ""
+    return effective, (
+        f"EWMA with λ = {float(ewma_lambda):g} leans on about "
+        f"1/(1−λ) ≈ {exact:.0f} observations regardless of the "
+        f"{int(n_observations)} rows supplied."
+    )
 
 
 def covariance_diagnostics(
@@ -172,7 +234,7 @@ def covariance_diagnostics(
         float(n_observations) / n_assets if n_assets else float("nan")
     )
     eff_obs = (
-        1.0 / (1.0 - ewma_lambda)
+        _ewma_effective_observations(ewma_lambda)
         if method == "ewma" and ewma_lambda < 1.0
         else float(n_observations)
     )
@@ -313,6 +375,14 @@ def covariance_matrix(
             estimating (López de Prado, 2020). Implied by
             ``method="denoised"``, and composable with any other estimator —
             denoising a Ledoit-Wolf matrix is legitimate, if belt-and-braces.
+            The noise edge is fitted against the sample the estimator
+            actually leant on, not the row count: under ``method="ewma"``
+            that is ``round(1/(1−ewma_lambda))`` — about 17 at the default
+            decay — so the cutoff sits far higher than it would on the same
+            panel estimated equally-weighted, and a universe wider than that
+            effective sample cannot be denoised at all. See
+            :func:`effective_sample_size` and
+            :func:`~optimization_engine.data.denoise.denoise_covariance`.
         denoise_method: ``"constant_residual"`` or ``"targeted_shrinkage"``;
             see :func:`~optimization_engine.data.denoise.denoise_correlation`.
         denoise_alpha: Noise-block shrinkage retained under
@@ -370,12 +440,17 @@ def covariance_matrix(
     if denoise or method == "denoised" or detone:
         from optimization_engine.data.denoise import denoise_covariance
 
+        n_effective, note = effective_sample_size(
+            len(returns), method=method, ewma_lambda=ewma_lambda
+        )
         cov, report = denoise_covariance(
             cov,
-            n_observations=len(returns),
+            n_observations=n_effective,
             method=denoise_method,
             alpha=denoise_alpha,
             detone=detone,
+            n_observations_nominal=len(returns),
+            effective_sample_note=note,
         )
 
     if ensure_psd:
@@ -420,9 +495,18 @@ def covariance_from_config(returns: pd.DataFrame, config) -> pd.DataFrame:
 
 EXPECTED_RETURN_DESCRIPTIONS: dict[str, str] = {
     "mean": (
-        "Annualized geometric mean of realized returns. Simple, but the "
-        "standard error of a mean estimate is huge — decades of data are "
-        "needed to distinguish two assets' means."
+        "Annualized arithmetic mean of realized returns — the single-period "
+        "expected return mean-variance optimization is defined against. "
+        "Simple, but the standard error of a mean estimate is huge: decades "
+        "of data are needed to distinguish two assets' means."
+    ),
+    "geometric_mean": (
+        "Annualized geometric (compound) mean of realized returns. This is "
+        "the growth rate an investor actually earned, and it is the right "
+        "number for a multi-period question — but it is not the μ a "
+        "single-period mean-variance model wants, and pairing it with an "
+        "arithmetic covariance understates every expected return by roughly "
+        "half the variance."
     ),
     "ema": (
         "Exponentially-weighted mean: recent returns count more. Responsive "
@@ -433,9 +517,9 @@ EXPECTED_RETURN_DESCRIPTIONS: dict[str, str] = {
         "disciplined, so far more stable than raw historical means."
     ),
     "shrunk_mean": (
-        "James-Stein shrinkage of historical means toward the grand mean. "
-        "Keeps the ranking information while pulling in the extremes that "
-        "drive mean-variance to corner solutions."
+        "James-Stein shrinkage of the arithmetic historical means toward the "
+        "grand mean. Keeps the ranking information while pulling in the "
+        "extremes that drive mean-variance to corner solutions."
     ),
 }
 
@@ -473,8 +557,21 @@ def james_stein_shrinkage(
             ``cov_matrix`` — 252 for daily inputs, 12 for monthly, ``1``
             when they are already per-period.
 
+    **A degenerate quadratic form reports zero intensity, not one.** When
+    ``(μ−μ₀)'Σ⁻¹(μ−μ₀)`` comes back non-positive — every mean already sits on
+    the target, or the pseudo-inverse of a singular Σ annihilates the
+    deviation — the formula's analytic limit is ``λ = 1``. But ``λ`` is not
+    the answer here; it is a description of what the estimator did, and what
+    it did was return the sample means untouched. Reporting full shrinkage
+    beside an unshrunk vector is a lie about the estimator's own output, and
+    a caller that logs the intensity or gates on it would draw exactly the
+    wrong conclusion. The :class:`numpy.linalg.LinAlgError` exit below
+    already reports ``0.0`` for the same reason; this matches it.
+
     Returns:
         ``(shrunk_means, intensity)`` where ``intensity`` is in ``[0, 1]``.
+        The intensity is the share of the returned vector that came from the
+        target, so a returned ``sample_mean`` always carries ``0.0``.
     """
     mu = sample_mean.astype(float)
     assets = list(mu.index)
@@ -496,8 +593,21 @@ def james_stein_shrinkage(
         )
         diff = mu.values - mu_target
         quad = float(diff @ inv @ diff) / float(periods_per_year)
-        if quad <= 0:
-            return mu, 1.0
+        # A deviation at the level of floating-point residue is not a
+        # deviation. Testing ``quad <= 0`` alone made this branch depend on an
+        # exact cancellation: when every mean already sits on the target, the
+        # target is that mean recomputed through ``pinv``, so ``diff`` comes
+        # back as either exactly zero or a few ulps, depending on the BLAS.
+        # Both are the same estimator doing the same nothing, and only one of
+        # them used to be reported as such — the other returned an intensity
+        # of 1.0 beside an unshrunk vector, which is the very claim this
+        # branch exists to prevent.
+        scale = float(np.max(np.abs(mu.values))) or 1.0
+        if quad <= 0 or not bool(np.any(np.abs(diff) > 1e-12 * scale)):
+            # Nothing was shrunk — see the docstring. The analytic limit of
+            # the formula is 1.0, but the intensity reports what happened to
+            # the vector, and what happened to it was nothing.
+            return mu, 0.0
         lam = (n + 2) / (n + 2 + n_observations * quad)
     except np.linalg.LinAlgError:
         return mu, 0.0
@@ -519,17 +629,39 @@ def expected_returns_from_history(
 ) -> pd.Series:
     """Build an expected-return vector from realized history.
 
-    * ``mean``        — annualized geometric historical mean.
-    * ``ema``         — exponentially-weighted mean with the given ``span``.
-    * ``capm``        — implied returns from a single-factor CAPM where the
-      market portfolio is approximated by ``market_weights`` (defaulting to
-      equal weights).
-    * ``shrunk_mean`` — ``mean`` pulled toward the minimum-variance
+    **The single definition of μ in this library.** Every other place that
+    needs expected returns — the app, the doc-image script, the resampler,
+    the shrinkage and CAPM branches below — calls this rather than writing
+    the formula out again, so there is one place where the convention lives
+    and one place to change it.
+
+    * ``mean``           — annualized *arithmetic* historical mean,
+      ``r̄ · periods_per_year``.
+    * ``geometric_mean`` — annualized compound growth rate,
+      ``(∏(1+r))^(ppy/T) − 1``.
+    * ``ema``            — exponentially-weighted mean with the given
+      ``span``.
+    * ``capm``           — implied returns from a single-factor CAPM where
+      the market portfolio is approximated by ``market_weights`` (defaulting
+      to equal weights).
+    * ``shrunk_mean``    — ``mean`` pulled toward the minimum-variance
       portfolio's return via :func:`james_stein_shrinkage`.
+
+    **Why ``mean`` is arithmetic.** Mean-variance optimization is a
+    single-period model: it maximizes ``μ'w − λ·w'Σw`` over one period's
+    return, and the expectation of a one-period return is its arithmetic
+    mean. The geometric mean is the *realized* compound growth rate, lower
+    than the arithmetic mean by roughly ``σ²/2``, and it is the answer to a
+    different question — what an investor earned over many periods. Pairing a
+    geometric μ with an arithmetic Σ is not conservative, it is inconsistent:
+    the penalty term is measured on one convention and the reward term on
+    another, and the size of the error is exactly the quantity the optimizer
+    is trading off. ``geometric_mean`` is kept, named for what it is, for
+    callers who want that number deliberately.
 
     Args:
         returns: Periodic returns, one column per asset.
-        method: Which of the four estimators above to use.
+        method: Which of the five estimators above to use.
         periods_per_year: Annualization basis for the result.
         span: EWMA span in periods. Only used by ``ema``.
         market_return: The market's expected return, for ``capm``. Estimated
@@ -548,16 +680,21 @@ def expected_returns_from_history(
             weights summing to zero, or a CAPM market portfolio with zero
             variance, which leaves the betas undefined.
     """
+
     if returns is None or returns.empty:
         raise ValueError("Cannot estimate expected returns from empty data.")
 
     if method == "mean":
+        return returns.mean() * periods_per_year
+    if method == "geometric_mean":
         return ((1 + returns).prod() ** (periods_per_year / len(returns))) - 1
     if method == "ema":
         ema = returns.ewm(span=span, adjust=False).mean().iloc[-1]
         return (1 + ema) ** periods_per_year - 1
     if method == "shrunk_mean":
-        raw = ((1 + returns).prod() ** (periods_per_year / len(returns))) - 1
+        raw = expected_returns_from_history(
+            returns, method="mean", periods_per_year=periods_per_year
+        )
         if cov_matrix is None:
             cov_matrix = covariance_matrix(
                 returns, method="ledoit_wolf", periods_per_year=periods_per_year
@@ -584,9 +721,17 @@ def expected_returns_from_history(
         market_weights = market_weights / float(market_weights.sum())
         market_return_est = market_return
         if market_return_est is None:
+            # The market premium is multiplied by a beta and read as a
+            # single-period expectation, so it has to be the arithmetic mean
+            # for the same reason ``mean`` is — and it goes through the same
+            # code path so it cannot drift from it.
             mkt = (returns * market_weights).sum(axis=1)
-            market_return_est = (
-                (1 + mkt).prod() ** (periods_per_year / len(mkt)) - 1
+            market_return_est = float(
+                expected_returns_from_history(
+                    mkt.to_frame("market"),
+                    method="mean",
+                    periods_per_year=periods_per_year,
+                ).iloc[0]
             )
         market_var = float(market_weights.values @ cov_matrix.values @ market_weights.values)
         if market_var <= 0:

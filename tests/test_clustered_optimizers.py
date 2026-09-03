@@ -189,6 +189,185 @@ def test_nco_honours_weight_bounds_by_projection(blocked_cov: pd.DataFrame):
     assert "projection_distance" in result.extras
 
 
+@pytest.mark.parametrize("objective", ["min_variance", "max_sharpe"])
+def test_nco_layers_go_through_optimize(objective: str, blocked_cov: pd.DataFrame):
+    """Both nested layers are solved by ``optimize()``, not by a bare ``_solve``.
+
+    NCO used to reach past the public entry point straight into the
+    sub-optimizer's ``_solve``, which meant the intra- and inter-cluster
+    weights were the only ones in the engine that nothing cleaned, bounded or
+    checked — no dust removal, no ``bounds_mode``, no solver record. The spy
+    below fires only if the sub-solves go through ``optimize``, so the test
+    fails outright on a regression rather than on a weakened assertion.
+
+    The one thing a nested layer deliberately does *not* get is the post-solve
+    mandate audit: see ``test_nco_sub_solves_are_not_audited_against_the_mandate``
+    for why, and for what the opt-out is worth in cost.
+    """
+    from optimization_engine.optimizers.mean_variance import (
+        MaxSharpeOptimizer,
+        MinVarianceOptimizer,
+    )
+
+    sub_optimizer = (
+        MinVarianceOptimizer if objective == "min_variance" else MaxSharpeOptimizer
+    )
+    assert "optimize" not in sub_optimizer.__dict__, (
+        "this test restores the method by deleting it from the subclass"
+    )
+    mu = pd.Series(
+        np.linspace(0.03, 0.12, len(blocked_cov.columns)), index=blocked_cov.columns
+    )
+    sub_results = []
+    sub_kwargs = []
+    unpatched = sub_optimizer.optimize
+
+    def spy(self, **kwargs):
+        result = unpatched(self, **kwargs)
+        sub_results.append(result)
+        sub_kwargs.append(kwargs)
+        return result
+
+    sub_optimizer.optimize = spy
+    try:
+        result = NCOOptimizer(
+            cov_matrix=blocked_cov,
+            expected_returns=mu,
+            constraints=PortfolioConstraints(),
+            objective=objective,
+        ).optimize()
+    finally:
+        del sub_optimizer.optimize
+
+    # One solve per cluster, plus the one across the synthetic cluster assets.
+    n_clusters = result.extras["nco_n_clusters"]
+    assert len(sub_results) == n_clusters + 1
+
+    for sub in sub_results:
+        assert isinstance(sub.extras["solver"], str) and sub.extras["solver"]
+        assert sub.extras["solver_status"] == "optimal"
+        assert sub.extras["solvers_attempted"]
+        assert sub.extras["bounds_mode"] == "hard"
+        assert sub.extras["optimizer"] == sub_optimizer.name
+        assert sub.weights.sum() == pytest.approx(1.0)
+
+    # Every layer asked `optimize` to skip the post-solve pass, explicitly.
+    assert sub_kwargs == [{"run_post_solve_diagnostics": False}] * len(sub_results)
+
+    # The last sub-solve is the inter-cluster layer: one weight per cluster.
+    assert list(sub_results[-1].weights.index) == sorted(
+        int(label) for label in result.extras["nco_cluster_weights"]
+    )
+
+
+def test_nco_sub_solves_are_not_audited_against_the_mandate(blocked_cov: pd.DataFrame):
+    """A cluster weight is not a book weight, so the mandate cannot judge it.
+
+    NCO solves each cluster against budget-and-sign only and applies the
+    mandate's per-asset limits to the *combined* book by projection. Auditing a
+    sub-solve against the mandate would therefore measure the wrong quantity —
+    an intra-cluster weight of 0.30 is 30% of a cluster, not 30% of the
+    portfolio, and a 10% cap would be "breached" by every layer of every NCO
+    run. Auditing it against the budget-and-sign set it really was solved with
+    is not wrong, only pointless: it re-checks, k+1 times, a constraint the
+    convex program has already imposed.
+
+    So the layers opt out, and the assertion that proves it is not that the
+    sub-reports are clean — it is that the raw intra-cluster weights would
+    *not* have been, had the mandate been the yardstick.
+    """
+    from optimization_engine.optimizers.mean_variance import MinVarianceOptimizer
+
+    cap = 0.10
+    constraints = PortfolioConstraints(
+        bounds={a: (0.0, cap) for a in blocked_cov.columns}
+    )
+    sub_results = []
+    unpatched = MinVarianceOptimizer.optimize
+
+    def spy(self, **kwargs):
+        result = unpatched(self, **kwargs)
+        sub_results.append((self.constraints, result))
+        return result
+
+    MinVarianceOptimizer.optimize = spy
+    try:
+        result = NCOOptimizer(cov_matrix=blocked_cov, constraints=constraints).optimize()
+    finally:
+        del MinVarianceOptimizer.optimize
+
+    assert sub_results, "no sub-solve was observed"
+    for sub_constraints, sub in sub_results:
+        # The sub-problem never sees the mandate's box in the first place.
+        assert sub_constraints.bounds == {}
+        assert sub.audit is None
+        assert "diagnostics" not in sub.extras
+        assert "violations" not in sub.extras
+
+    # The heart of it: at least one layer breaks the mandate's cap in cluster
+    # units, so an audit against `constraints` would have reported a breach
+    # that does not exist in the book.
+    assert any(
+        sub.weights.max() > cap + 1e-6 for _constraints, sub in sub_results
+    ), "expected a cluster weight above the book-level cap"
+
+    # The book itself is audited, and complies.
+    assert result.audit is not None
+    assert result.audit.is_clean, result.audit.describe()
+    assert result.weights.max() <= cap + 1e-6
+
+
+def test_nco_survives_a_long_short_mandate(blocked_cov: pd.DataFrame):
+    """``long_only=False`` is the path where the unit-budget invariant can break.
+
+    Every cluster's weights are rescaled to sum to one before the outer
+    product, so ``loadings @ inter`` sums to one. ``_clean_weights`` normally
+    does that rescaling, but it declines to when a layer nets to ~0 — which
+    only a long-short book can do. The nest has to hold the budget anyway.
+    """
+    constraints = PortfolioConstraints(
+        long_only=False, bounds={a: (-0.30, 0.30) for a in blocked_cov.columns}
+    )
+    result = NCOOptimizer(cov_matrix=blocked_cov, constraints=constraints).optimize()
+
+    assert result.weights.sum() == pytest.approx(1.0, abs=1e-9)
+    assert result.weights.min() < 0.0, "expected a genuinely long-short book"
+    assert result.weights.min() >= -0.30 - 1e-6
+    assert result.weights.max() <= 0.30 + 1e-6
+    assert result.is_compliant, result.violations
+
+
+def test_nco_refuses_a_layer_whose_weights_net_to_zero(blocked_cov: pd.DataFrame):
+    """A cancelled-out cluster is named, not quietly folded into the book.
+
+    ``_clean_weights`` returns the weights *unnormalized* when they net to
+    approximately zero, because rescaling is meaningless there. Passing that
+    through would leave the cluster with no share of the book to allocate and
+    the combined weights no longer summing to one — a silently un-invested
+    portfolio. The sub-solve is forced into that state here, since a real
+    covariance matrix reaches it only by accident.
+    """
+    from optimization_engine.optimizers.mean_variance import MinVarianceOptimizer
+
+    def nets_to_zero(self):
+        weights = np.ones(len(self.assets))
+        weights[0] = -(len(weights) - 1.0)
+        return weights
+
+    unpatched = MinVarianceOptimizer._solve
+    MinVarianceOptimizer._solve = nets_to_zero
+    try:
+        with pytest.raises(ValueError, match="net to") as excinfo:
+            NCOOptimizer(
+                cov_matrix=blocked_cov,
+                constraints=PortfolioConstraints(long_only=False),
+            ).optimize()
+    finally:
+        MinVarianceOptimizer._solve = unpatched
+
+    assert "cluster" in str(excinfo.value)
+
+
 # ---------------------------------------------------------------------------
 # HERC
 # ---------------------------------------------------------------------------

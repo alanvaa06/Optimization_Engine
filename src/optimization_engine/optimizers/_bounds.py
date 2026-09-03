@@ -156,7 +156,15 @@ def project_to_constraints(
             cp.Minimize(cp.sum_squares(x - w)),
             build_constraints(x, assets, _without_turnover(constraints)),
         )
-        solve_problem(problem)
+        # ``accept_inaccurate=True`` on purpose, and it is the only call site
+        # in the package that says so. This solve is not the portfolio: it is
+        # the cleanup that follows one, moving a rescaled vector the smallest
+        # distance back inside the box after dust was zeroed. A few basis
+        # points of slack in *that* is noise on a correction, whereas refusing
+        # it would raise on every soft-bounds method whose real solve already
+        # succeeded -- turning a cosmetic step into a failure. The honesty the
+        # refusal buys is bought at the solve above it, not here.
+        solve_problem(problem, accept_inaccurate=True)
         if x.value is None:
             raise SolverFailure("unknown", ())
         projected = np.asarray(x.value).flatten()

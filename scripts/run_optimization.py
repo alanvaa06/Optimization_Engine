@@ -22,7 +22,10 @@ from optimization_engine.data.loader import (  # noqa: E402
     prices_to_returns,
     sample_dataset,
 )
-from optimization_engine.data.quality import analyze_prices  # noqa: E402
+from optimization_engine.data.quality import (  # noqa: E402
+    align_panel,
+    analyze_prices,
+)
 from optimization_engine.engine import run_engine  # noqa: E402
 from optimization_engine.reporting.exporters import (  # noqa: E402
     run_sheets,
@@ -58,7 +61,22 @@ def main() -> int:
     for issue in quality.issues:
         print(f"Data {issue.severity} — {issue.describe()}", file=sys.stderr)
 
-    returns = prices_to_returns(prices).dropna(how="any")
+    # `method="common"` matches `optengine` — see `cli._prepare_inputs` for
+    # why that method and not one of the other two. The panel is aligned
+    # *after* the quality report so the report still sees the gaps.
+    prices, alignment = align_panel(prices, method="common")
+    for action in alignment:
+        print(f"Alignment — {action}", file=sys.stderr)
+
+    returns = prices_to_returns(prices)
+    n_rows = len(returns)
+    returns = returns.dropna(how="any")
+    if len(returns) < n_rows:
+        print(
+            f"Alignment — dropped {n_rows - len(returns)} period(s) whose "
+            "return could not be computed from the aligned prices.",
+            file=sys.stderr,
+        )
     if returns.empty:
         print("No usable returns after alignment.", file=sys.stderr)
         return 2

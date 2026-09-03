@@ -34,6 +34,13 @@ import pandas as pd
 from optimization_engine.optimizers.base import BaseOptimizer
 from optimization_engine.optimizers.mean_variance import MeanVarianceOptimizer
 
+# Below this, a view's pick portfolio has no prior variance at all: ``p'τΣp``
+# is zero to the last bit rather than merely small. 1e-300 is denormal
+# territory, so any view portfolio built from a real annualized covariance sits
+# many orders of magnitude above it; the threshold catches exact degeneracy
+# without passing judgement on a genuinely low-variance view.
+_MIN_VIEW_VARIANCE = 1e-300
+
 
 @dataclass(frozen=True)
 class View:
@@ -116,10 +123,34 @@ def normalize_views(
     return list(views)
 
 
+def _identify_view(view: View, position: int) -> str:
+    """Name one view for an error message.
+
+    Args:
+        view: The view to name.
+        position: Its 1-based place in the list the caller passed.
+
+    Returns:
+        The view's label when it has one, otherwise its position and the assets
+        it names — either way, enough for the caller to find the row they typed.
+    """
+    if view.label:
+        return f"view {position} ({view.label!r})"
+    return f"view {position} on {', '.join(view.weights)}"
+
+
 def build_pick_matrix(
     views: list[View], assets: list[str]
 ) -> tuple[np.ndarray, np.ndarray, list[View]]:
-    """Assemble ``(P, Q)`` from a list of views, dropping unusable ones.
+    """Assemble ``(P, Q)`` from a list of views.
+
+    Every asset a view names must be in the universe. Views used to be trimmed
+    to fit it instead: a basket view's out-of-universe legs were zeroed, so
+    "long A versus short B" quietly became "long A" — a different opinion, with
+    a different effect on the posterior — and a view whose assets were *all*
+    absent was dropped whole. Both changed what the caller said without saying
+    so, and a view on a name the portfolio cannot hold is not a view, so both
+    now raise.
 
     Args:
         views: The views to encode.
@@ -127,29 +158,55 @@ def build_pick_matrix(
 
     Returns:
         ``(P, Q, kept)`` — the pick matrix, the view returns, and the views
-        that survived. A view is dropped when none of its assets are in the
-        universe, or when every coefficient is zero: either way it carries no
-        information about the assets being optimized.
+        themselves in input order. Nothing is dropped, so ``kept`` is always
+        every view passed; it stays in the signature because callers unpack
+        three values.
+
+    Raises:
+        ValueError: If any view references an asset outside ``assets``. The
+            message names every missing asset and every view that referenced
+            one, not just the first hit.
     """
     idx = {a: i for i, a in enumerate(assets)}
     rows: list[np.ndarray] = []
     q: list[float] = []
-    kept: list[View] = []
-    for view in views:
-        row = np.zeros(len(assets))
-        touched = False
-        for asset, coeff in view.weights.items():
-            if asset in idx and coeff != 0:
-                row[idx[asset]] = float(coeff)
-                touched = True
-        if not touched:
+    # An insertion-ordered set: the message lists missing names in the order
+    # the views name them, so the same inputs always produce the same message.
+    missing_assets: dict[str, None] = {}
+    offenders: list[str] = []
+    for position, view in enumerate(views, start=1):
+        absent = [a for a in view.weights if a not in idx]
+        if absent:
+            for asset in absent:
+                missing_assets[asset] = None
+            named = _identify_view(view, position)
+            # When every leg is missing the name already carries the assets;
+            # "view 2 on ZZZZ references ZZZZ" is noise.
+            offenders.append(
+                named
+                if len(absent) == len(view.weights)
+                else f"{named} references {', '.join(absent)}"
+            )
             continue
+        row = np.zeros(len(assets))
+        for asset, coeff in view.weights.items():
+            row[idx[asset]] = float(coeff)
         rows.append(row)
         q.append(float(view.expected_return))
-        kept.append(view)
+    if missing_assets:
+        raise ValueError(
+            "Black-Litterman views reference assets that are not in the "
+            f"optimization universe: {', '.join(missing_assets)} ("
+            + "; ".join(offenders)
+            + "). A view on an asset the portfolio cannot hold says nothing "
+            "about the assets being optimized, and a basket view reduced to "
+            "the legs that happen to be held is a different view from the one "
+            "written. Drop these views, or widen the universe to include the "
+            "missing assets."
+        )
     if not rows:
         return np.zeros((0, len(assets))), np.zeros(0), []
-    return np.vstack(rows), np.array(q), kept
+    return np.vstack(rows), np.array(q), list(views)
 
 
 def implied_risk_aversion(
@@ -241,9 +298,12 @@ def black_litterman_posterior(
 
     Raises:
         ValueError: If ``tau`` lies outside ``(0, 1]``, which makes the prior
-            either degenerate or wider than the return distribution itself, or
-            if a view confidence is not strictly positive — a zero would
-            assert a view held with perfect certainty.
+            either degenerate or wider than the return distribution itself; if
+            a view references an asset outside ``cov_matrix``'s columns (see
+            :func:`build_pick_matrix`); if a view's pick portfolio has
+            numerically zero prior variance, leaving the He-Litterman default
+            uncertainty undefined; or if a view confidence is not strictly
+            positive — a zero would assert a view held with perfect certainty.
     """
     if not 0 < tau <= 1:
         raise ValueError(
@@ -269,7 +329,31 @@ def black_litterman_posterior(
     # He-Litterman default: each view's uncertainty is the prior variance of
     # that view's own portfolio. Explicit confidences override per view.
     default_omega = np.diag(P @ tau_sigma @ P.T).copy()
-    default_omega = np.maximum(default_omega, 1e-12)
+    # A pick portfolio with no prior variance has no defensible uncertainty:
+    # ``p'τΣp`` is the whole He-Litterman default. Flooring it, as this did,
+    # handed such a view a variance of 1e-12 — near-perfect confidence — and
+    # let it dominate the posterior it was meant to nudge. The comparison is
+    # written as ``not >=`` so a NaN projection is caught too.
+    degenerate = [
+        j for j, var in enumerate(default_omega) if not var >= _MIN_VIEW_VARIANCE
+    ]
+    if degenerate:
+        detail = "; ".join(
+            f"{_identify_view(kept[j], j + 1)} projects onto prior variance "
+            f"{float(default_omega[j]):.3g}"
+            for j in degenerate
+        )
+        raise ValueError(
+            "A Black-Litterman view has no prior variance to scale its "
+            f"uncertainty by: {detail}, below {_MIN_VIEW_VARIANCE:g}. The "
+            "default view uncertainty is the prior variance of the view's own "
+            "portfolio, so a pick portfolio the covariance holds at zero "
+            "variance — a spread between assets it treats as identical, or a "
+            "row of zero coefficients — has no uncertainty to state, and the "
+            "prior cannot be blended with it either: it is singular in that "
+            "direction. Drop the view, or state it over assets the covariance "
+            "tells apart."
+        )
     omega_diag = np.array(
         [
             view.confidence if view.confidence is not None else default_omega[j]

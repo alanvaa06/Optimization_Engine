@@ -42,6 +42,8 @@ from optimization_engine.reporting.payloads import (
     describe_payload,
     optimization_payload,
 )
+from optimization_engine.stress import StressError, load_shocks
+from optimization_engine.universe.eligibility import MASK_POLICIES
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -80,6 +82,13 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     _add_ingest_arguments(optimize)
     optimize.add_argument("--output", default="outputs.xlsx", help="Output Excel path.")
+    optimize.add_argument(
+        "--accept-inaccurate",
+        action="store_true",
+        help=(
+            "Accept an approximate solution when no solver converges exactly. Off by default: a solve that only reaches 'optimal_inaccurate' fails rather than report unverified weights as optimal. Turn it on when an indicative book beats no book, and read solver_status on the result to see which one you got. No-op for HRP, HERC and the naive weightings, which never call a solver."
+        ),
+    )
     optimize.add_argument("--frontier", action="store_true", help="Also compute the frontier.")
     optimize.add_argument("--frontier-points", type=int, default=25)
     optimize.add_argument(
@@ -149,9 +158,26 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Cap active share against the benchmark (0.4 = 40%%).",
     )
     optimize.add_argument(
+        "--stress", metavar="FILE",
+        help="YAML/JSON file of stress scenarios to apply to the solved book. "
+             "Each entry needs a 'name' and a 'returns' map of asset -> "
+             "one-period return; 'covariance_scale' (a number or a full "
+             "matrix) and 'notes' are optional. A shock naming an asset "
+             "outside the panel is refused, not silently zeroed.",
+    )
+    optimize.add_argument(
         "--strict", action="store_true",
         help="Refuse to run when the constraints are infeasible, naming the "
              "constraint instead of letting the solver fail.",
+    )
+    optimize.add_argument(
+        "--strict-mandate", action="store_true",
+        help="Refuse a solved book that breaches the mandate instead of "
+             "reporting the breach. The flag form of the config's "
+             "'strict_mandate'. Distinct from --strict, which is a pre-solve "
+             "check on the constraints: this one fires *after* a successful "
+             "solve, and it is the methods that apply bounds by projection "
+             "(HRP, HERC, NCO, the naive weightings) it most often stops.",
     )
 
     backtest = sub.add_parser(
@@ -178,6 +204,13 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     backtest.add_argument("--yahoo-start", help="Yahoo start date (YYYY-MM-DD).")
     backtest.add_argument("--yahoo-end", help="Yahoo end date (YYYY-MM-DD).")
+    backtest.add_argument(
+        "--accept-inaccurate",
+        action="store_true",
+        help=(
+            "Accept an approximate solution when no solver converges exactly. Off by default: a solve that only reaches 'optimal_inaccurate' fails rather than report unverified weights as optimal. Turn it on when an indicative book beats no book, and read solver_status on the result to see which one you got. No-op for HRP, HERC and the naive weightings, which never call a solver. Applies to every re-solve in the walk-forward."
+        ),
+    )
     backtest.add_argument(
         "--lookback", type=int, metavar="N",
         help="Estimation window in periods. Defaults to two years.",
@@ -273,6 +306,48 @@ def _build_parser() -> argparse.ArgumentParser:
              "into the deflated Sharpe.",
     )
     backtest.add_argument(
+        "--stress", metavar="FILE",
+        help="YAML/JSON file of stress scenarios. The tearsheet gains a "
+             "stress panel over the book the walk-forward ended on.",
+    )
+    backtest.add_argument(
+        "--strict-mandate", action="store_true",
+        help="Refuse a solved book that breaches the mandate. Read the "
+             "warning on --strict-mandate for `optimize` first: inside a "
+             "walk-forward a refused window is caught per-window and recorded "
+             "as a failed solve, so this does not stop the run — it turns "
+             "non-compliant windows into carried-forward ones, counted in "
+             "the 'solve(s) failed' line.",
+    )
+    backtest.add_argument(
+        "--universe", metavar="FILE",
+        help="YAML/JSON rules file defining point-in-time membership: which "
+             "names were investable, and when. Without one the universe is "
+             "'every column of the panel, from the first bar', which is "
+             "survivorship bias and look-ahead in the same frame. See "
+             "optimization_engine.universe.rules for the schema.",
+    )
+    backtest.add_argument(
+        "--universe-policy", default="exclude",
+        choices=list(MASK_POLICIES),
+        help="How a date/asset cell the rules could not evaluate is read. "
+             "'exclude' (the default) treats it as ineligible and prints how "
+             "many cells that silently removed; 'include' admits a name "
+             "nothing screened; 'raise' refuses to guess and stops the run. "
+             "The library API has no default here on purpose — the CLI picks "
+             "one because a non-interactive run cannot ask, and then says "
+             "what the choice cost.",
+    )
+    backtest.add_argument(
+        "--delisting-grace", type=int, metavar="N",
+        help="Bars of silence after which a name counts as delisted, dropped "
+             "from the solve and sold at its last mark. Separate from "
+             "--universe and opt-in on its own: a screen says what the "
+             "mandate permits, this says what still trades. Omitted, "
+             "delisting is not diagnosed at all and a name that stopped "
+             "printing is simply held.",
+    )
+    backtest.add_argument(
         "--output", help="Optional Excel path for the tearsheet frames."
     )
 
@@ -308,6 +383,17 @@ def _build_parser() -> argparse.ArgumentParser:
     check.add_argument(
         "--benchmark",
         help="Benchmark to check the mandate against: a kind or an asset name.",
+    )
+    check.add_argument(
+        "--accept-inaccurate",
+        action="store_true",
+        help=(
+            "Let the reachable-return LPs settle for an approximate answer. "
+            "Off by default, in which case a range the solver could not "
+            "verify is reported as 'we could not tell' rather than as a "
+            "range. This is the pre-flight's half of the same flag "
+            "'optimize' and 'backtest' pass to the solve itself."
+        ),
     )
     check.add_argument("--max-tracking-error", type=float, default=None)
     check.add_argument("--max-active-share", type=float, default=None)
@@ -369,13 +455,107 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _load_stress_into(config, args: argparse.Namespace) -> int:
+    """Read ``--stress`` into ``config.stress``, or report why it could not.
+
+    Args:
+        config: The configuration to attach the scenarios to, in place.
+        args: The parsed command line. ``--stress`` is optional; without it
+            the config keeps whatever its own file declared.
+
+    Returns:
+        ``0`` on success (including when no file was named), ``2`` when the
+        file could not be read or parsed — the message is on stderr.
+    """
+    path = getattr(args, "stress", None)
+    if not path:
+        return 0
+    try:
+        config.stress = load_shocks(path)
+    except (OSError, StressError) as exc:
+        print(f"Could not read stress scenarios from {path}: {exc}", file=sys.stderr)
+        return 2
+    print(f"Loaded {len(config.stress)} stress scenario(s) from {path}")
+    return 0
+
+
+def _load_universe_for(args: argparse.Namespace, returns, prices):
+    """Read ``--universe`` into an :class:`Eligibility`, and say what it costs.
+
+    The rules file carries the paths to any characteristic panel it needs —
+    ADV, market capitalisation — because :func:`_prepare_inputs` loads prices
+    and nothing else; see :mod:`optimization_engine.universe.rules` for why
+    the data lives with the rules rather than behind a second flag. The run's
+    own panels are handed in here under the names ``returns`` and ``prices``,
+    so a screen written only over those needs no data files at all.
+
+    Args:
+        args: The parsed command line. ``--universe`` is optional.
+        returns: The aligned return panel, available to rules as ``returns``.
+        prices: The aligned price panel, available as ``prices``.
+
+    Returns:
+        The :class:`~optimization_engine.universe.eligibility.Eligibility`,
+        ``None`` when no rules file was named, or ``2`` when the file could
+        not be read — the message is on stderr.
+    """
+    from optimization_engine.universe.rules import (
+        count_unresolved,
+        load_universe_rules,
+    )
+    from optimization_engine.universe.signal import UniverseError
+
+    path = getattr(args, "universe", None)
+    if not path:
+        return None
+    try:
+        rules = load_universe_rules(path)
+        universe = rules.build(returns=returns, prices=prices)
+    except (OSError, UniverseError) as exc:
+        print(f"Could not read the universe from {path}: {exc}", file=sys.stderr)
+        return 2
+    print(rules.describe())
+
+    policy = getattr(args, "universe_policy", "exclude")
+    cells, bars, names = count_unresolved(universe, returns.index, list(returns.columns))
+    if cells:
+        # Unconditionally on stderr, like the alignment log and for the same
+        # reason: the library refuses to pick a collapse policy, this command
+        # picked one, and the size of what that decided is not an advanced-mode
+        # detail. Under "raise" the run is about to stop on these very cells,
+        # so the count is the diagnosis rather than a footnote.
+        verdict = {
+            "exclude": "reads them as ineligible",
+            "include": "admits them",
+            "raise": "will stop the run on them",
+        }[policy]
+        print(
+            f"  Universe: {cells} date/asset cell(s) across {bars} bar(s) and "
+            f"{len(names)} name(s) were not evaluable, and the {policy!r} "
+            f"policy — not a screen — {verdict}: "
+            f"{', '.join(names[:5])}{' …' if len(names) > 5 else ''}.",
+            file=sys.stderr,
+        )
+    else:
+        print(
+            "  Universe: every date/asset cell was evaluable, so the "
+            f"{policy!r} policy decides nothing.",
+            file=sys.stderr,
+        )
+    return universe
+
+
 def _cmd_optimize(args: argparse.Namespace) -> int:
+    from optimization_engine.optimizers.audit import MandateViolationError
     from optimization_engine.optimizers.feasibility import InfeasibleConstraintsError
 
     inputs = _prepare_inputs(args)
     if isinstance(inputs, int):
         return inputs
     config, returns, quality = inputs.config, inputs.returns, inputs.quality
+    alignment = inputs.alignment
+    if _load_stress_into(config, args) != 0:
+        return 2
     for issue in quality.errors:
         print(f"Data error — {issue.describe()}", file=sys.stderr)
     for issue in quality.warnings:
@@ -395,9 +575,28 @@ def _cmd_optimize(args: argparse.Namespace) -> int:
             build_frontier=args.frontier,
             n_frontier_points=args.frontier_points,
             raise_on_infeasible=args.strict,
+            run_stress=bool(config.stress),
         )
     except InfeasibleConstraintsError as exc:
         print(str(exc), file=sys.stderr)
+        return 2
+    except StressError as exc:
+        print(f"Stress test failed: {exc}", file=sys.stderr)
+        return 2
+    except MandateViolationError as exc:
+        # Raised only under --strict-mandate, and *after* a successful solve:
+        # the answer arrived and does not comply. It is a ValueError while
+        # SolverFailure is a RuntimeError, so the clause below never sees it —
+        # without this one the CLI would leak a traceback for the one failure
+        # the flag exists to produce.
+        print(str(exc), file=sys.stderr)
+        print(
+            "  The mandate is satisfiable; this method did not satisfy it. "
+            "Pick a method whose bounds are enforced inside the convex "
+            "program, loosen the limit named above, or drop --strict-mandate "
+            "and read the audit on the result.",
+            file=sys.stderr,
+        )
         return 2
     except SolverFailure as exc:
         print(f"Optimization failed: {exc}", file=sys.stderr)
@@ -413,6 +612,9 @@ def _cmd_optimize(args: argparse.Namespace) -> int:
 
     for warning in run.warnings:
         print(f"Warning — {warning}", file=sys.stderr)
+
+    if run.stress is not None:
+        print(run.stress.describe())
 
     walk_forward = None
     if args.walk_forward:
@@ -501,7 +703,9 @@ def _cmd_optimize(args: argparse.Namespace) -> int:
                     f"worst position {row['max_weight_drift']:.2%}"
                 )
     print(f"Wrote {out} ({len(sheets)} sheets)")
-    _capture(args, optimization_payload(run, output_path=str(out)))
+    _capture(
+        args, optimization_payload(run, output_path=str(out), alignment=alignment)
+    )
     return 0
 
 
@@ -694,17 +898,32 @@ def _cmd_describe(args: argparse.Namespace) -> int:
 
 
 def _apply_estimator_flags(config, args: argparse.Namespace) -> None:
-    """Let command-line estimator flags override the config file.
+    """Let command-line flags override the config file's estimator settings.
 
     Kept in one place so ``check`` and ``optimize`` cannot diverge: a
     pre-flight that reports the conditioning of a matrix the solve will not
-    use is worse than no pre-flight at all.
+    use is worse than no pre-flight at all. The same argument covers
+    ``--accept-inaccurate``: the command that says the mandate is reachable
+    and the command that solves it have to agree about what counts as an
+    answer.
+
+    ``getattr`` throughout because the three subcommands that share
+    :func:`_prepare_inputs` do not carry identical flags.
     """
     if getattr(args, "denoise", False):
         config.denoise = True
     detone = getattr(args, "detone", None)
     if detone is not None:
         config.detone = int(detone)
+    if getattr(args, "accept_inaccurate", False):
+        # One-way on purpose. The flag is an opt-in to a weaker answer, so
+        # its absence must not overwrite a config that already asked for one.
+        config.optimizer.accept_inaccurate = True
+    if getattr(args, "strict_mandate", False):
+        # One-way for the same reason, in the other direction: the flag is an
+        # opt-in to a *stricter* answer, and its absence must not switch off a
+        # config that already asked to refuse a non-compliant book.
+        config.strict_mandate = True
 
 
 
@@ -854,6 +1073,9 @@ class _Inputs:
     returns: pd.DataFrame
     quality: object
     volumes: pd.DataFrame | None
+    #: One sentence per change alignment made to the panel. Empty means
+    #: nothing was dropped, which is a claim worth being able to make.
+    alignment: list[str]
 
 
 def _fail(args: argparse.Namespace, message: str, code: int = 2) -> int:
@@ -879,16 +1101,26 @@ def _prepare_inputs(args: argparse.Namespace) -> _Inputs | int:
     ``resolve_expected_returns`` would otherwise have estimated.
 
     The order of operations: estimator flags, then the panel, then currency
-    conversion, then the universe, then the benchmark flags. Currency before
-    universe because a conversion needs every column it is told about;
-    universe before benchmark because a single-asset benchmark has to name
-    an asset that survived.
+    conversion, then the universe, then alignment, then the benchmark flags.
+    Currency before universe because a conversion needs every column it is
+    told about; universe before alignment because an asset the config never
+    asked for must not be allowed to truncate the sample; alignment before
+    benchmark because a single-asset benchmark has to name an asset that
+    survived.
+
+    Missing data is resolved by :func:`~optimization_engine.data.quality.align_panel`
+    rather than by dropping incomplete rows in passing. The operation is
+    the same one; what changes is that the caller is told. One asset that
+    listed three years after the rest truncates the sample for every other
+    asset, and a covariance estimated on three years of a twenty-year
+    panel is not the estimate the config asked for.
 
     Returns:
-        The inputs, or an exit code when something the caller can fix is
-        wrong — printed on stderr, and carried into the ``--json`` payload.
+        The inputs — including the alignment log — or an exit code when
+        something the caller can fix is wrong: printed on stderr, and
+        carried into the ``--json`` payload.
     """
-    from optimization_engine.data.quality import analyze_prices
+    from optimization_engine.data.quality import align_panel, analyze_prices
 
     config = load_config(args.config)
     _apply_estimator_flags(config, args)
@@ -938,8 +1170,43 @@ def _prepare_inputs(args: argparse.Namespace) -> _Inputs | int:
             )
         prices = prices[common]
 
+    # Quality is read off the *raw* panel on purpose: aligning first would
+    # hide the very gaps the report exists to name.
     quality = analyze_prices(prices, periods_per_year=config.periods_per_year)
-    returns = prices_to_returns(prices).dropna(how="any")
+
+    # `method="common"` keeps the dates on which every asset is present.
+    # The alternatives were rejected deliberately: `"ffill"` fabricates
+    # prices, and a fabricated flat period understates volatility and
+    # correlation in exactly the sample the covariance is estimated on;
+    # `"drop_assets"` silently edits the *universe*, which is a mandate
+    # decision the config makes and the CLI must not make for it. Losing
+    # history is the least dishonest of the three, so long as the loss is
+    # stated. The app offers all three (`app/streamlit_app.py`) and defaults
+    # to the same one; a non-interactive run does not get to guess.
+    #
+    # For a late listing — the case this replaced — the surviving sample is
+    # identical to what the bare `dropna(how="any")` produced, so no number
+    # moves. An *interior* gap does differ, and deliberately: differencing
+    # first left NaN at the gap and at the period after it, quietly costing
+    # two observations, whereas aligning first drops the gap date and books
+    # the move across it as one period. That is the split `prices_to_returns`
+    # documents and hands to "the alignment step"; this is that step.
+    prices, alignment = align_panel(prices, method="common")
+    returns = prices_to_returns(prices)
+    # Nothing is missing after alignment, so a NaN surviving here is a
+    # degenerate price rather than a listing date. Counting it keeps the
+    # guard without restoring the silence.
+    n_rows = len(returns)
+    returns = returns.dropna(how="any")
+    if len(returns) < n_rows:
+        alignment.append(
+            f"Dropped {n_rows - len(returns)} period(s) whose return could "
+            "not be computed from the aligned prices."
+        )
+    # Unconditionally on stderr: stdout is the parsed stream under
+    # `--json`, and a truncated sample is not an advanced-mode detail.
+    for action in alignment:
+        print(f"  Alignment: {action}", file=sys.stderr)
     if returns.empty:
         return _fail(args, "No usable returns after alignment.")
     if config.expected_returns:
@@ -951,7 +1218,12 @@ def _prepare_inputs(args: argparse.Namespace) -> _Inputs | int:
         return _fail(args, f"Benchmark error: {exc}")
 
     return _Inputs(
-        config=config, prices=prices, returns=returns, quality=quality, volumes=volumes
+        config=config,
+        prices=prices,
+        returns=returns,
+        quality=quality,
+        volumes=volumes,
+        alignment=alignment,
     )
 
 
@@ -1007,6 +1279,8 @@ def _cmd_backtest(args: argparse.Namespace) -> int:
         run_backtest,
     )
     from optimization_engine.backtest.spec import SpecValidationError
+    from optimization_engine.optimizers.audit import MandateViolationError
+    from optimization_engine.universe.signal import UniverseError
 
     inputs = _prepare_inputs(args)
     if isinstance(inputs, int):
@@ -1014,6 +1288,12 @@ def _cmd_backtest(args: argparse.Namespace) -> int:
     config, prices, returns, volumes = (
         inputs.config, inputs.prices, inputs.returns, inputs.volumes
     )
+    alignment = inputs.alignment
+    if _load_stress_into(config, args) != 0:
+        return 2
+    universe = _load_universe_for(args, returns, prices)
+    if isinstance(universe, int):
+        return universe
 
     try:
         spec = BacktestSpec(
@@ -1054,6 +1334,11 @@ def _cmd_backtest(args: argparse.Namespace) -> int:
 
     try:
         run = run_engine(evaluation, config, check_feasibility=False)
+    except MandateViolationError as exc:
+        # --strict-mandate on the anchor solve. Every per-window refusal is
+        # caught inside the walk-forward and recorded as a failed solve, but
+        # this one is outside it and would otherwise leak a traceback.
+        return _fail(args, f"The initial solve was refused: {exc}")
     except SolverFailure as exc:
         return _fail(args, f"The initial solve failed: {exc}")
     try:
@@ -1064,7 +1349,20 @@ def _cmd_backtest(args: argparse.Namespace) -> int:
             expanding=args.expanding,
             prices=prices,
             volumes=volumes,
+            universe=universe,
+            # Only when there is a universe to read it under. Passed with no
+            # universe the runner logs that the policy decides nothing, which
+            # is noise on every run that does not use the feature.
+            universe_policy=args.universe_policy if universe is not None else None,
+            delisting_grace=args.delisting_grace,
         )
+    except UniverseError as exc:
+        # The 'raise' collapse policy lands here, and it is the one case where
+        # the message has to say which flag chose it: a run that stopped
+        # because a warm-up period could not be evaluated has not found a
+        # problem with the data.
+        print(f"Universe failed: {exc}", file=sys.stderr)
+        return 2
     except ValueError as exc:
         print(f"Walk-forward failed: {exc}", file=sys.stderr)
         return 2
@@ -1084,6 +1382,10 @@ def _cmd_backtest(args: argparse.Namespace) -> int:
         print(f"Sweep skipped: {exc}", file=sys.stderr)
         sweep_spec = None
     if sweep_spec is not None:
+        # The grid is evaluated under the *same* universe as the headline run.
+        # Its cell Sharpes are what the deflated Sharpe is deflated against, so
+        # a grid run on the survivors while the run itself was screened would
+        # deflate one universe's result by another universe's dispersion.
         sweep_results = run.sweep(
             sweep_spec,
             lookback=args.lookback,
@@ -1092,9 +1394,12 @@ def _cmd_backtest(args: argparse.Namespace) -> int:
             expanding=args.expanding,
             prices=prices,
             volumes=volumes,
+            universe=universe,
+            universe_policy=args.universe_policy if universe is not None else None,
+            delisting_grace=args.delisting_grace,
         )
         print(f"  {sweep_results.describe()}")
-        n_trials = max(sweep_results.n_ok, 1)
+        n_trials = max(sweep_results.n_cells, 1)
         trial_sharpes = sweep_results.trial_sharpes()
         try:
             overfitting = sweep_results.overfitting_report()
@@ -1103,15 +1408,24 @@ def _cmd_backtest(args: argparse.Namespace) -> int:
         else:
             print(f"  {overfitting.describe()}")
 
-    sheet = run.tearsheet(
-        walk.run,
-        n_trials=n_trials if sweep_results is not None else None,
-        trial_sharpes=trial_sharpes,
-        overfitting=overfitting,
-    )
+    try:
+        sheet = run.tearsheet(
+            walk.run,
+            n_trials=n_trials if sweep_results is not None else None,
+            trial_sharpes=trial_sharpes,
+            overfitting=overfitting,
+        )
+    except StressError as exc:
+        # ``tearsheet`` applies ``config.stress`` to the book the walk-forward
+        # ended on, so a shock naming an asset outside the panel surfaces here
+        # rather than at the solve.
+        print(f"Stress test failed: {exc}", file=sys.stderr)
+        return 2
     print(f"  {sheet.tca.describe()}")
     if sheet.deflated_sharpe is not None:
         print(f"  {sheet.deflated_sharpe.describe()}")
+    if sheet.stress is not None:
+        print(sheet.stress.describe())
     for caveat in sheet.caveats:
         print(f"  ! {caveat}")
 
@@ -1162,6 +1476,7 @@ def _cmd_backtest(args: argparse.Namespace) -> int:
             walk.run,
             tearsheet=sheet,
             output_path=str(out) if out is not None else None,
+            alignment=alignment,
         ),
     )
     return 0
@@ -1173,11 +1488,15 @@ def _cmd_check(args: argparse.Namespace) -> int:
         covariance_diagnostics,
         covariance_from_config,
     )
+    from optimization_engine.optimizers._cvxpy_helpers import accepting_inaccurate
     from optimization_engine.optimizers.factory import (
         constraints_from_config,
         effective_expected_returns,
     )
-    from optimization_engine.optimizers.feasibility import analyze_feasibility
+    from optimization_engine.optimizers.feasibility import (
+        STAGE_STRUCTURAL,
+        analyze_feasibility,
+    )
 
     inputs = _prepare_inputs(args)
     if isinstance(inputs, int):
@@ -1185,6 +1504,7 @@ def _cmd_check(args: argparse.Namespace) -> int:
     config, prices, returns, quality = (
         inputs.config, inputs.prices, inputs.returns, inputs.quality
     )
+    alignment = inputs.alignment
 
     print("== Data quality ==")
     print(quality.describe())
@@ -1215,24 +1535,53 @@ def _cmd_check(args: argparse.Namespace) -> int:
     # zeros, when the config carries no expected_returns block — would have
     # this command validate a mandate the optimizer never sees.
     mu = resolve_expected_returns(config, returns, cov)
-    report = analyze_feasibility(
-        list(returns.columns),
-        constraints_from_config(config, list(returns.columns)),
-        expected_returns=effective_expected_returns(config, cov, mu),
-        cov_matrix=cov,
-    )
-    print(report.describe())
-    if report.min_return is not None:
-        line = (
-            f"Reachable expected return: {report.min_return:.2%} to "
-            f"{report.max_return:.2%}"
+    # The reachable-return LPs run on the same solver chain as the solve, so
+    # they inherit the same refusal of an unverified answer. ``check`` builds
+    # no optimizer, so there is no constructor to carry the setting down --
+    # the scope is opened here instead, which is what keeps the pre-flight
+    # and the solve answering the same question.
+    with accepting_inaccurate(config.optimizer.accept_inaccurate):
+        report = analyze_feasibility(
+            list(returns.columns),
+            constraints_from_config(config, list(returns.columns)),
+            expected_returns=effective_expected_returns(config, cov, mu),
+            cov_matrix=cov,
         )
+    # Fatal findings and warnings print differently on purpose: the whole
+    # point of the two-stage analysis is that "no allocation satisfies these
+    # constraints" and "the solver could not answer" are different answers,
+    # and a reader who cannot tell them apart is back where they started.
+    for issue in report.fatal_issues:
+        print(f"  x {issue.message}")
+        if issue.suggestion:
+            print(f"    -> {issue.suggestion}")
+    for issue in report.warnings:
+        print(f"  ! {issue.message}")
+        if issue.suggestion:
+            print(f"    -> {issue.suggestion}")
+    if not report.issues:
+        print("  Constraints are satisfiable.")
+
+    if report.reachable_return is not None:
+        low, high = report.reachable_return
+        line = f"Reachable expected return: {low:.2%} to {high:.2%}"
         if report.min_variance_return is not None:
             line += f" (efficient above {report.min_variance_return:.2%})"
         print(line)
+    elif report.stage_reached == STAGE_STRUCTURAL and not report.fatal_issues:
+        # Saying nothing here would let "Ready to optimize." read as though a
+        # return target had been validated against a reachable range that was
+        # never computed.
+        print(
+            "Reachable expected return: not computed — "
+            "the range needs a solver and none answered."
+        )
 
-    _capture(args, check_payload(quality, report, diag))
-    if quality.errors or not report.is_feasible:
+    _capture(args, check_payload(quality, report, diag, alignment=alignment))
+    if report.fatal_issues:
+        print("\nNot ready to optimize.", file=sys.stderr)
+        return 2
+    if quality.errors:
         print("\nNot ready to optimize.", file=sys.stderr)
         return 1
     print("\nReady to optimize.")

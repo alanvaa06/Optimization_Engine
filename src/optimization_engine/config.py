@@ -17,6 +17,7 @@ import yaml
 
 from optimization_engine.benchmark import BenchmarkSpec
 from optimization_engine.constraints import ConstraintLayer, coerce_layers
+from optimization_engine.stress import Shock, shocks_from_dicts, shocks_to_dicts
 
 
 @dataclass
@@ -54,6 +55,15 @@ class OptimizerSpec:
         nco_objective: Objective solved at both NCO layers.
         nco_detone_for_clustering: Strip the market eigenvector before
             clustering in NCO.
+        accept_inaccurate: Take an ``optimal_inaccurate`` answer when no
+            solver in the fallback chain converges exactly. ``False`` — the
+            default — refuses it: the run raises rather than report weights
+            no solver would vouch for as though they were optimal. Set it to
+            ``True`` only having decided that an approximate book is more
+            use than no book, and read ``solver_status`` on the result, which
+            says which one you got. It is a no-op for the methods that never
+            call a solver (HRP, HERC and the naive weightings); it *does*
+            reach NCO, whose two layers are solved by real optimizers.
     """
 
     name: str = "mean_variance"
@@ -79,6 +89,7 @@ class OptimizerSpec:
     nco_detone_for_clustering: bool = True
     bl_market_return: float | None = None
     bl_calibrate_risk_aversion: bool = False
+    accept_inaccurate: bool = False
     extra: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -102,10 +113,44 @@ _CONFIG_KEYS = frozenset(
         "expected_returns_method", "ema_span", "market_return", "market_weights",
         "optimizer", "benchmark", "benchmark_weights", "max_tracking_error",
         "max_active_share", "long_only", "fully_invested", "leverage",
-        "previous_weights", "turnover_limit",
+        "previous_weights", "turnover_limit", "strict_mandate", "stress",
     }
 )
 _OPTIMIZER_KEYS = frozenset(OptimizerSpec.__dataclass_fields__)
+
+#: Where a config's expected-return vocabulary differs from the estimator's.
+#: ``EngineConfig`` says ``historical_mean``; the estimator in
+#: :mod:`optimization_engine.data.covariance` calls the same thing ``mean``.
+#: Every other name is shared. One entry, but it was written out inline in
+#: four separate places, so a name added on one side quietly failed to reach
+#: the other.
+_EXPECTED_RETURN_METHOD_ALIASES: dict[str, str] = {"historical_mean": "mean"}
+
+
+def expected_return_method_for_estimator(method: str) -> str:
+    """Translate a config's expected-return method into an estimator name.
+
+    Args:
+        method: The value of ``EngineConfig.expected_returns_method``.
+
+    Returns:
+        The corresponding
+        :data:`~optimization_engine.data.covariance.ExpectedReturnMethod`.
+        Unknown names pass through untouched so
+        :func:`~optimization_engine.data.covariance.expected_returns_from_history`
+        raises with its own message rather than this one guessing.
+    """
+    return _EXPECTED_RETURN_METHOD_ALIASES.get(method, method)
+
+
+#: How ``EngineConfig`` seeds expected returns. Named rather than written
+#: inline on the field, so a caller can read the vocabulary without resolving
+#: the class's annotations: ``typing.get_type_hints(EngineConfig)`` evaluates
+#: every annotation on the class, and several use PEP 604 unions, which are a
+#: runtime ``TypeError`` on the 3.9 this package still supports.
+ExpectedReturnsMethod = Literal[
+    "historical_mean", "geometric_mean", "ema", "capm", "shrunk_mean"
+]
 
 
 @dataclass
@@ -142,8 +187,14 @@ class EngineConfig:
             appropriate for the clustering methods, not for solves that
             invert it.
         expected_returns_method: How to seed expected returns when
-            ``expected_returns`` is empty: ``historical_mean``, ``ema``,
-            or ``capm``.
+            ``expected_returns`` is empty: ``historical_mean`` (the
+            annualized *arithmetic* mean, which is the single-period
+            expectation mean-variance is defined against),
+            ``geometric_mean`` (the compound growth rate — a different
+            question, and inconsistent with an arithmetic covariance),
+            ``ema``, ``shrunk_mean`` or ``capm``. The names map onto
+            :data:`~optimization_engine.data.covariance.EXPECTED_RETURN_DESCRIPTIONS`
+            via :func:`expected_return_method_for_estimator`.
         ema_span: Span for the ``ema`` method.
         market_return: Optional CAPM market return (defaults to estimated).
         market_weights: Optional CAPM market portfolio (defaults to equal).
@@ -175,6 +226,25 @@ class EngineConfig:
         turnover_limit: Cap on ``Σ|w_i − w_prev,i|``. Honoured by the
             mean-variance family and mean-CVaR; the homogeneous solves
             (max-Sharpe, max-diversification, risk parity) warn instead.
+        strict_mandate: Refuse a book that breaches the mandate instead of
+            reporting the breach. Off by default, which is the engine's
+            long-standing contract: the post-solve audit is attached to the
+            result and to ``run.warnings``, and the caller decides. Turning it
+            on raises
+            :class:`~optimization_engine.optimizers.audit.MandateViolationError`
+            on any violation past tolerance. It matters most for the methods
+            that apply bounds by projection — HRP, HERC, NCO, the naive
+            weightings — which can return a book their mandate does not permit;
+            a turnover budget or a tracking-error cap is dropped by the
+            projection entirely, and this is what turns that from a warning
+            into a stop.
+        stress: Named one-period shock scenarios for the pre-trade stress
+            report — see :mod:`optimization_engine.stress`. Applied by
+            ``run_engine(..., run_stress=True)`` and by
+            :meth:`~optimization_engine.engine.EngineRun.tearsheet`; empty runs
+            no stress test. Entries may be given as
+            :class:`~optimization_engine.stress.Shock` objects or as the
+            mappings they serialize to, and are normalized to the former.
     """
 
     expected_returns: dict[str, float] = field(default_factory=dict)
@@ -191,9 +261,7 @@ class EngineConfig:
     denoise_method: str = "constant_residual"
     denoise_alpha: float = 0.0
     detone: int = 0
-    expected_returns_method: Literal[
-        "historical_mean", "ema", "capm", "shrunk_mean"
-    ] = "historical_mean"
+    expected_returns_method: ExpectedReturnsMethod = "historical_mean"
     ema_span: int = 180
     market_return: float | None = None
     market_weights: dict[str, float] | None = None
@@ -207,18 +275,27 @@ class EngineConfig:
     leverage: float | None = None
     previous_weights: dict[str, float] | None = None
     turnover_limit: float | None = None
+    strict_mandate: bool = False
+    stress: tuple[Shock, ...] = ()
 
     def __post_init__(self) -> None:
-        """Coerce the constraint layers into their canonical form.
+        """Coerce the constraint layers and the stress scenarios into canonical form.
 
         A config loaded from YAML has mappings where one built in memory has
-        :class:`~optimization_engine.constraints.ConstraintLayer` objects; after
-        this they behave identically.
+        :class:`~optimization_engine.constraints.ConstraintLayer` and
+        :class:`~optimization_engine.stress.Shock` objects; after this they
+        behave identically. It runs on direct construction too, so
+        ``EngineConfig(stress=[{"name": ..., "returns": ...}])`` is as valid as
+        the loaded form, and a malformed scenario is refused where it was
+        written rather than at the solve.
 
         Raises:
             LayerConfigurationError: If any layer entry is malformed.
+            StressError: If any stress entry is malformed, or two scenarios
+                share a name.
         """
         self.constraint_layers = list(coerce_layers(self.constraint_layers))
+        self.stress = shocks_from_dicts(self.stress)
 
     @property
     def assets(self) -> list[str]:
@@ -313,6 +390,12 @@ class EngineConfig:
                 dict(self.previous_weights) if self.previous_weights else None
             ),
             "turnover_limit": self.turnover_limit,
+            "strict_mandate": self.strict_mandate,
+            # Plain mappings, not ``Shock`` objects: this dict is
+            # ``yaml.safe_dump``-ed by ``save_config`` and by the app's config
+            # panel, and ``json.dumps``-ed by ``config_signature``. A dataclass
+            # here would make every one of those raise a representer error.
+            "stress": shocks_to_dicts(self.stress),
         }
 
     @classmethod
@@ -334,6 +417,8 @@ class EngineConfig:
                 used to load cleanly and simply not constrain anything.
             LayerConfigurationError: If a constraint layer is malformed.
             BenchmarkError: If the benchmark block is malformed.
+            StressError: If the ``stress`` block is not a list of scenario
+                mappings, one of them is malformed, or two share a name.
         """
         from optimization_engine.optimizers import ConfigurationError
 
@@ -407,6 +492,8 @@ class EngineConfig:
                 if data.get("turnover_limit") is not None
                 else None
             ),
+            strict_mandate=bool(data.get("strict_mandate", False)),
+            stress=shocks_from_dicts(data.get("stress")),
         )
 
 

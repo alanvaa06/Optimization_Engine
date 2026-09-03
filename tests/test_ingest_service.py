@@ -780,6 +780,98 @@ def test_an_interrupted_write_leaves_nothing_a_later_run_would_trust(
     assert list(tmp_path.iterdir()) == []
 
 
+def test_a_refused_publish_is_retried_rather_than_reported_as_a_failure(
+    tmp_path, monkeypatch
+):
+    """Windows refuses ``os.replace`` while anyone else holds the target open.
+
+    ``PermissionError`` (``WinError 5``) there means "come back in a moment",
+    not "this write failed": a reader mid-``load`` is enough to trigger it,
+    which is why the two concurrency tests in this section lose a handful of
+    their writers on Windows. POSIX renames straight over an open file, so the
+    refusal has to be simulated — there is no way to provoke it on the
+    platform CI runs on.
+    """
+    from optimization_engine.ingest import cache as cache_module
+
+    cache = PanelCache(tmp_path)
+    panel = _panel_for("AAA", volume=True)
+
+    real_replace = cache_module.os.replace
+    attempts = []
+
+    def refuse_the_first_two(src, dst):
+        attempts.append(1)
+        if len(attempts) <= 2:
+            raise PermissionError(5, "Access is denied")
+        real_replace(src, dst)
+
+    monkeypatch.setattr(cache_module.os, "replace", refuse_the_first_two)
+    assert cache.store("samekey", panel) is True
+    monkeypatch.undo()
+
+    assert len(attempts) == 3, "the third attempt should have been the one that landed"
+    loaded = cache.load("samekey")
+    assert loaded is not None
+    pd.testing.assert_frame_equal(loaded[0].prices(), panel.prices())
+    # The staging file was renamed away, not left behind next to the entry.
+    assert list(tmp_path.iterdir()) == [cache.path_for("samekey")]
+
+
+def test_a_publish_lost_to_another_writer_of_the_same_key_is_still_a_success(
+    tmp_path, monkeypatch
+):
+    """Losing the race to a writer of the *same* key is a hit, not a failure.
+
+    The key is the request fingerprint, which covers everything that affects
+    the data, so the entry the other writer published is the entry this call
+    would have written. What the caller asked for is an entry under this key,
+    and there is one.
+    """
+    from optimization_engine.ingest import cache as cache_module
+
+    cache = PanelCache(tmp_path)
+    panel = _panel_for("AAA", volume=True)
+    assert cache.store("samekey", panel) is True  # the writer that wins the race
+    already_published = cache.path_for("samekey").read_bytes()
+
+    attempts = []
+
+    def always_refuse(src, dst):
+        attempts.append(1)
+        raise PermissionError(5, "Access is denied")
+
+    monkeypatch.setattr(cache_module.os, "replace", always_refuse)
+    assert cache.store("samekey", panel) is True
+    monkeypatch.undo()
+
+    assert len(attempts) == 5, "five attempts before conceding the race"
+    # The entry that was already there is untouched — no half-published mix of
+    # the two — and the staging file this call built is gone.
+    assert cache.path_for("samekey").read_bytes() == already_published
+    assert list(tmp_path.iterdir()) == [cache.path_for("samekey")]
+    assert cache.load("samekey") is not None
+
+
+def test_a_publish_that_is_never_permitted_and_lands_nothing_reports_failure(
+    tmp_path, monkeypatch
+):
+    """No entry afterwards is a failed write, retries or not — and no leftovers."""
+    from optimization_engine.ingest import cache as cache_module
+
+    def always_refuse(src, dst):
+        raise PermissionError(5, "Access is denied")
+
+    cache = PanelCache(tmp_path)
+    monkeypatch.setattr(cache_module.os, "replace", always_refuse)
+    assert cache.store("samekey", _panel_for("AAA", volume=True)) is False
+    monkeypatch.undo()
+
+    assert cache.load("samekey") is None
+    assert not cache.path_for("samekey").exists()
+    assert list(tmp_path.iterdir()) == []
+
+
 def test_clear_removes_entries_and_the_directories_version_one_wrote(tmp_path):
     cache = PanelCache(tmp_path)
     cache.store("k1", _panel_for("AAA", volume=True))

@@ -195,6 +195,93 @@ def test_denoise_covariance_preserves_the_volatilities(returns: pd.DataFrame):
     assert list(denoised.columns) == list(cov.columns)
 
 
+def test_denoise_ewma_uses_effective_observations(returns: pd.DataFrame):
+    """EWMA leans on ~1/(1−λ) observations, not on every row it was handed.
+
+    Feeding the row count to the Marchenko-Pastur fit treats 1000 rows of
+    exponentially-decayed history as 1000 independent observations, which
+    puts the noise edge far too low and classes almost every eigenvalue as
+    signal. The two numbers used to disagree silently: the diagnostics
+    warned about a ~17-observation sample while the denoiser was told it had
+    a thousand.
+    """
+    plain = covariance_matrix(returns, method="sample", denoise=True)
+    ewma = covariance_matrix(returns, method="ewma", denoise=True)
+    plain_report = plain.attrs["denoise_report"]
+    ewma_report = ewma.attrs["denoise_report"]
+
+    # Both saw the same panel...
+    assert plain_report.n_observations == len(returns)
+    assert ewma_report.n_observations == len(returns)
+    # ...but only one of them leant on all of it.
+    assert plain_report.n_observations_effective == plain_report.n_observations
+    assert ewma_report.n_observations_effective < ewma_report.n_observations
+    assert ewma_report.n_observations_effective == round(1 / (1 - 0.94))
+
+    # A shorter effective sample means a wider noise band, so the edge moves
+    # up and fewer eigenvalues survive as signal.
+    assert ewma_report.q < plain_report.q
+    assert ewma_report.eigenvalue_cutoff > plain_report.eigenvalue_cutoff
+    assert ewma_report.n_signal_eigenvalues <= plain_report.n_signal_eigenvalues
+    assert "effective observations" in ewma_report.describe()
+    assert "λ = 0.94" in ewma_report.describe()
+
+
+def test_denoise_ewma_refuses_a_universe_wider_than_its_effective_sample():
+    """T/N below 1 is not a cutoff this fit can find, so it refuses.
+
+    The Marchenko-Pastur law exists for q < 1, but the law *this module
+    fits* does not: the sample correlation is singular there, N−T of its
+    eigenvalues are exactly zero, and ``marchenko_pastur_pdf`` models only
+    the continuous part of the law without the zero atom the true limit
+    carries. Fitting one against the other would return a σ² that is an
+    artefact of the missing atom. The honest answer is to say so.
+    """
+    rng = np.random.default_rng(0)
+    frame = pd.DataFrame(
+        rng.normal(0, 0.01, size=(1000, 25)),
+        columns=[f"a{i}" for i in range(25)],
+    )
+    # A thousand rows: nothing about the panel is short.
+    with pytest.raises(ValueError) as exc:
+        covariance_matrix(frame, method="ewma", denoise=True)
+    message = str(exc.value)
+    # The message has to name the effective sample, or the reader concludes
+    # their loader dropped 983 rows.
+    assert "effective observations" in message
+    assert "from 1000 rows" in message
+    assert "λ = 0.94" in message
+    assert "T/N = 0.68" in message
+    # The same panel denoises fine without the exponential weighting.
+    assert covariance_matrix(frame, method="sample", denoise=True) is not None
+
+
+def test_denoise_ewma_survives_when_the_universe_is_narrow_enough():
+    """Below N = 1/(1−λ) the fit is defined, so it runs rather than refusing."""
+    rng = np.random.default_rng(1)
+    frame = pd.DataFrame(
+        rng.normal(0, 0.01, size=(1000, 8)),
+        columns=[f"a{i}" for i in range(8)],
+    )
+    cov = covariance_matrix(frame, method="ewma", denoise=True)
+    report = cov.attrs["denoise_report"]
+    assert report.n_observations_effective == 17
+    assert report.q == pytest.approx(17 / 8)
+
+
+def test_denoise_report_defaults_effective_to_nominal():
+    """A caller that says nothing about weighting gets T back unchanged."""
+    frame = pd.DataFrame(
+        np.random.default_rng(3).normal(size=(400, 6)),
+        columns=[f"a{i}" for i in range(6)],
+    )
+    _, report = denoise_covariance(frame.cov(), n_observations=400)
+    assert report.n_observations == 400
+    assert report.n_observations_effective == 400
+    assert report.effective_sample_note == ""
+    assert "effective observations" not in report.describe()
+
+
 def test_denoise_covariance_refuses_a_degenerate_sample():
     frame = pd.DataFrame(
         np.random.default_rng(0).normal(size=(5, 8)),

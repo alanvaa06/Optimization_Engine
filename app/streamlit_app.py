@@ -35,10 +35,19 @@ for path in (str(SRC), str(HERE)):
         sys.path.insert(0, path)
 
 from components import (  # noqa: E402
+    ELIGIBILITY_STATES,
+    align_scenario_table,
+    describe_policy_cost,
+    eligibility_state_counts,
+    empty_scenario_table,
+    empty_shock_table,
     format_table,
     metric_row,
     num,
     pct,
+    plot_eligibility_heatmap,
+    plot_universe_breadth,
+    plot_universe_turnover,
     render_assumptions,
     render_benchmark,
     render_compliance,
@@ -49,6 +58,13 @@ from components import (  # noqa: E402
     render_method_card,
     render_portfolio_diagnostics,
     render_projection_distance,
+    render_stress_report,
+    render_universe_notes,
+    shock_dicts_from_tables,
+    tables_from_shocks,
+    thin_rows,
+    unheld_shocked_assets,
+    validated_shock_dicts,
 )
 from data_sources import (  # noqa: E402
     render_empty_state,
@@ -63,7 +79,11 @@ from layer_editor import (  # noqa: E402
     seed_layers_from_config,
 )
 
-from optimization_engine.analytics.performance import rolling_metrics, summary_stats  # noqa: E402
+from optimization_engine.analytics.performance import (  # noqa: E402
+    annualize_returns,
+    rolling_metrics,
+    summary_stats,
+)
 from optimization_engine.analytics.relative import (  # noqa: E402
     active_share,
     summary_relative,
@@ -76,14 +96,20 @@ from optimization_engine.backtest import (  # noqa: E402
     SpecValidationError,
     compute_tca,
     cost_by_asset,
+    run_backtest,
 )
 from optimization_engine.benchmark import BenchmarkError, BenchmarkSpec  # noqa: E402
-from optimization_engine.config import EngineConfig, OptimizerSpec  # noqa: E402
+from optimization_engine.config import (  # noqa: E402
+    EngineConfig,
+    OptimizerSpec,
+    expected_return_method_for_estimator,
+)
 from optimization_engine.data.covariance import (  # noqa: E402
     COVARIANCE_DESCRIPTIONS,
     EXPECTED_RETURN_DESCRIPTIONS,
     covariance_from_config,
     covariance_matrix,
+    expected_returns_from_history,
 )
 from optimization_engine.data.fx import (  # noqa: E402
     FXError,
@@ -141,8 +167,22 @@ from optimization_engine.scenarios import (
 from optimization_engine.scenarios import (
     rename_scenario as _rename_scenario,
 )
+from optimization_engine.stress import (  # noqa: E402
+    StressError,
+    dump_shocks_yaml,
+    load_shocks_yaml,
+    shocks_from_dicts,
+    stress_test,
+)
 from optimization_engine.ui_state import (  # noqa: E402
     derive_widget_state,
+)
+from optimization_engine.universe import (  # noqa: E402
+    MASK_POLICIES,
+    UniverseError,
+    UniverseRules,
+    count_unresolved,
+    load_universe_rules,
 )
 
 # ---------------------------------------------------------------------------
@@ -181,10 +221,29 @@ _DEFAULT_STATE = {
     "walk_forward": None,
     "frontier_uncertainty": None,
     "ingest": None,
+    # The stress grids exist from the first run because ``_build_config``
+    # reads them: a config assembled before the Stress tab has rendered must
+    # still be a config, and an absent key would make it one that quietly
+    # carries no scenarios rather than one that carries none.
+    "stress_shock_table": empty_shock_table(),
+    "stress_scenario_table": empty_scenario_table(),
+    "stress_unknown_assets": "raise",
+    "universe_run_notes": None,
 }
 for key, default in _DEFAULT_STATE.items():
     if key not in st.session_state:
         st.session_state[key] = default
+
+
+def _adopt_shock_tables(shock_rows, scenario_rows) -> None:
+    """Replace both stress grids wholesale — a file load, or a preset.
+
+    Both go together or neither does: a covariance multiplier left over from
+    the scenarios that were on the page a moment ago would attach itself to
+    whichever new scenario happened to take the same name.
+    """
+    st.session_state.stress_shock_table = shock_rows
+    st.session_state.stress_scenario_table = scenario_rows
 
 
 def _seed_table_from_config(cfg) -> None:
@@ -224,6 +283,10 @@ def _seed_table_from_config(cfg) -> None:
         st.session_state.risk_budget = pd.DataFrame(
             {"Risk Budget": pd.Series(cfg.optimizer.risk_budget)}
         )
+    # The scenarios are part of the mandate, not a scratch pad: a config that
+    # declares what a bad day does to the book has to reopen carrying them,
+    # the same way its layered limits do.
+    _adopt_shock_tables(*tables_from_shocks(cfg.stress))
     if getattr(cfg.optimizer, "bl_views", None) and isinstance(
         cfg.optimizer.bl_views, dict
     ):
@@ -262,6 +325,7 @@ if _pending and _pending in st.session_state.scenarios:
     st.session_state["herc_risk_measure"] = str(_cfg.optimizer.herc_risk_measure)
     st.session_state["nco_objective"] = str(_cfg.optimizer.nco_objective)
     st.session_state["nco_detone"] = bool(_cfg.optimizer.nco_detone_for_clustering)
+    st.session_state["accept_inaccurate"] = bool(_cfg.optimizer.accept_inaccurate)
     st.session_state["long_only"] = bool(_cfg.long_only)
     st.session_state["benchmark_kind"] = _cfg.benchmark.kind
     if _cfg.benchmark.asset:
@@ -328,7 +392,14 @@ def _historical_mu_cached(
     periods_per_year: int,
     _returns: pd.DataFrame,
 ) -> pd.Series:
-    return (1 + _returns).prod() ** (periods_per_year / len(_returns)) - 1
+    """Seed the config table's μ column from the library's own estimator.
+
+    The formula used to be written out here as well, which meant the table
+    the analyst edits could disagree with the μ the engine solved against.
+    """
+    return expected_returns_from_history(
+        _returns, method="mean", periods_per_year=periods_per_year
+    )
 
 
 @st.cache_data(show_spinner=False, max_entries=8)
@@ -862,6 +933,26 @@ with st.sidebar:
     if not ws["frontier"]["enabled"]:
         build_frontier = False
 
+    st.divider()
+    with st.expander("9 · Advanced", expanded=False):
+        accept_inaccurate = st.checkbox(
+            "Accept approximate solutions",
+            value=False,
+            key="accept_inaccurate",
+            help=(
+                "Off: a solve that no solver can verify fails, and says so. "
+                "On: the approximate weights are used and flagged in the "
+                "compliance banner. Turn it on only when an indicative book "
+                "is more use than none — the constraints it reports as "
+                "satisfied are satisfied to the solver's own loose tolerance, "
+                "not to yours."
+            ),
+        )
+        st.caption(
+            "Has no effect on HRP, HERC or the naive weightings: they never "
+            "call a solver."
+        )
+
 
 # ---------------------------------------------------------------------------
 # Tabs
@@ -873,7 +964,9 @@ st.markdown("---")
     tab_assets,
     tab_constraints,
     tab_optimize,
+    tab_stress,
     tab_backtest,
+    tab_universe,
     tab_performance,
     tab_compare,
     tab_whatif,
@@ -884,7 +977,9 @@ st.markdown("---")
         "📊 Assets",
         "⚙️ Assumptions & constraints",
         "🚀 Optimize",
+        "💥 Stress",
         "📉 Backtest",
+        "🌍 Universe",
         "🎯 Performance",
         "🆚 Compare",
         "🎚️ What-if",
@@ -1043,7 +1138,9 @@ with tab_constraints:
 
     if ws["expected_returns_method"]["enabled"]:
         st.markdown("**Expected returns**")
-        er_options = ["historical_mean", "shrunk_mean", "ema", "capm"]
+        er_options = [
+            "historical_mean", "geometric_mean", "shrunk_mean", "ema", "capm",
+        ]
         er_method = st.radio(
             "Method",
             options=er_options,
@@ -1058,7 +1155,7 @@ with tab_constraints:
         )
         st.caption(
             EXPECTED_RETURN_DESCRIPTIONS.get(
-                "mean" if er_method == "historical_mean" else er_method, ""
+                expected_return_method_for_estimator(er_method), ""
             )
         )
         if er_method == "ema":
@@ -1095,8 +1192,6 @@ with tab_constraints:
             )
 
         if st.button("Reset μ to method default", key="reset_mu_btn"):
-            from optimization_engine.data.covariance import expected_returns_from_history
-
             mw_for_capm = (
                 pd.Series(st.session_state.market_weights_table["Market weight"])
                 if er_method == "capm"
@@ -1106,7 +1201,7 @@ with tab_constraints:
             try:
                 seeded = expected_returns_from_history(
                     returns,
-                    method=("mean" if er_method == "historical_mean" else er_method),
+                    method=expected_return_method_for_estimator(er_method),
                     periods_per_year=int(periods_per_year),
                     span=int(st.session_state.get("ema_span", 180)),
                     market_return=float(st.session_state.get("market_return") or 0.0) or None,
@@ -1464,6 +1559,21 @@ with tab_constraints:
         )
 
 
+def _current_shock_dicts() -> tuple[list[dict], list[str]]:
+    """The Stress tab's grids as scenario mappings, and what would not parse.
+
+    ``align_scenario_table`` is re-run here rather than trusted from session
+    state because the per-scenario grid is rebuilt one rerun *behind* the leg
+    grid: a scenario renamed and immediately saved would otherwise carry the
+    old name's covariance multiplier into the preset.
+    """
+    rows = st.session_state.get("stress_shock_table")
+    if rows is None or rows.empty:
+        return [], []
+    meta = align_scenario_table(rows, st.session_state.get("stress_scenario_table"))
+    return validated_shock_dicts(shock_dicts_from_tables(rows, meta))
+
+
 def _build_config() -> EngineConfig:
     """Assemble the EngineConfig from every widget and editable table."""
     table = st.session_state.config_table
@@ -1498,6 +1608,7 @@ def _build_config() -> EngineConfig:
         ),
         nco_objective=str(st.session_state.get("nco_objective", "min_variance")),
         nco_detone_for_clustering=bool(st.session_state.get("nco_detone", True)),
+        accept_inaccurate=bool(accept_inaccurate),
     )
 
     if optimizer_name == "risk_parity" and "risk_budget" in st.session_state:
@@ -1599,6 +1710,9 @@ def _build_config() -> EngineConfig:
         leverage=leverage_cap,
         previous_weights=previous_weights,
         turnover_limit=turnover_limit,
+        # Only the scenarios that are scenarios. What did not parse is named
+        # on the Stress tab rather than dropped in silence.
+        stress=_current_shock_dicts()[0],
     )
 
 
@@ -1702,6 +1816,13 @@ with tab_optimize:
         try:
             config = _build_config()
             with st.spinner("Solving…"):
+                # Deliberately without ``run_stress``. The engine applies the
+                # scenarios inside the solve and *raises* on a shock naming an
+                # asset the book cannot hold — correct for a CLI, wrong here,
+                # where it would mean a mistyped scenario destroys a good
+                # allocation. The 💥 Stress tab applies the same scenarios to
+                # the same book through the same ``stress_test`` call, and
+                # shows that refusal as a message instead.
                 st.session_state["last_run"] = run_engine(
                     returns,
                     config,
@@ -2067,6 +2188,192 @@ with tab_optimize:
 
 
 # ---------------------------------------------------------------------------
+# 💥 Stress
+# ---------------------------------------------------------------------------
+
+with tab_stress:
+    st.subheader("What does a named bad day do to this book?")
+    st.caption(
+        "Each scenario is a one-period return shock per asset applied to the "
+        "solved weights: P&L = Σ wᵢ·rᵢ, decomposed back onto the positions "
+        "that produced it. No horizon, no distribution, no simulation — which "
+        "is why the contributions add to the loss exactly rather than "
+        "approximately. An asset a scenario does not name is unmoved, not "
+        "undefined."
+    )
+
+    st.markdown("**Scenarios**")
+    st.caption(
+        "One row per leg: a scenario is its legs, and a name it does not "
+        "mention is unmoved. This book can hold "
+        f"{', '.join(returns.columns)} — a leg on anything else is refused."
+    )
+    st.session_state.stress_shock_table = st.data_editor(
+        st.session_state.stress_shock_table,
+        width="stretch",
+        num_rows="dynamic",
+        hide_index=True,
+        # Keyless, like every other grid on this page and unlike the layered
+        # limits: ``data_editor`` stores its edits against the key as a delta
+        # from the data it was handed, so a keyed dynamic grid replays "add a
+        # row" onto a frame that already has it. Writing the returned frame
+        # back to session state is the whole state model here.
+        column_config={
+            "Scenario": st.column_config.TextColumn(
+                help="Scenario name. Every report line is keyed by it, and "
+                "two legs sharing a name are two legs of one scenario."
+            ),
+            # Deliberately free text rather than a picker over the loaded
+            # universe. A scenario library is written against the world, not
+            # against today's book, and the engine's refusal to apply a shock
+            # to a name that cannot be held is the safeguard — hiding the case
+            # behind a dropdown would hide the safeguard too.
+            "Asset": st.column_config.TextColumn(
+                help="An asset name. One this book does not hold is refused "
+                "rather than zeroed; the message below says so."
+            ),
+            "Shock return": st.column_config.NumberColumn(
+                format="%.4f",
+                help="One-period simple return, as a fraction: -0.32 is a 32% "
+                "fall.",
+            ),
+        },
+    )
+
+    st.session_state.stress_scenario_table = align_scenario_table(
+        st.session_state.stress_shock_table,
+        st.session_state.get("stress_scenario_table"),
+    )
+    if not st.session_state.stress_scenario_table.empty:
+        st.session_state.stress_scenario_table = st.data_editor(
+            st.session_state.stress_scenario_table,
+            width="stretch",
+            num_rows="fixed",
+            column_config={
+                "Covariance ×": st.column_config.NumberColumn(
+                    format="%.2f",
+                    help="What the scenario does to *risk*: a multiple of the "
+                    "base covariance, so 4.00 doubles every volatility with "
+                    "correlations unchanged. Blank leaves risk unstressed.",
+                ),
+                "Notes": st.column_config.TextColumn(
+                    help="Where the numbers came from, or which episode they "
+                    "are calibrated to. Carried into the report."
+                ),
+            },
+        )
+
+    up_left, up_right = st.columns([3, 2])
+    with up_left:
+        shocks_file = st.file_uploader(
+            "⬆ Load scenarios from YAML",
+            type=["yaml", "yml", "json"],
+            key="stress_upload",
+            help="A --stress file, in either shape the CLI accepts: a mapping "
+            "with a 'shocks' list, or a bare list of scenarios.",
+        )
+        if shocks_file is not None:
+            try:
+                uploaded_shocks = load_shocks_yaml(
+                    shocks_file.getvalue().decode("utf-8")
+                )
+            except (StressError, UnicodeDecodeError) as exc:
+                st.error(f"Could not read those scenarios: {exc}")
+            else:
+                digest = (shocks_file.name, len(shocks_file.getvalue()))
+                if st.session_state.get("stress_upload_applied") != digest:
+                    _adopt_shock_tables(*tables_from_shocks(uploaded_shocks))
+                    st.session_state["stress_upload_applied"] = digest
+                    st.success(
+                        f"Loaded {len(uploaded_shocks)} scenario(s) from "
+                        f"{shocks_file.name}."
+                    )
+                    st.rerun()
+
+    shock_dicts, shock_problems = _current_shock_dicts()
+    for problem in shock_problems:
+        st.error(f"Not a scenario yet — {problem}")
+
+    with up_right:
+        st.download_button(
+            "⬇ Download scenarios (YAML)",
+            data=(
+                dump_shocks_yaml(shocks_from_dicts(shock_dicts))
+                if shock_dicts
+                else ""
+            ),
+            file_name="shocks.yaml",
+            mime="text/yaml",
+            disabled=not shock_dicts,
+            width="stretch",
+            help="The same file `optengine optimize --stress` reads.",
+        )
+        st.caption(
+            "Scenarios are part of the configuration, so saving a preset in "
+            "the sidebar saves them with it."
+        )
+
+    st.divider()
+
+    run = st.session_state.get("last_run")
+    if not shock_dicts:
+        st.info(
+            "No scenarios yet. Add a row above, or load a file — "
+            "`config/shocks.yaml` is a worked example over this panel."
+        )
+    elif run is None:
+        st.info(
+            "Run an optimization first — a scenario is applied to a book, and "
+            "there is not one yet."
+        )
+    else:
+        unheld = unheld_shocked_assets(shock_dicts, returns.columns)
+        unknown_policy = st.radio(
+            "A scenario naming an asset this book cannot hold",
+            options=["raise", "ignore"],
+            format_func=lambda p: {
+                "raise": "Refuse the scenario (default)",
+                "ignore": "Apply it anyway, recording what was dropped",
+            }[p],
+            horizontal=True,
+            key="stress_unknown_assets",
+            help=(
+                "The loss a scenario describes on a name the book cannot hold "
+                "cannot reach the book, so applying it anyway reports a "
+                "smaller loss than the scenario says. Refusing is the default "
+                "for that reason; the other option makes the narrowing "
+                "visible rather than assumed."
+            ),
+        )
+        try:
+            report = stress_test(
+                run.result.weights,
+                shocks_from_dicts(shock_dicts),
+                cov_matrix=run.cov_matrix,
+                unknown_assets=unknown_policy,
+            )
+        except StressError as exc:
+            # The library's refusal, shown rather than swallowed: the scenario
+            # is still in the grid, still in the config, and still wrong.
+            st.error(f"**Stress test refused.** {exc}")
+            if unheld:
+                st.markdown(
+                    "\n".join(
+                        f"- **{name}** moves {', '.join(missing)}, which this "
+                        "book does not hold."
+                        for name, missing in unheld.items()
+                    )
+                )
+                st.caption(
+                    "Drop those legs, widen the universe in the sidebar, or "
+                    "switch the choice above to apply the scenario with them "
+                    "recorded as dropped."
+                )
+        else:
+            render_stress_report(report)
+
+
+# ---------------------------------------------------------------------------
 # 📉 Backtest
 # ---------------------------------------------------------------------------
 
@@ -2178,7 +2485,9 @@ with tab_backtest:
                     "Annualized return (net)",
                     pct(
                         float(
-                            (1 + bt.returns).prod() ** (periods_per_year / len(bt.returns)) - 1
+                            annualize_returns(
+                                bt.returns, periods_per_year=int(periods_per_year)
+                            )
                         )
                     ),
                     None,
@@ -2448,9 +2757,9 @@ with tab_backtest:
                         "OOS annualized return",
                         pct(
                             float(
-                                (1 + wf.returns).prod()
-                                ** (periods_per_year / len(wf.returns))
-                                - 1
+                                annualize_returns(
+                                    wf.returns, periods_per_year=int(periods_per_year)
+                                )
                             )
                         ),
                         None,
@@ -2516,6 +2825,381 @@ with tab_backtest:
                 with st.expander(f"{len(wf.failures)} failed re-solve(s)"):
                     for f in wf.failures[:20]:
                         st.text(f)
+
+
+# ---------------------------------------------------------------------------
+# 🌍 Universe
+# ---------------------------------------------------------------------------
+
+#: Falls back to this when ``config/universe.yaml`` is not beside the app —
+#: a screen over nothing but the return panel, so it needs no data files.
+_DEFAULT_UNIVERSE_RULES = """schema_version: 1
+combine: all
+rules:
+  - kind: rolling
+    panel: returns
+    window: 63
+    agg: std
+    op: "<"
+    value: 0.0126
+    name: trailing 63-session volatility under 20% annualized
+"""
+
+_UNIVERSE_EXAMPLE = ROOT / "config" / "universe.yaml"
+
+
+@st.cache_data(show_spinner=False, max_entries=8)
+def _universe_cached(rules_text: str, base_dir: str, returns_hash: str, _returns, _prices):
+    """Parse and evaluate a rules document. Cached on the text, not the object.
+
+    Returns ``(rules, eligibility)``. Raising is left to the caller so the
+    error lands on the page beside the text box that caused it.
+    """
+    import yaml as _yaml
+
+    try:
+        document = _yaml.safe_load(rules_text)
+    except _yaml.YAMLError as exc:
+        # Re-raised as the package's own error so the caller has one except
+        # clause rather than two, and so a syntax slip reads like every other
+        # thing wrong with the document.
+        raise UniverseError(f"That is not readable YAML: {exc}") from exc
+    if document is None:
+        raise UniverseError("The rules document is empty.")
+    rules = UniverseRules.from_dict(document, base_dir=Path(base_dir))
+    return rules, rules.build(returns=_returns, prices=_prices)
+
+
+with tab_universe:
+    st.subheader("Who was investable, and when?")
+    st.caption(
+        "Every other tab takes the universe from the columns of the return "
+        "panel — the universe as it looks *today*. Names that were delisted "
+        "or dropped from the index never appear, and the ones that were added "
+        "appear from the first day of the sample. That is survivorship bias "
+        "and look-ahead in the same panel, and no amount of care in the "
+        "optimizer removes it. A rules file puts the missing axis back."
+    )
+
+    if "universe_rules_text" not in st.session_state:
+        st.session_state["universe_rules_text"] = (
+            _UNIVERSE_EXAMPLE.read_text(encoding="utf-8")
+            if _UNIVERSE_EXAMPLE.exists()
+            else _DEFAULT_UNIVERSE_RULES
+        )
+        st.session_state["universe_rules_base"] = str(
+            _UNIVERSE_EXAMPLE.parent if _UNIVERSE_EXAMPLE.exists() else ROOT
+        )
+
+    path_col, load_col = st.columns([4, 1], vertical_alignment="bottom")
+    with path_col:
+        rules_path = st.text_input(
+            "Rules file on disk",
+            value=str(_UNIVERSE_EXAMPLE),
+            key="universe_rules_path",
+            help=(
+                "Loaded through the library's own reader, which validates the "
+                "whole document before touching any data — and resolves a "
+                "characteristic panel's relative path against *this file's* "
+                "directory, which is the one thing an uploaded copy cannot do."
+            ),
+        )
+    with load_col:
+        load_rules_clicked = st.button(
+            "Load", key="universe_load_path", width="stretch"
+        )
+    if load_rules_clicked:
+        try:
+            loaded_rules = load_universe_rules(rules_path)
+        except (UniverseError, OSError) as exc:
+            st.error(f"Could not read {rules_path}: {exc}")
+        else:
+            st.session_state["universe_rules_text"] = Path(rules_path).read_text(
+                encoding="utf-8"
+            )
+            st.session_state["universe_rules_base"] = str(
+                Path(rules_path).resolve().parent
+            )
+            st.success(
+                f"Loaded {len(loaded_rules.rules)} rule(s) from {rules_path}."
+            )
+            st.rerun()
+
+    rules_file = st.file_uploader(
+        "⬆ Rules file (YAML/JSON)",
+        type=["yaml", "yml", "json"],
+        key="universe_upload",
+        help=(
+            "The same --universe file the CLI reads. A rules document that "
+            "screens on a characteristic panel — ADV, market capitalisation — "
+            "names that panel's path itself, which is why the data comes with "
+            "the rules rather than behind a second control."
+        ),
+    )
+    if rules_file is not None:
+        digest = (rules_file.name, len(rules_file.getvalue()))
+        if st.session_state.get("universe_upload_applied") != digest:
+            st.session_state["universe_rules_text"] = rules_file.getvalue().decode(
+                "utf-8", errors="replace"
+            )
+            # An uploaded document has no directory of its own, so a relative
+            # panel path in it has nothing to resolve against. Saying so is
+            # better than resolving it against a directory it never meant.
+            st.session_state["universe_rules_base"] = str(ROOT)
+            st.session_state["universe_upload_applied"] = digest
+            st.rerun()
+
+    # Keyed on the session value itself, so replacing the text from the
+    # uploader or the path loader actually redraws the box: a keyed widget's
+    # own state wins over a ``value=`` argument on every rerun after the first.
+    rules_text = st.text_area(
+        "Rules",
+        height=260,
+        key="universe_rules_text",
+        help="Edited here, evaluated as soon as the box loses focus.",
+    )
+
+    universe = None
+    try:
+        parsed_rules, universe = _universe_cached(
+            rules_text,
+            st.session_state["universe_rules_base"],
+            _frame_hash(returns),
+            returns,
+            prices.reindex(returns.index),
+        )
+    except (UniverseError, OSError, ValueError) as exc:
+        st.error(f"**These rules do not describe a universe.** {exc}")
+    else:
+        st.caption(parsed_rules.describe())
+
+    if universe is not None:
+        eligibility_frame = universe.frame.reindex(columns=list(returns.columns))
+        counts = eligibility_state_counts(eligibility_frame)
+        cells, bars, decided_names = count_unresolved(
+            universe, returns.index, list(returns.columns)
+        )
+
+        st.divider()
+        st.markdown("**How the unknowns are read**")
+        st.caption(
+            "There is deliberately no default. `exclude` quietly shrinks the "
+            "book across every warm-up, `include` quietly admits names no "
+            "rule has screened, and `raise` stops any run whose rules have a "
+            "warm-up at all. Which of those is wrong depends on the mandate, "
+            "so this page will not choose one for you."
+        )
+        policy = st.radio(
+            "Collapse policy",
+            options=list(MASK_POLICIES),
+            index=None,
+            horizontal=True,
+            key="universe_policy",
+            format_func=lambda p: {
+                "exclude": "exclude — unknown means not eligible",
+                "include": "include — unknown means eligible",
+                "raise": "raise — refuse to guess",
+            }[p],
+        )
+        st.info(describe_policy_cost(policy, cells, bars, decided_names))
+
+        st.divider()
+        st.markdown("**Eligibility, three states**")
+        metric_row(
+            [
+                (label, f"{counts[label]:,} cells", None)
+                for label in ELIGIBILITY_STATES
+            ]
+            + [
+                (
+                    "Names the policy decides",
+                    f"{len(decided_names):,}",
+                    "Assets touched by at least one cell no rule reached.",
+                )
+            ]
+        )
+        heatmap_frame, step = thin_rows(eligibility_frame, 400)
+        st.plotly_chart(
+            plot_eligibility_heatmap(heatmap_frame), width="stretch"
+        )
+        st.caption(
+            (
+                f"Every {step}th bar is drawn, ending on the last one — "
+                "sampled, not aggregated, because there is no honest way to "
+                "collapse a fortnight containing both an eligible and an "
+                "unevaluated day into one cell. "
+                if step > 1
+                else ""
+            )
+            + "Amber is *not evaluable*: no rule reached that cell. It is a "
+            "third state, not a shade of ineligible — reading it as "
+            "'excluded' is exactly the mistake the colour exists to prevent."
+        )
+
+        st.markdown("**Breadth and churn**")
+        st.plotly_chart(
+            plot_universe_breadth(universe.breadth(), universe.unknown_count()),
+            width="stretch",
+        )
+        turnover = universe.turnover()
+        st.plotly_chart(plot_universe_turnover(turnover), width="stretch")
+        st.caption(
+            f"{int(turnover['entries'].sum()):,} entries and "
+            f"{int(turnover['exits'].sum()):,} exits over the sample. Only "
+            "transitions between two *evaluated* states count: a name going "
+            "from unknown to eligible has not entered the universe, it has "
+            "become knowable."
+        )
+
+        st.markdown("**Why was a name in or out?**")
+        index_dates = pd.DatetimeIndex(universe.index)
+        first_day, last_day = index_dates[0].date(), index_dates[-1].date()
+        universe_assets = [str(a) for a in universe.assets]
+        # Both controls are keyed, so their remembered value outlives the
+        # universe that produced it: edit the rules, or reload the panel, and
+        # yesterday's date or a name this universe never heard of would be
+        # handed back to a widget that refuses it. Reset rather than raise.
+        if not (first_day <= st.session_state.get(
+            "universe_explain_date", last_day
+        ) <= last_day):
+            st.session_state["universe_explain_date"] = last_day
+        if st.session_state.get("universe_explain_asset") not in universe_assets:
+            st.session_state.pop("universe_explain_asset", None)
+        e1, e2 = st.columns([1, 1])
+        with e1:
+            explain_date = st.date_input(
+                "As of",
+                value=last_day,
+                min_value=first_day,
+                max_value=last_day,
+                key="universe_explain_date",
+            )
+        with e2:
+            explain_asset = st.selectbox(
+                "Asset",
+                options=universe_assets,
+                key="universe_explain_asset",
+            )
+        try:
+            st.info(universe.explain(explain_date, explain_asset))
+        except UniverseError as exc:
+            st.warning(str(exc))
+
+        st.divider()
+        st.markdown("**Apply it to a run**")
+        run = st.session_state.get("last_run")
+        if run is None:
+            st.info("Run an optimization first — a universe is applied to a book.")
+        elif policy is None:
+            st.info(
+                "Choose a collapse policy above. A run needs one, and the "
+                "library will not pick it either."
+            )
+        else:
+            universe_mode = st.radio(
+                "How to apply it",
+                options=["replay", "walk_forward"],
+                horizontal=True,
+                key="universe_mode",
+                format_func=lambda m: {
+                    "replay": "Replay this book under the universe",
+                    "walk_forward": "Re-solve each window inside the universe",
+                }[m],
+                help=(
+                    "The replay keeps the weights already solved and only "
+                    "sells what the universe stops admitting. The "
+                    "walk-forward re-optimizes inside the eligible set at "
+                    "each decision, which is the honest version and the "
+                    "slower one."
+                ),
+            )
+            u1, u2 = st.columns([1, 1])
+            with u1:
+                universe_frequency = st.selectbox(
+                    "Rebalancing",
+                    options=["monthly", "quarterly", "annual", "weekly", "none"],
+                    index=0,
+                    format_func=lambda f: f.title() if f != "none" else "Buy and hold",
+                    key="universe_frequency",
+                    help=(
+                        "Eligibility is read at each *decision*, never at the "
+                        "execution, so a rebalance acts on the universe the "
+                        "desk could see when it chose the target."
+                    ),
+                )
+            with u2:
+                if universe_mode == "walk_forward":
+                    delisting_grace = st.number_input(
+                        "Delisting grace (bars of silence)",
+                        min_value=0, max_value=250, value=5, step=1,
+                        key="universe_delisting_grace",
+                        help=(
+                            "A separate opt-in from the screen, because it "
+                            "answers a different question: the universe says "
+                            "what the mandate permits, this says what still "
+                            "trades. A name silent for longer than this is "
+                            "liquidated at its last print and never traded "
+                            "again."
+                        ),
+                    )
+                    universe_lag = 1
+                else:
+                    delisting_grace = None
+                    universe_lag = st.number_input(
+                        "Execution lag (periods)",
+                        min_value=0, max_value=10, value=1, step=1,
+                        key="universe_lag",
+                    )
+            if st.button("Run it", key="run_universe"):
+                spec = BacktestSpec(
+                    frequency=universe_frequency,
+                    execution_lag=int(universe_lag),
+                    periods_per_year=int(periods_per_year),
+                )
+                try:
+                    with st.spinner("Applying the universe…"):
+                        if universe_mode == "walk_forward":
+                            universe_result = run.walk_forward_run(
+                                spec=spec,
+                                rebalance_frequency=universe_frequency,
+                                universe=universe,
+                                universe_policy=policy,
+                                delisting_grace=int(delisting_grace),
+                            ).run
+                        else:
+                            universe_result = run_backtest(
+                                returns,
+                                run.result.weights,
+                                spec,
+                                universe=universe,
+                                universe_policy=policy,
+                            )
+                except (UniverseError, ValueError) as exc:
+                    st.session_state["universe_run_notes"] = None
+                    # Under 'raise' this is the run stopping on the very cells
+                    # the policy line above counted, which is the diagnosis
+                    # rather than a surprise.
+                    st.error(f"The run stopped: {exc}")
+                else:
+                    st.session_state["universe_run_notes"] = dict(
+                        universe_result.meta.notes
+                    )
+
+            notes = st.session_state.get("universe_run_notes")
+            if notes is not None:
+                render_universe_notes(notes)
+                if "delistings" not in notes:
+                    st.caption(
+                        "Delisting was not diagnosed: a replay only applies "
+                        "the screen. Re-solve each window with a grace period "
+                        "to find names that stopped printing."
+                    )
+                st.caption(
+                    "A name the universe drops is sold at the next bar and "
+                    "the proceeds sit in cash: the runner never renormalises "
+                    "the rest of the book to hide the gap, because that would "
+                    "be a trade nobody decided to make."
+                )
 
 
 # ---------------------------------------------------------------------------

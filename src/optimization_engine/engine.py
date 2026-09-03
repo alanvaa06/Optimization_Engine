@@ -8,6 +8,7 @@ whether to trust it.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
@@ -63,6 +64,13 @@ from optimization_engine.optimizers.feasibility import (
     InfeasibleConstraintsError,
     analyze_feasibility,
 )
+from optimization_engine.stress import (
+    Shock,
+    StressReport,
+    shocks_from_dicts,
+    stress_test,
+)
+from optimization_engine.universe import Eligibility
 
 
 def apply_fx_conversion(
@@ -124,6 +132,10 @@ class EngineRun:
     #: The benchmark this run was measured — and possibly optimized — against,
     #: resolved once at solve time so every downstream view uses the same one.
     benchmark: ResolvedBenchmark | None = None
+    #: What the configured shocks do to this allocation, when ``run_engine``
+    #: was asked for them (``run_stress=True``) and the config named any.
+    #: ``None`` means the question was not asked — never that nothing hurts.
+    stress: StressReport | None = None
 
     # -- allocation views ---------------------------------------------------
 
@@ -484,6 +496,9 @@ class EngineRun:
         rebalance_frequency: RebalanceFrequency | None = None,
         prices: pd.DataFrame | None = None,
         volumes: pd.DataFrame | None = None,
+        universe: Eligibility | None = None,
+        universe_policy: str | None = None,
+        delisting_grace: int | None = None,
     ) -> WalkForwardRun:
         """:meth:`walk_forward`, returning the full bundle instead of the digest.
 
@@ -502,6 +517,30 @@ class EngineRun:
             volumes: Traded volume per asset. Optional everywhere: without it
                 the impact model prices from a fixed participation rate, which
                 is the only thing available for an index universe.
+            universe: Point-in-time membership — an
+                :class:`~optimization_engine.universe.eligibility.Eligibility`,
+                or ``None`` to take the universe from the panel's columns, which
+                is the survivors-only reading every run had before this
+                argument existed.
+            universe_policy: How a cell the rules could not evaluate is read —
+                ``"exclude"``, ``"include"`` or ``"raise"``. Required whenever
+                ``universe`` is given, and deliberately without a default here
+                too: passing the decision through unchanged is the point.
+            delisting_grace: Bars of silence after which a name counts as
+                delisted, or ``None`` to not diagnose delisting at all. A
+                separate opt-in from ``universe`` because it answers a
+                different question — the screen says what the mandate permits,
+                this says what still trades.
+
+        Returns:
+            The bundle, forwarded from
+            :func:`~optimization_engine.backtest.walkforward.walk_forward_run`.
+
+        Raises:
+            ValueError: If the history is too short, or ``universe`` was given
+                with no ``universe_policy``.
+            UniverseError: If the policy is unknown, or it is ``"raise"`` and
+                some name was not evaluable on some bar.
         """
         ppy = self.config.periods_per_year
         # An explicit "none" rather than the spec default: a caller who never
@@ -517,6 +556,9 @@ class EngineRun:
             rebalance_frequency=rebalance_frequency,
             prices=prices,
             volumes=volumes,
+            universe=universe,
+            universe_policy=universe_policy,
+            delisting_grace=delisting_grace,
         )
 
     def tearsheet(
@@ -527,6 +569,7 @@ class EngineRun:
         n_trials: int | None = None,
         trial_sharpes: pd.Series | None = None,
         overfitting: Any = None,
+        shocks: Sequence[Shock] | None = None,
     ) -> Tearsheet:
         """The assembled reading of a run, caveats attached.
 
@@ -546,13 +589,22 @@ class EngineRun:
             trial_sharpes: The Sharpe ratios of those trials, which sharpen the
                 deflation.
             overfitting: A pre-computed overfitting report to attach.
+            shocks: Stress scenarios for the book the run ends on. ``None``
+                takes the ones this run's config carries, so a mandate that
+                declares its scenarios gets the panel without asking twice;
+                pass ``()`` to suppress it.
 
         Returns:
             A :class:`~optimization_engine.backtest.Tearsheet` carrying the run,
-            its cost analysis, the selection-bias diagnostics, and the caveats
-            that qualify them.
+            its cost analysis, the selection-bias diagnostics, the stress panel
+            when scenarios were configured, and the caveats that qualify them.
+
+        Raises:
+            StressError: If a configured shock names an asset outside the
+                panel this run was solved on.
         """
         rf = self.config.optimizer.risk_free_rate if riskfree_rate is None else riskfree_rate
+        applied = configured_shocks(self.config) if shocks is None else tuple(shocks)
         return build_tearsheet(
             run if run is not None else self.simulate(),
             self.returns,
@@ -560,6 +612,8 @@ class EngineRun:
             n_trials=n_trials,
             trial_sharpes=trial_sharpes,
             overfitting=overfitting,
+            shocks=applied,
+            stress_cov_matrix=self.cov_matrix,
         )
 
     def sweep(
@@ -574,6 +628,9 @@ class EngineRun:
         rebalance_frequency: RebalanceFrequency | None = None,
         prices: pd.DataFrame | None = None,
         volumes: pd.DataFrame | None = None,
+        universe: Eligibility | None = None,
+        universe_policy: str | None = None,
+        delisting_grace: int | None = None,
     ) -> SweepResults:
         """Walk-forward every cell of a grid, and count the trials.
 
@@ -589,6 +646,16 @@ class EngineRun:
                 way, so a grid run with a capacity-aware cost model must be
                 handed the same panel the single run was — otherwise the grid
                 is cheaper than the run it is supposed to contextualize.
+            universe: Point-in-time membership, applied to every cell. Same
+                argument as ``volumes``, and it bites harder: the cells'
+                Sharpes are what the deflated Sharpe is deflated *against*, so
+                a grid run on the survivors while the headline run was screened
+                would deflate one universe's result by another universe's
+                dispersion.
+            universe_policy: How a *not evaluable* cell is read. Required
+                whenever ``universe`` is given.
+            delisting_grace: Bars of silence after which a name counts as
+                delisted, applied to every cell for the same reason.
         """
         ppy = self.config.periods_per_year
         run_spec = spec or BacktestSpec(periods_per_year=ppy, frequency="none")
@@ -640,6 +707,9 @@ class EngineRun:
                 rebalance_frequency=rebalance_frequency,
                 prices=prices,
                 volumes=volumes,
+                universe=universe,
+                universe_policy=universe_policy,
+                delisting_grace=delisting_grace,
             ).returns
 
         return run_sweep(
@@ -937,6 +1007,27 @@ def resolve_expected_returns(
     return expected_returns.reindex(returns.columns).fillna(0.0)
 
 
+def configured_shocks(config: EngineConfig) -> tuple[Shock, ...]:
+    """The stress scenarios a configuration carries, if it carries any.
+
+    Args:
+        config: The configuration to read ``stress`` from.
+
+    Returns:
+        The shocks as a tuple, empty when none are configured. Read through
+        ``getattr`` for the same reason
+        :func:`~optimization_engine.data.covariance.covariance_from_config`
+        reads the denoising settings that way — a config object built by an
+        older release, or duck-typed by a caller, still runs.
+
+    Raises:
+        StressError: If ``config.stress`` is set to something that is neither a
+            sequence of :class:`~optimization_engine.stress.Shock` nor of the
+            mappings one serializes to, or names the same scenario twice.
+    """
+    return shocks_from_dicts(getattr(config, "stress", ()) or ())
+
+
 def run_engine(
     returns: pd.DataFrame,
     config: EngineConfig,
@@ -947,6 +1038,7 @@ def run_engine(
     check_feasibility: bool = True,
     raise_on_infeasible: bool = False,
     external_returns: pd.DataFrame | pd.Series | None = None,
+    run_stress: bool = False,
 ) -> EngineRun:
     """Run the engine end-to-end.
 
@@ -966,11 +1058,53 @@ def run_engine(
             of letting the solver fail with a less informative error.
         external_returns: Return series from outside the investable universe,
             needed only when ``config.benchmark`` names an external index.
+        run_stress: Apply ``config.stress`` to the solved book and attach the
+            report as ``run.stress``. Off by default, and deliberately: the
+            walk-forward and sweep solvers call this function once per window
+            and throw everything but the weights away, so nothing they do not
+            read should be computed. Setting it with no shocks configured is a
+            no-op, not an error.
+
+    Returns:
+        An :class:`EngineRun` carrying the allocation and the evidence behind
+        it — the covariance, the expected returns, the feasibility report when
+        one was asked for, the frontier when one was built, and the stress
+        report when ``run_stress`` was set and shocks were configured.
 
     Raises:
         ValueError: If ``returns`` is empty or has no columns.
         InfeasibleConstraintsError: When ``raise_on_infeasible`` is set and the
             constraints cannot be satisfied.
+        StressError: When ``run_stress`` is set and a configured shock names an
+            asset outside the panel, which is the same defect as a view on one.
+        MandateViolationError: When ``config.strict_mandate`` is set and the
+            solved book breaches the mandate past tolerance. Unlike the other
+            two this is raised *after* a successful solve — the answer arrived
+            and does not comply — so it is not a solver failure and the
+            ``except SolverFailure`` below deliberately does not intercept it
+            (``SolverFailure`` is a ``RuntimeError``, this is a ``ValueError``,
+            so the two never overlap). Two consequences worth stating rather
+            than leaving to be discovered:
+
+            * A caller guarding a solve with ``except SolverFailure`` alone
+              will not catch it. Catch it by name, or leave
+              ``strict_mandate`` off and read ``run.result.audit``.
+            * Inside a walk-forward it does not propagate.
+              :func:`~optimization_engine.backtest.walkforward.walk_forward_run`
+              catches every exception a window's solve raises and records the
+              window as ``failed: <message>``, carrying the previous book
+              forward — or holding cash when there is no previous book. That is
+              coherent (a window whose only compliant answer is "no book" is a
+              window the desk could not trade) but surprising: turning
+              ``strict_mandate`` on does not stop a backtest, it converts
+              non-compliant windows into carried-forward ones. Read
+              ``walk.failures`` and ``walk.n_failures``, which name every one.
+              The single exception is a method that can *never* satisfy the
+              mandate, where every window refuses: the walk-forward then raises
+              a plain ``ValueError`` quoting the first window's message, so
+              that case is loud — but it arrives as a ``ValueError`` with no
+              ``.report`` on it, not as the ``MandateViolationError`` a caller
+              would be catching for.
     """
     if returns is None or returns.empty:
         raise ValueError("run_engine received an empty returns frame.")
@@ -1013,9 +1147,25 @@ def run_engine(
     optimizer = optimizer_factory(
         config, cov, expected_returns=expected_returns, returns=returns
     )
+    # The gate lives on the optimizer, not here, so that *every* entry into a
+    # solve honours it and not just this one: the frontier sweep, the
+    # walk-forward's per-window solver and any caller holding the instance all
+    # go through ``optimize()``, and a check written into ``run_engine`` would
+    # bind on exactly one of those paths. Read through ``getattr`` for the same
+    # reason ``configured_shocks`` does — a duck-typed config from an older
+    # release still runs.
+    optimizer.strict_mandate = bool(getattr(config, "strict_mandate", False))
     try:
         result = optimizer.optimize()
     except SolverFailure as exc:
+        # Deliberately narrow. ``optimize()`` also raises
+        # ``MandateViolationError`` under the ``strict_mandate`` set above, and
+        # that must pass straight through: the solve succeeded and the *answer*
+        # is non-compliant, which is not a solver failure and must not be
+        # re-dressed as one. The types keep them apart on their own —
+        # ``SolverFailure`` is a ``RuntimeError``, ``MandateViolationError`` a
+        # ``ValueError`` — so this is a statement of intent, not a guard.
+        #
         # A solver that reports "infeasible" has found the same thing the
         # pre-solve analysis did, but says it in solver terms. When the
         # analysis named the culprit, attach its findings rather than leaving
@@ -1040,6 +1190,12 @@ def run_engine(
             return_range=return_range,
         )
 
+    stress: StressReport | None = None
+    if run_stress:
+        shocks = configured_shocks(config)
+        if shocks:
+            stress = stress_test(result.weights, shocks, cov_matrix=cov)
+
     run_warnings: list[str] = list(cov_diag.warnings)
     if feasibility is not None:
         run_warnings.extend(i.message for i in feasibility.warnings)
@@ -1056,4 +1212,5 @@ def run_engine(
         covariance_diagnostics=cov_diag,
         warnings=tuple(run_warnings),
         benchmark=benchmark,
+        stress=stress,
     )

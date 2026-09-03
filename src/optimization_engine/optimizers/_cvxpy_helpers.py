@@ -3,8 +3,12 @@
 from __future__ import annotations
 
 import logging
+import threading
 import time
 import warnings
+from collections.abc import Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 
 import cvxpy as cp
@@ -20,23 +24,106 @@ _LOG = logging.getLogger(__name__)
 #: that converge on harder instances at looser tolerance.
 SOLVER_FALLBACK = ("CLARABEL", "ECOS", "SCS", "OSQP")
 
-_OK_STATUSES = ("optimal", "optimal_inaccurate")
-
 # CVXPY warns on stderr whenever a solve returns ``optimal_inaccurate``. That
 # is not actionable for a caller of this module: the fallback chain below
-# treats an inaccurate answer as a *reason to try the next solver*, and when
-# it does end up settling for one it says so through ``SolveInfo.status``, a
-# logged warning, and the UI's compliance banner. Suppressing the duplicate
-# has to happen with a process-wide filter rather than a context manager,
-# because frontier sweeps and walk-forward runs solve on a thread pool and
+# treats an inaccurate answer as a *reason to try the next solver*, and then
+# refuses it outright unless the caller opted in -- and when one is accepted
+# it says so through ``SolveInfo.status``, a logged warning, and the UI's
+# compliance banner. Suppressing the duplicate has to happen with a
+# process-wide filter rather than a context manager, because frontier sweeps
+# and walk-forward runs solve on a thread pool and
 # ``warnings.catch_warnings`` is not thread-safe -- scoping it per solve would
 # leak across threads and could swallow unrelated warnings. The filter is
 # matched on the exact message so nothing else is silenced; ``module`` is not
 # usable here because CVXPY raises with a stacklevel that attributes the
 # warning to this file rather than to its own.
-warnings.filterwarnings(
-    "ignore", message="Solution may be inaccurate", category=UserWarning
+#
+# That argument is unchanged, and so is the filter: it is still installed on
+# the interpreter's global filter list and still outlives the solve that put
+# it there. What moved is *when* it goes on. Installing it at import time made
+# ``import optimization_engine`` -- a statement that solves nothing -- mutate a
+# process-global belonging to the host application, which is not a library's
+# to change until the library is actually asked to do something. So the install
+# happens on the first ``solve_problem`` call instead, once, behind
+# ``_FILTER_LOCK`` because that first call may well be N pool threads at once.
+#
+# One residual behaviour difference, deliberate: a consumer who calls
+# ``warnings.resetwarnings()`` after solving wipes the filter, and under the
+# lazy scheme the next solve reinstalls it, where the eager scheme would have
+# left it off for the rest of the process. Reinstalling is the better of the
+# two -- the filter exists to keep a solve quiet, and every solve should get
+# the same treatment -- but it does mean ``resetwarnings()`` no longer holds
+# against this module.
+_FILTER_LOCK = threading.Lock()
+_filter_installed = False
+
+
+def _install_inaccurate_warning_filter() -> None:
+    """Silence CVXPY's ``optimal_inaccurate`` warning, once per process.
+
+    Idempotent and thread-safe: concurrent first solves add exactly one entry
+    to ``warnings.filters`` between them. See the comment above for why the
+    filter is process-wide rather than scoped to the solve.
+    """
+    global _filter_installed
+    if _filter_installed:
+        return
+    with _FILTER_LOCK:
+        if _filter_installed:
+            return
+        warnings.filterwarnings(
+            "ignore", message="Solution may be inaccurate", category=UserWarning
+        )
+        _filter_installed = True
+
+
+# An ``optimal_inaccurate`` answer is refused unless somebody asks for it, and
+# the somebody who asks is a configuration two call frames above the solve.
+# There is no argument to thread it down: every optimizer calls
+# ``solve_problem(problem)`` from inside its own ``_solve``, and widening
+# those signatures would put the same keyword on eleven methods that have no
+# other reason to know about solver tolerance -- and would still miss the
+# nested solves, where NCO builds a min-variance optimizer per cluster and
+# never passes its own settings on.
+#
+# So the setting travels as ambient state instead:
+# :class:`~optimization_engine.optimizers.base.BaseOptimizer.optimize` opens an
+# :func:`accepting_inaccurate` scope around ``_solve()`` and everything solved
+# inside it -- including a sub-optimizer built halfway down -- sees the same
+# answer. A :class:`~contextvars.ContextVar` rather than a module global
+# because frontier sweeps and walk-forward runs solve on a thread pool: each
+# thread carries its own context, so one worker's opt-in cannot leak into
+# another's solve. The default is ``False``: a caller who says nothing gets
+# the refusal.
+_ACCEPT_INACCURATE: ContextVar[bool] = ContextVar(
+    "optimization_engine_accept_inaccurate", default=False
 )
+
+
+@contextmanager
+def accepting_inaccurate(accept: bool | None) -> Iterator[None]:
+    """Set, for this scope, whether a loose solution is acceptable.
+
+    Args:
+        accept: ``True`` to take an ``optimal_inaccurate`` answer when no
+            solver converges exactly, ``False`` to refuse it. ``None`` means
+            *inherit* — the scope is a no-op and whatever the surrounding
+            scope decided still holds. That is what lets a nested solve
+            (NCO's per-cluster optimizers) run under the settings of the
+            solve that created it rather than resetting them to the default.
+
+    Yields:
+        Nothing. The previous setting is restored on exit, including on an
+        exception.
+    """
+    if accept is None:
+        yield
+        return
+    token = _ACCEPT_INACCURATE.set(bool(accept))
+    try:
+        yield
+    finally:
+        _ACCEPT_INACCURATE.reset(token)
 
 
 @dataclass(frozen=True)
@@ -54,8 +141,9 @@ class SolveInfo:
         """Whether the solver converged properly rather than approximately.
 
         Returns:
-            ``True`` only for ``"optimal"``. An ``"optimal_inaccurate"`` answer is
-            usable and is accepted, but it is not this.
+            ``True`` only for ``"optimal"``. An ``"optimal_inaccurate"`` answer
+            is usable but unverified, and reaching one at all means somebody
+            opted in — see :func:`solve_problem`.
         """
         return self.status == "optimal"
 
@@ -83,9 +171,9 @@ class SolverFailure(RuntimeError):
         """Build the failure, interpreting the status where it can.
 
         Args:
-            status: The last solver status. ``"infeasible"`` and ``"unbounded"``
-                get a message explaining what to change; anything else is
-                reported as-is.
+            status: The last solver status. ``"infeasible"``, ``"unbounded"``
+                and ``"optimal_inaccurate"`` get a message explaining what to
+                change; anything else is reported as-is.
             attempts: Every solver tried, in order. Appended to the message and
                 kept on the exception as ``exc.attempts``.
             detail: Extra context appended verbatim.
@@ -102,6 +190,14 @@ class SolverFailure(RuntimeError):
             message = (
                 "The problem is unbounded: the objective improves without "
                 "limit. Add weight bounds or a budget constraint."
+            )
+        elif status == "optimal_inaccurate":
+            # A solution exists here -- it is just one no solver would vouch
+            # for, which is why this reads differently from the two above.
+            message = (
+                "No solver converged to a verified optimum. The best answer "
+                "on offer was flagged inaccurate, so it was refused rather "
+                "than reported as if it were optimal."
             )
         if attempts:
             message += f" Solvers tried: {', '.join(attempts)}."
@@ -135,28 +231,54 @@ def _restore(snapshot: VariableSnapshot) -> None:
 def solve_problem(
     problem: cp.Problem,
     solvers: tuple[str, ...] = SOLVER_FALLBACK,
-    accept_inaccurate: bool = True,
+    accept_inaccurate: bool | None = None,
 ) -> SolveInfo:
     """Solve ``problem``, walking a fallback chain, and report what happened.
 
     An ``optimal_inaccurate`` answer is *not* accepted straight away: the rest
-    of the chain is tried first in case another solver converges properly, and
-    the loose answer is only returned if nothing better turns up. Settling for
-    the first solver's inaccurate result is how a portfolio ends up a few
-    basis points outside its own constraints for no reason.
+    of the chain is tried first in case another solver converges properly. If
+    nothing better turns up the loose answer is **refused** — the default is
+    to raise :class:`SolverFailure` with ``status="optimal_inaccurate"``
+    rather than hand back weights no solver would vouch for. Settling for an
+    inaccurate result is how a portfolio ends up a few basis points outside
+    its own constraints for no reason, and a number reported as optimal when
+    it is not is the one failure mode this package exists to avoid.
+
+    Opting back in is deliberate:
+    ``solve_problem(problem, accept_inaccurate=True)`` for this call, or
+    ``accept_inaccurate: true`` under the config's ``optimizer`` block, which
+    reaches every solve the run's optimizers make. When it is taken, the
+    answer still says so through ``SolveInfo.status``, a logged warning, and
+    the UI's compliance banner. See ``docs/ERRORS.md`` for what each opt-in
+    covers, and for the methods the setting cannot reach because they never
+    call a solver at all (HRP, HERC, the naive weightings -- but *not* NCO,
+    whose layers are solved by real optimizers).
+
+    The first call in a process also installs the process-wide warnings filter
+    described at the top of this module. Importing the package does not; only
+    asking it to solve something does.
 
     Args:
         problem: The CVXPY problem to solve.
         solvers: Fallback chain, tried in order. Missing solvers are skipped.
         accept_inaccurate: Return a loose solution when no solver converges
-            exactly. Set False to raise instead.
+            exactly. ``None`` — the default — reads the surrounding
+            :func:`accepting_inaccurate` scope, which itself defaults to
+            refusing. Pass ``True`` or ``False`` to decide here regardless of
+            the scope.
 
     Raises:
-        SolverFailure: When every solver fails or reports a non-optimal
-            status. The exception distinguishes *infeasible* (the constraints
-            are impossible) from *unbounded* and from numerical failure,
-            because the analyst's next action differs in each case.
+        SolverFailure: When every solver fails, reports a non-optimal status,
+            or reports only ``optimal_inaccurate`` while inaccurate answers
+            are refused. The exception distinguishes *infeasible* (the
+            constraints are impossible) from *unbounded*, from
+            *optimal_inaccurate* and from numerical failure, because the
+            analyst's next action differs in each case.
     """
+    _install_inaccurate_warning_filter()
+    accept = (
+        _ACCEPT_INACCURATE.get() if accept_inaccurate is None else bool(accept_inaccurate)
+    )
     attempts: list[str] = []
     last_status = "unknown"
     last_error: Exception | None = None
@@ -208,7 +330,7 @@ def solve_problem(
         if last_status in ("infeasible", "unbounded"):
             break
 
-    if inaccurate is not None and accept_inaccurate:
+    if inaccurate is not None and accept:
         info, snapshot = inaccurate
         _restore(snapshot)
         _LOG.warning(
@@ -223,6 +345,27 @@ def solve_problem(
             solve_seconds=info.solve_seconds,
             objective_value=info.objective_value,
             attempts=tuple(attempts),
+        )
+
+    if inaccurate is not None:
+        # The chain did produce an answer, just not one anybody verified.
+        # ``last_status`` is whatever the *final* solver in the chain said --
+        # often ``solver_error`` from a fallback that gave up, sometimes an
+        # ``infeasible`` verdict contradicted by the solver that already found
+        # a point. Reporting either of those would send the reader after the
+        # wrong problem, so the status is the one that describes what actually
+        # happened: an inaccurate solution was on the table and was refused.
+        raise SolverFailure(
+            "optimal_inaccurate",
+            tuple(attempts),
+            detail=(
+                f"{inaccurate[0].solver} returned a solution it could not "
+                "verify. Pass accept_inaccurate=True (the CLI's "
+                "--accept-inaccurate, or accept_inaccurate: true under the "
+                "config's optimizer block) to take the approximate weights "
+                "anyway, or call analyze_feasibility() to find out which "
+                "constraint is making the problem this hard."
+            ),
         )
 
     raise SolverFailure(

@@ -36,6 +36,9 @@ from optimization_engine import (  # noqa: E402
     sample_dataset,
 )
 from optimization_engine.analytics.report import BENCHMARK, PORTFOLIO  # noqa: E402
+from optimization_engine.data.covariance import (  # noqa: E402
+    expected_returns_from_history,
+)
 from optimization_engine.reporting.plots import (  # noqa: E402
     plot_efficient_frontier,
     plot_frontier_uncertainty,
@@ -88,7 +91,9 @@ def shoot(fig, path: Path, width: int = WIDTH, height: int = 520) -> None:
 def build(output: Path) -> None:
     output.mkdir(parents=True, exist_ok=True)
     returns = prices_to_returns(sample_dataset(252 * 8))
-    mu = ((1 + returns).prod() ** (252 / len(returns)) - 1).to_dict()
+    mu = expected_returns_from_history(
+        returns, method="mean", periods_per_year=252
+    ).to_dict()
 
     def config(name: str, **spec) -> EngineConfig:
         return EngineConfig(

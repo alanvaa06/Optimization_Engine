@@ -58,14 +58,18 @@ def annualize_volatility(
     Args:
         r: A return stream, or a frame of them.
         periods_per_year: Annualization basis — 252 for daily, 12 for monthly.
-        prices: Treat ``r`` as a price panel and difference it first.
+        prices: Treat ``r`` as a price panel and difference it first. Gaps
+            are *not* forward-filled — an interior missing price costs two
+            returns rather than becoming a 0% period followed by a
+            compounded jump, and the answer no longer depends on which
+            pandas is installed.
 
     Returns:
         Annualized volatility as a fraction. One value per column for a
         frame, a scalar for a series.
     """
     if prices:
-        r = r.pct_change().dropna()
+        r = r.pct_change(fill_method=None).dropna()
     return r.std() * np.sqrt(periods_per_year)
 
 
@@ -117,14 +121,18 @@ def annualize_returns(
     Args:
         r: A return stream, or a frame of them.
         periods_per_year: Annualization basis — 252 for daily, 12 for monthly.
-        prices: Treat ``r`` as a price panel and difference it first.
+        prices: Treat ``r`` as a price panel and difference it first. Gaps
+            are *not* forward-filled — an interior missing price costs two
+            returns rather than becoming a 0% period followed by a
+            compounded jump, and the answer no longer depends on which
+            pandas is installed.
 
     Returns:
         The compound annual growth rate as a fraction. One value per column
         for a frame, a scalar for a series.
     """
     if prices:
-        r = r.pct_change().dropna()
+        r = r.pct_change(fill_method=None).dropna()
     compounded = (1 + r).prod()
     # Count the observations that exist, not the rows: ``prod`` skips a NaN,
     # so counting its row would price a missing period as a zero return.
@@ -136,25 +144,77 @@ def _rf_per_period(riskfree_rate: float, periods_per_year: int) -> float:
     return (1 + riskfree_rate) ** (1 / periods_per_year) - 1
 
 
+#: The Sharpe conventions this library will compute, and nothing else.
+SHARPE_METHODS = ("arithmetic", "geometric")
+
+
 def sharpe_ratio(
-    r: pd.Series | pd.DataFrame, riskfree_rate: float = 0.0, periods_per_year: int = 252
+    r: pd.Series | pd.DataFrame,
+    riskfree_rate: float = 0.0,
+    periods_per_year: int = 252,
+    *,
+    method: str = "arithmetic",
 ) -> float | pd.Series:
     """Annualized excess return over annualized volatility.
+
+    **The single source of the Sharpe ratio in this library.** Three
+    definitions used to coexist — this one, an arithmetic one inside
+    :func:`rolling_metrics`, and a per-period one inside
+    ``analytics.selection`` — so a deflated Sharpe deflated an arithmetic
+    number against a distribution of geometric ones. Every Sharpe in the tree
+    now routes through here; the only thing that varies is ``method``.
+
+    The gap between the two is not a rounding error: on the eight-year sample
+    panel, equal-weighted, the geometric Sharpe is 0.5950 and the arithmetic
+    one 0.6238 — 4.8% higher.
+
+    The usual shorthand, that the geometric numerator is the arithmetic one
+    less half the variance, holds for the volatilities most return series
+    have but is not a rule. Compounding is convex, and its second-order term
+    pushes the geometric numerator back up; it wins whenever the per-period
+    volatility falls below roughly ``sqrt(periods_per_year - 1)`` times the
+    mean — about 15.8x on daily data. On a low-volatility, high-mean series
+    the geometric Sharpe is therefore the *higher* of the two. This is the
+    same effect that makes the sample panel's cash column the one asset whose
+    arithmetic mean sits below its geometric one.
 
     Args:
         r: A return stream, or a frame of them.
         riskfree_rate: Annualized risk-free rate, as a fraction.
         periods_per_year: Annualization basis — 252 for daily, 12 for monthly.
+        method: ``"arithmetic"`` (the default) annualizes the mean excess
+            return by multiplying by ``periods_per_year``. This is the
+            convention Bailey and López de Prado's deflated and probabilistic
+            Sharpe ratios assume, so it is the one the selection-bias
+            diagnostics need. ``"geometric"`` annualizes it by compounding,
+            via :func:`annualize_returns`; it answers "what compound excess
+            growth did this earn per unit of risk", and it is the number this
+            function returned before the conventions were unified.
 
     Returns:
         A dimensionless ratio. One value per column for a frame, a scalar
         for a series.
+
+    Raises:
+        ValueError: If ``method`` is neither ``"arithmetic"`` nor
+            ``"geometric"``.
     """
+    if method not in SHARPE_METHODS:
+        raise ValueError(
+            f"Unknown Sharpe method {method!r}; expected one of "
+            f"{', '.join(repr(m) for m in SHARPE_METHODS)}."
+        )
     rf = _rf_per_period(riskfree_rate, periods_per_year)
     excess = r - rf
-    ann_excess = annualize_returns(excess, periods_per_year)
     ann_vol = annualize_volatility(r, periods_per_year)
-    return ann_excess / ann_vol
+    # A zero-variance stream has an infinite Sharpe, which is the answer, not
+    # an error. pandas already suppresses the warning for the frame path; this
+    # makes the scalar path behave the same way, which is what lets
+    # ``rolling_metrics`` call this per window without changing what it warns.
+    with np.errstate(divide="ignore", invalid="ignore"):
+        if method == "geometric":
+            return annualize_returns(excess, periods_per_year) / ann_vol
+        return excess.mean() * periods_per_year / ann_vol
 
 
 def probabilistic_sharpe_ratio(
@@ -170,6 +230,13 @@ def probabilistic_sharpe_ratio(
     toward. The PSR (Bailey & López de Prado, 2012) converts the point
     estimate into a confidence statement: below ~0.95 the portfolio has not
     demonstrably beaten the benchmark, however good the headline number looks.
+
+    Its internal Sharpe is arithmetic per period — it always was, and it had
+    to be, because the standard error below is derived for that estimator.
+    Before the conventions were unified it therefore *disagreed* with
+    :func:`sharpe_ratio`, which annualized geometrically; now the two agree,
+    and ``sharpe_ratio(r, rf, periods_per_year=1)`` is exactly the per-period
+    Sharpe this function tests.
 
     Args:
         r: A return stream.
@@ -210,6 +277,13 @@ def sortino_ratio(
 ) -> float | pd.Series:
     """Annualized excess return over annualized downside deviation.
 
+    **Convention:** the numerator is *geometric* — :func:`annualize_returns`
+    compounds it — while :func:`sharpe_ratio` now annualizes arithmetically by
+    default. The two ratios in the same summary therefore do not share a
+    numerator, and a Sortino cannot be read as "the Sharpe with a different
+    denominator". This is deliberate and unchanged; it is recorded here so the
+    mixing is visible rather than silent.
+
     Args:
         r: A return stream, or a frame of them.
         riskfree_rate: Annualized risk-free rate, as a fraction.
@@ -235,6 +309,11 @@ def calmar_ratio(
     r: pd.Series | pd.DataFrame, periods_per_year: int = 252
 ) -> float | pd.Series:
     """Annualized return over the absolute worst drawdown.
+
+    **Convention:** the numerator is *geometric* — :func:`annualize_returns`
+    compounds it — while :func:`sharpe_ratio` now annualizes arithmetically by
+    default. Deliberate and unchanged, but stated so a summary carrying both
+    is not read as though they shared a numerator.
 
     Args:
         r: A return stream, or a frame of them.
@@ -334,6 +413,11 @@ def martin_ratio(
     difference between a portfolio that fell 30% and recovered in a month and
     one that spent three years down 20%.
 
+    **Convention:** like :func:`sortino_ratio` and :func:`calmar_ratio`, the
+    numerator is *geometric* — :func:`annualize_returns` compounds it — while
+    :func:`sharpe_ratio` now annualizes arithmetically by default. Deliberate
+    and unchanged; recorded so the mixing is visible.
+
     Args:
         r: A return stream, or a frame of them.
         riskfree_rate: Annualized risk-free rate, as a fraction.
@@ -389,10 +473,18 @@ def rolling_metrics(
     A single full-sample Sharpe hides whether the strategy worked throughout
     or earned everything in one window. This is the frame that answers that.
 
+    ``rolling_sharpe`` is :func:`sharpe_ratio` evaluated on each window, so
+    the last row of a full-length window is the headline Sharpe to the last
+    bit. It used to be an open-coded arithmetic ratio while the headline was
+    geometric, which meant the two disagreed by a few per cent and neither
+    said so.
+
     Args:
         r: The return stream.
         window: Rolling window length, in periods. At least 2.
-        riskfree_rate: Per-period risk-free rate used by the Sharpe ratio.
+        riskfree_rate: Annualized risk-free rate, as a fraction — the same
+            unit :func:`sharpe_ratio` takes, converted to a per-period rate
+            internally.
         periods_per_year: Annualization basis.
 
     Returns:
@@ -404,7 +496,6 @@ def rolling_metrics(
     """
     if window < 2:
         raise ValueError(f"Rolling window must be at least 2 periods; got {window}.")
-    rf = _rf_per_period(riskfree_rate, periods_per_year)
     roll = r.rolling(window)
     # Compound in log space. A rolling np.prod over a long window can overflow
     # float64 on high-return series, and it accumulates rounding besides;
@@ -412,12 +503,21 @@ def rolling_metrics(
     growth = np.log1p(r.clip(lower=-1 + 1e-12))
     ann_ret = np.expm1(growth.rolling(window).sum() * (periods_per_year / window))
     ann_vol = roll.std() * np.sqrt(periods_per_year)
-    excess_mean = (r - rf).rolling(window).mean() * periods_per_year
+    # Calling ``sharpe_ratio`` per window rather than open-coding the ratio
+    # again costs about 0.2 s on 2,000 rows against 0.01 s vectorised. That is
+    # the price of the guarantee that this column and the headline Sharpe can
+    # never disagree, on a function called a handful of times per report and
+    # never inside a solve or a sweep.
+    # ``raw=False`` is load-bearing: on a bare ndarray ``.std()`` is ddof=0,
+    # which is a different — and wrong — denominator.
+    rolling_sharpe = roll.apply(
+        sharpe_ratio, raw=False, args=(riskfree_rate, periods_per_year)
+    )
     return pd.DataFrame(
         {
             "rolling_return": ann_ret,
             "rolling_volatility": ann_vol,
-            "rolling_sharpe": excess_mean / ann_vol,
+            "rolling_sharpe": rolling_sharpe,
             "rolling_drawdown": drawdown_series(r),
         }
     )
@@ -431,6 +531,18 @@ def summary_stats(
     extended: bool = False,
 ) -> pd.DataFrame:
     """Aggregate summary statistics per column of a returns frame.
+
+    **Mixed annualization conventions, on purpose.** ``"Sharpe Ratio"`` is
+    arithmetic: the mean excess return times ``periods_per_year``. Every other
+    ratio here — Sortino, Calmar, Martin — keeps a *geometric* (compounded)
+    numerator, as does ``"Annualized Return"``. They are therefore not
+    rescalings of one another, and a Sortino above a Sharpe may say something
+    about the convention rather than about downside risk. Unifying them is out
+    of scope; naming the split is not.
+
+    ``"Sharpe Ratio (geometric)"`` carries the number ``"Sharpe Ratio"`` held
+    before the conventions were unified, so a reader can see exactly what
+    moved. It is a one-release migration aid and will be removed.
 
     Args:
         r: Periodic returns, one column per series.
@@ -449,6 +561,12 @@ def summary_stats(
     ann_vol = r.aggregate(annualize_volatility, periods_per_year=periods_per_year)
     ann_sr = r.aggregate(
         sharpe_ratio, riskfree_rate=riskfree_rate, periods_per_year=periods_per_year
+    )
+    geo_sr = r.aggregate(
+        sharpe_ratio,
+        riskfree_rate=riskfree_rate,
+        periods_per_year=periods_per_year,
+        method="geometric",
     )
     ann_sortino = r.aggregate(
         sortino_ratio, riskfree_rate=riskfree_rate, periods_per_year=periods_per_year
@@ -470,6 +588,7 @@ def summary_stats(
             f"Cornish-Fisher VaR({var_level:.0f}%)": cf_var,
             f"Historic CVaR({var_level:.0f}%)": hist_cvar,
             "Sharpe Ratio": ann_sr,
+            "Sharpe Ratio (geometric)": geo_sr,
             "Sortino Ratio": ann_sortino,
             "Max Drawdown": dd,
         }

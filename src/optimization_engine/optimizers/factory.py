@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+import numpy as np
 import pandas as pd
 
 from optimization_engine.config import EngineConfig, OptimizerSpec
@@ -283,8 +284,25 @@ def effective_expected_returns(
         )
         posterior.name = "black_litterman_posterior"
         return posterior
-    except Exception:
+    except np.linalg.LinAlgError as exc:
+        # A singular covariance is a numerical accident, not a statement
+        # about the config: fall back so the pre-flight can still say
+        # something, but never silently.
+        _LOG.warning(
+            "Black-Litterman posterior could not be formed (%s); "
+            "the pre-flight will use the configured expected returns, "
+            "which sit at a different level than the solve will see.",
+            exc,
+        )
         return expected_returns
+    except ValueError:
+        # A view naming an asset outside the universe, or one with no prior
+        # variance, is a bad config, and `optimize()` raises on it. This
+        # function exists so the pre-flight sees the vector the solve will
+        # see; swallowing the refusal here made the preview quietly fall
+        # back to the prior mean while the solve raised on the same config,
+        # which is the disagreement the docstring above exists to prevent.
+        raise
 
 
 def optimizer_factory(
@@ -344,6 +362,7 @@ def optimizer_factory(
         cov_matrix=cov_matrix,
         constraints=constraints,
         risk_free_rate=spec.risk_free_rate,
+        accept_inaccurate=spec.accept_inaccurate,
     )
     if cls not in (CVaROptimizer, CDaROptimizer):
         common["expected_returns"] = expected_returns
@@ -387,6 +406,10 @@ def optimizer_factory(
             **common,
             **overrides,
         )
+    # These two re-list every base argument instead of splatting ``common``,
+    # because they take ``expected_returns`` conditionally above. Anything
+    # added to ``common`` has to be added here too or it silently stops
+    # reaching the two path-dependent methods.
     if cls is CVaROptimizer:
         return cls(
             returns=returns,
@@ -397,6 +420,7 @@ def optimizer_factory(
             cov_matrix=cov_matrix,
             constraints=constraints,
             risk_free_rate=spec.risk_free_rate,
+            accept_inaccurate=spec.accept_inaccurate,
             **overrides,
         )
     if cls is CDaROptimizer:
@@ -409,6 +433,7 @@ def optimizer_factory(
             cov_matrix=cov_matrix,
             constraints=constraints,
             risk_free_rate=spec.risk_free_rate,
+            accept_inaccurate=spec.accept_inaccurate,
             **overrides,
         )
     return cls(**common, **overrides)

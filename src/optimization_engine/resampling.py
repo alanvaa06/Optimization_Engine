@@ -17,6 +17,11 @@ Two standard remedies, both here:
   point-estimate frontier, because it stops the optimizer from acting on
   differences between assets that the sample cannot resolve.
 
+Both report the draws they lost as well as the draws they kept. An average
+over the survivors of a mandate that only sometimes binds is not the estimate
+it looks like, so the failure count and the first failure's message travel
+with the result rather than being swallowed by the loop.
+
 Both are expensive relative to a single solve — cost scales linearly in the
 number of draws — so the draw count is an explicit argument rather than a
 hidden default.
@@ -30,7 +35,10 @@ from typing import Literal
 import numpy as np
 import pandas as pd
 
-from optimization_engine.config import EngineConfig
+from optimization_engine.config import (
+    EngineConfig,
+    expected_return_method_for_estimator,
+)
 from optimization_engine.data.covariance import (
     covariance_from_config,
     expected_returns_from_history,
@@ -108,6 +116,9 @@ class FrontierUncertainty:
         weight_dispersion: Per-asset standard deviation of the weights across
             draws, at the middle of the frontier. Large values name the
             positions the sample cannot pin down.
+        first_error: The first failure's message, verbatim. A count on its own
+            says a draw was lost but not why; without the message the caller
+            cannot tell a binding mandate from a solver that fell over.
     """
 
     volatility: np.ndarray
@@ -116,6 +127,7 @@ class FrontierUncertainty:
     n_draws: int
     n_failed: int = 0
     weight_dispersion: pd.Series = field(default_factory=pd.Series)
+    first_error: str | None = None
 
     def band_width(self, quantile_low: float = 0.05, quantile_high: float = 0.95) -> pd.Series:
         """Height of the confidence band at each volatility level.
@@ -209,6 +221,7 @@ def bootstrap_frontier(
     curves: list[pd.Series] = []
     mid_weights: list[pd.Series] = []
     n_failed = 0
+    first_error: str | None = None
 
     for _ in range(n_draws):
         sample = resample_returns(returns, method=method, rng=rng)
@@ -218,10 +231,8 @@ def bootstrap_frontier(
             if reestimate_expected_returns:
                 mu = expected_returns_from_history(
                     sample,
-                    method=(
-                        "mean"
-                        if config.expected_returns_method == "historical_mean"
-                        else config.expected_returns_method
+                    method=expected_return_method_for_estimator(
+                        config.expected_returns_method
                     ),
                     periods_per_year=config.periods_per_year,
                     span=config.ema_span,
@@ -241,6 +252,11 @@ def bootstrap_frontier(
             )
             if len(solved) < 2:
                 n_failed += 1
+                if first_error is None:
+                    first_error = (
+                        f"Only {len(solved)} frontier point(s) solved on this "
+                        "draw; at least 2 are needed to interpolate a curve."
+                    )
                 continue
             curves.append(
                 pd.Series(
@@ -250,14 +266,17 @@ def bootstrap_frontier(
             )
             mid = frontier.weights.iloc[:, len(frontier.weights.columns) // 2]
             mid_weights.append(mid)
-        except Exception:
+        except Exception as exc:
             n_failed += 1
+            if first_error is None:
+                first_error = f"{type(exc).__name__}: {exc}"
             continue
 
     if not curves:
         raise ValueError(
             f"Every one of the {n_draws} resampled frontiers failed to solve. "
-            "The constraints may be feasible only on the observed sample."
+            "The constraints may be feasible only on the observed sample. "
+            f"First failure: {first_error}"
         )
 
     # Evaluate every curve on a shared volatility grid so the quantiles
@@ -295,7 +314,54 @@ def bootstrap_frontier(
         n_draws=len(curves),
         n_failed=n_failed,
         weight_dispersion=dispersion,
+        first_error=first_error,
     )
+
+
+@dataclass
+class ResampledFrontier:
+    """Michaud-averaged weights, and how many draws they actually rest on.
+
+    Mirrors :class:`FrontierUncertainty`: ``n_draws`` counts the draws that
+    contributed, ``n_failed`` the ones that did not, and ``first_error``
+    carries the first failure's message so a caller can tell a binding
+    mandate from a solver that fell over.
+
+    Attributes:
+        weights: An assets × rank frame of averaged weights. Each column
+            sums to 1. This is the frame the old bare-frame return gave back.
+        n_draws: Draws that produced a usable frontier and were averaged.
+        n_failed: Draws that produced nothing to average — whether they
+            raised or merely failed to solve two ranks.
+        first_error: The first failure's message, verbatim, or ``None`` when
+            every draw solved.
+    """
+
+    weights: pd.DataFrame
+    n_draws: int
+    n_failed: int = 0
+    first_error: str | None = None
+
+    @property
+    def failure_rate(self) -> float:
+        """Share of attempted draws that produced nothing to average."""
+        attempted = self.n_draws + self.n_failed
+        return float(self.n_failed) / attempted if attempted else float("nan")
+
+    def summary(self) -> str:
+        """How many draws the average rests on, in one sentence."""
+        attempted = self.n_draws + self.n_failed
+        line = (
+            f"Averaged {self.n_draws} of {attempted} resampled frontiers "
+            f"({self.weights.shape[1]} ranks, {self.weights.shape[0]} assets)."
+        )
+        if self.n_failed:
+            line += (
+                f" {self.n_failed} draw(s) produced nothing to average, so the "
+                "result is conditioned on the draws where the mandate solved. "
+                f"First failure: {self.first_error}"
+            )
+        return line
 
 
 def resampled_efficient_frontier(
@@ -305,7 +371,7 @@ def resampled_efficient_frontier(
     n_points: int = 15,
     method: BootstrapMethod = "block",
     seed: int | None = 0,
-) -> pd.DataFrame:
+) -> ResampledFrontier:
     """Michaud-style resampled frontier: average weights at each frontier rank.
 
     Rather than optimizing once on the point estimate, each draw is optimized
@@ -313,6 +379,14 @@ def resampled_efficient_frontier(
     frontier. Averaging weights (not inputs) is what makes the result robust:
     an asset the optimizer loads on only in some draws ends up with a
     moderate weight instead of a corner.
+
+    A draw can be lost two ways, and both are counted. It can raise — an
+    infeasible mandate on the drawn sample, a solver that fell over — or it
+    can return a frontier on which fewer than two ranks solved, which is not
+    enough to place the draw on the rank grid and produces no exception at
+    all. Averaging over the survivors of either is biased toward the draws
+    where the mandate did not bind, so the count and the first message come
+    back with the weights, and a majority-failure run refuses outright.
 
     Args:
         returns: The observed history to resample from.
@@ -324,15 +398,20 @@ def resampled_efficient_frontier(
             unseeded.
 
     Returns:
-        An assets × rank frame of averaged weights. Each column sums to 1.
+        A :class:`ResampledFrontier`. ``.weights`` is the assets × rank frame
+        of averaged weights, each column summing to 1.
 
     Raises:
-        ValueError: If no draw produces a usable frontier.
+        ValueError: If no draw produces a usable frontier, or if more draws
+            failed than succeeded — an average over the minority that solved
+            is not a resampled portfolio.
     """
     import copy
 
     rng = np.random.default_rng(seed)
     stacks: list[pd.DataFrame] = []
+    n_failed = 0
+    first_error: str | None = None
 
     for _ in range(n_draws):
         sample = resample_returns(returns, method=method, rng=rng)
@@ -341,10 +420,8 @@ def resampled_efficient_frontier(
             cov = covariance_from_config(sample, config)
             mu = expected_returns_from_history(
                 sample,
-                method=(
-                    "mean"
-                    if config.expected_returns_method == "historical_mean"
-                    else config.expected_returns_method
+                method=expected_return_method_for_estimator(
+                    config.expected_returns_method
                 ),
                 periods_per_year=config.periods_per_year,
                 span=config.ema_span,
@@ -359,16 +436,38 @@ def resampled_efficient_frontier(
             weights = frontier.weights
             ok = frontier.summary["status"].values == "ok"
             if ok.sum() < 2:
+                # A silent drop with no exception behind it: the frontier came
+                # back, but too little of it solved to rank. Counted the same
+                # as a raise, or n_failed under-reports.
+                n_failed += 1
+                if first_error is None:
+                    first_error = (
+                        f"Only {int(ok.sum())} of {len(ok)} frontier ranks "
+                        "solved on this draw; at least 2 are needed to place "
+                        "it on the rank grid."
+                    )
                 continue
             usable = weights.loc[:, ok]
             usable.columns = range(usable.shape[1])
             stacks.append(usable)
-        except Exception:
+        except Exception as exc:
+            n_failed += 1
+            if first_error is None:
+                first_error = f"{type(exc).__name__}: {exc}"
             continue
 
     if not stacks:
         raise ValueError(
-            "No resampled frontier could be traced; nothing to average."
+            f"No resampled frontier could be traced across {n_draws} draws; "
+            f"nothing to average. First failure: {first_error}"
+        )
+    if n_failed > len(stacks):
+        raise ValueError(
+            f"{n_failed} of {n_draws} resampled draws failed and only "
+            f"{len(stacks)} solved. An average over the minority that solved "
+            "is not a resampled portfolio — it is an average over the draws "
+            "where the mandate happened not to bind. Loosen the mandate, or "
+            f"resample a longer history. First failure: {first_error}"
         )
 
     # Ranks present in every draw, so each averaged column is built from the
@@ -376,7 +475,12 @@ def resampled_efficient_frontier(
     common = min(s.shape[1] for s in stacks)
     averaged = sum(s.iloc[:, :common] for s in stacks) / len(stacks)
     averaged.columns = [f"rank_{i}" for i in range(common)]
-    return averaged
+    return ResampledFrontier(
+        weights=averaged,
+        n_draws=len(stacks),
+        n_failed=n_failed,
+        first_error=first_error,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -554,10 +658,8 @@ def monte_carlo_optimization_selection(
         )
         mu = expected_returns_from_history(
             sample,
-            method=(
-                "mean"
-                if config.expected_returns_method == "historical_mean"
-                else config.expected_returns_method
+            method=expected_return_method_for_estimator(
+                config.expected_returns_method
             ),
             periods_per_year=config.periods_per_year,
             span=config.ema_span,

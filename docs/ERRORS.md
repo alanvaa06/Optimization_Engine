@@ -5,19 +5,20 @@ That only helps if the refusal is legible, so this is the contract: every
 exception the library raises on purpose, what causes it, whether it is
 recoverable, and what to catch.
 
-There are twenty-one exception classes. You almost never want to catch all of
+There are twenty-four exception classes. You almost never want to catch all of
 them, because they mean three different things:
 
 | It means | Do this | Examples |
 | --- | --- | --- |
-| **Your inputs are wrong** — a config, a universe, a constraint set | Fix the input. Retrying is pointless. | `SpecValidationError`, `LayerConfigurationError`, `BenchmarkError`, `ConfigurationError`, `SweepValidationError` |
-| **Your mandate is impossible** — the constraints have no solution | Relax something. The exception says which. | `InfeasibleConstraintsError`, `InfeasibleBoundsError`, `SolverFailure` |
+| **Your inputs are wrong** — a config, a universe, a constraint set | Fix the input. Retrying is pointless. | `SpecValidationError`, `LayerConfigurationError`, `BenchmarkError`, `ConfigurationError`, `SweepValidationError`, `StressError`, `UniverseError` |
+| **Your mandate is impossible** — the constraints have no solution, or this method cannot meet them | Relax something, or pick another method. The exception says which. | `InfeasibleConstraintsError`, `InfeasibleBoundsError`, `SolverFailure`, `MandateViolationError` |
 | **The world got in the way** — network, credentials, a vendor's bad day | Retry, or fix the environment. | `ProviderTransientError`, `ProviderCredentialsError`, `MissingDependencyError` |
 
-Five error types are exported from the package root — `IngestError`,
-`InfeasibleConstraintsError`, `YahooFinanceError`, `FREDError` and `FXError` —
-because they are what a caller writing a `try` block realistically reaches for.
-The rest are importable from the module that raises them.
+Seven error types are exported from the package root — `IngestError`,
+`InfeasibleConstraintsError`, `YahooFinanceError`, `FREDError`, `FXError`,
+`StressError` and `UniverseError` — because they are what a caller writing a
+`try` block realistically reaches for. The rest are importable from the module
+that raises them.
 
 ---
 
@@ -135,9 +136,145 @@ later.
 
 ---
 
+## Stress scenarios and the point-in-time universe
+
+Two flat `ValueError` subclasses, one per module, both exported from the
+package root. They share a posture: an input that cannot be honoured is refused
+where it was written, and a question with no honest answer is not guessed at.
+
+| Error | Raised by | Causes |
+| --- | --- | --- |
+| `StressError` | `stress_test`; `Shock` construction and `Shock.from_dict`; `shocks_from_dicts` (so `EngineConfig(stress=…)` and `EngineConfig.from_dict` too); `load_shocks`, `load_shocks_yaml` | A shock with no name, no returns, or a non-finite return; an unknown key in a scenario mapping; two scenarios sharing a name; a stress test with **no** shocks (an empty report reads exactly like a passing one); a shock naming an asset the book cannot hold, unless `unknown_assets="ignore"` says otherwise; a covariance that does not cover the book, or a `covariance_scale` that is neither a number nor a full matrix; a shocks document with an unsupported `schema_version` or neither of its two accepted shapes |
+| `UniverseError` | `Signal` construction and `to_boolean_frame`; the `Eligibility` rule builders (`from_threshold`, `from_rank`, `from_rolling`, `with_hysteresis`, `hold_through`); `to_mask` and `collapse`; `point_in_time_mask`; `Classification.label`; the whole of `universe.rules` | An index that is not dates, or is numeric — reading integers as nanoseconds since the epoch would invent a calendar; a duplicated date, which leaves an as-of lookup with no single answer; an unknown comparison operator, rolling aggregation or `top_n` below 1; a mask policy that is not one of the three; **`"raise"` meeting a cell nothing evaluated**; a point-in-time label asked for with no `as_of`; and in a rules file, an unknown key at any level, an unsupported `schema_version`, an empty `rules` list, a `hysteresis` block with no `exit`, a panel that cannot be read, or a rule naming a panel nothing supplied |
+
+Three things are worth knowing before you catch either.
+
+**An empty stress test raises rather than passing.** `stress_test` with no
+shocks has nothing to report, and a report with no findings is indistinguishable
+from one that found nothing wrong. So `run_engine(..., run_stress=True)` on a
+config with no `stress` block is a documented no-op — it attaches no report —
+while calling `stress_test` directly with an empty list is an error.
+
+**A shock naming an asset outside the book is the same defect as a view on
+one.** It is refused, not zeroed, for the reason `build_pick_matrix` refuses an
+out-of-universe Black-Litterman view: a scenario about a name you cannot hold
+is a scenario about a different portfolio. `unknown_assets="ignore"` is the
+explicit way out, and it records what it dropped.
+
+**`to_mask` has no default policy, and that is not an oversight.** A universe
+rule with a warm-up leaves cells nothing has evaluated, and there is no safe
+reading of them: `"exclude"` silently shrinks the book at every warm-up,
+`"include"` silently admits names nothing screened, and `"raise"` stops any run
+whose rules warm up at all — which is every run with a rolling rule. The library
+therefore makes the caller name one. `optengine backtest --universe` picks
+`"exclude"`, because a non-interactive run cannot ask, and prints to stderr how
+many date/asset cells that decided:
+
+```
+  Universe: 819 date/asset cell(s) across 63 bar(s) and 13 name(s) were not
+  evaluable, and the 'exclude' policy — not a screen — reads them as
+  ineligible: US_Equity, Intl_Equity, EM_Equity, Real_Estate, Commodities ….
+```
+
+`--universe-policy raise` turns that count into a refusal, and it is the one
+`UniverseError` you are most likely to meet: it means your rules have a warm-up,
+not that your data is bad.
+
+---
+
+## Conventions a caller has to know
+
+These are not errors, but every one of them has been mistaken for one.
+
+**Risk aversion is `μ'w − λ·w'Σw`, with no ½.** The convention is documented
+once, on `OptimizerSpec.risk_aversion`, and repeated here because the other
+common form carries a half in front of the variance term: a `risk_aversion`
+tuned against that form is twice as risk-averse here as intended.
+Black-Litterman passes `δ/2` for exactly this reason.
+
+**CVaR `alpha` is the tail probability**, not the confidence level.
+`alpha=0.05` means the worst 5% of outcomes.
+
+**The Sharpe ratio is arithmetic per period, annualized.** It is the quantity
+the probabilistic and deflated Sharpe ratios and the minimum track-record
+length are derived on, so they now agree with it. The geometric form is
+`sharpe_ratio(..., method="geometric")` and appears in `summary_stats` as
+`"Sharpe Ratio (geometric)"`. Sortino, Calmar and Martin keep geometric
+numerators; their docstrings say so.
+
+**`expected_returns_from_history("mean")` is the arithmetic mean.**
+Mean-variance is a single-period model, so a geometric μ against an
+arithmetic Σ is a mismatch. The geometric form is `"geometric_mean"`.
+
+**`cvar_sqrt_t_scaled` is a √T scaling, not an annualization.** It holds
+under iid-Gaussian returns and not otherwise, which is why the key no longer
+says "annualized".
+
+**An answer no solver can verify is refused, not returned.** When every
+solver in the fallback chain reports `optimal_inaccurate`, the solve raises
+`SolverFailure` with `status="optimal_inaccurate"` rather than hand back
+weights labelled optimal that are not. There are four ways to opt in, and they
+cover different things:
+
+| Opt-in | Covers |
+| --- | --- |
+| `accept_inaccurate: true` under the config's `optimizer` block | every solve the run's optimizers make, nested ones included |
+| `--accept-inaccurate` on `optengine optimize` / `backtest` | the same, by setting that field |
+| `--accept-inaccurate` on `optengine check` | the pre-flight's reachable-return LPs — `check` builds no optimizer |
+| `solve_problem(problem, accept_inaccurate=True)` | that one call |
+
+When you do opt in, the answer says so: `solver_status` on the result reads
+`optimal_inaccurate`, a warning is logged, and the UI's compliance banner shows
+it.
+
+Two edges are worth knowing. The flag is a no-op for the methods that never
+reach a solver — HRP, HERC and the naive weightings — but it is **not** a
+no-op for NCO, whose two layers are each solved by a real optimizer. And one
+call site accepts an inaccurate answer regardless of the setting: the
+projection in `_bounds.project_to_constraints`, which is the dust cleanup
+*after* a solve rather than the solve, where refusing would fail every
+soft-bounds method whose real answer had already arrived.
+
+The pre-flight `analyze_feasibility` also runs inside `optimize` and
+`backtest`, and there it keeps the default whatever the flag says: a range no
+solver could verify is reported as a `solver_error` warning rather than as a
+range, and the solve goes ahead. "We could not tell you the range" has never
+been a reason to refuse to optimize.
+
+**A book that breaks the mandate is reported, not raised — unless you say
+otherwise.** Every solve audits its own weights on the way out and attaches the
+result as `result.audit`, an `AuditReport` whose violations carry the limit, the
+actual figure and the distance between them as numbers:
+
+```python
+run = run_engine(returns, config)
+if not run.result.audit.is_clean:
+    print(run.result.audit.describe())      # one line per breach
+    print(run.result.audit.worst.magnitude) # the biggest one, in weight terms
+```
+
+The same check runs on weights from anywhere — a spreadsheet, a backtest's
+schedule, a book you did not solve for — through
+`optimization_engine.optimizers.audit.audit_weights(weights, assets,
+constraints, cov_matrix)`. Pass `assets` and an asset the weights never mention
+is audited at zero, so a floor it misses is a breach rather than an absence.
+
+Set `strict_mandate: true` in the config to make that a refusal instead. The
+default is off because the methods that apply bounds by *projection* — HRP,
+HERC, NCO, the naive weightings — can legitimately return a book their mandate
+does not permit, and refusing would make them unusable. What `bounds_mode`
+promises is narrower than what the audit checks: a `"hard"` method puts the box
+and the bucket budgets into the convex program, and still drops a turnover
+budget if it is one of the homogeneous solves (`ignored_constraints` names
+them). Two limits are dropped by every projection, so they are the ones a
+soft-bounds method most often breaches: a **turnover budget** (a projection is
+not a trade) and a **tracking-error budget** (a risk statement, not a weights
+one). An audit that ran without a covariance matrix could not check the second
+at all, and comes back clean because it did not look.
+
 ## Infeasible mandates
 
-The difference between these three matters.
+The difference between these four matters.
 
 **`InfeasibleConstraintsError`** is the good one. It is raised by the
 pre-flight analysis, before a solver is ever called, and it carries a full
@@ -155,7 +292,10 @@ except InfeasibleConstraintsError as exc:
 Note `raise_on_infeasible`. It defaults to `False`, in which case the engine
 reports the problem in `run.warnings` and proceeds. Pass `True` — the CLI's
 `--strict` — when you would rather stop. `optengine check` runs the same
-analysis without solving and exits `1` if the mandate is not ready.
+analysis without solving. It exits `2` when the mandate itself is impossible
+and `1` when the data is unusable — different problems, so a script can tell
+them apart. A finding that only says the solver could not answer is a warning,
+not a fatal: a solver that crashed is not a mandate that has no solution.
 
 **`InfeasibleBoundsError`** is narrower and comes from the projection step
 rather than the mandate analysis. Three ways in: the minima sum above 1 or the
@@ -174,21 +314,58 @@ from optimization_engine.optimizers._cvxpy_helpers import SolverFailure
 try:
     ...
 except SolverFailure as exc:
-    exc.status     # the last solver status: 'infeasible', 'unbounded', ...
+    exc.status     # 'infeasible', 'unbounded', 'optimal_inaccurate', ...
     exc.attempts   # every solver tried, in order
 ```
 
 The message already interprets the common statuses — `infeasible` means no
 allocation satisfies every constraint at once, `unbounded` means the objective
 improves without limit and you are missing a bound or a budget. The engine
-walks a solver fallback chain before giving up, and an `optimal_inaccurate`
-answer is not accepted until the rest of the chain has been tried, so a
-`SolverFailure` means every solver declined, not just the first.
+walks a solver fallback chain before giving up, so a `SolverFailure` means
+every solver declined, not just the first.
+
+`optimal_inaccurate` is the third, and it is the one that reads oddly at
+first: a solution *was* found, and refused, because no solver would vouch for
+it. See the convention above for the opt-in. Two details matter when you catch
+it. The status is `optimal_inaccurate` whenever an inaccurate answer was on
+the table and nothing better arrived, **even if a later solver in the chain
+said something else** — a fallback that then claims `infeasible` about a
+problem another solver has already found a point in is reporting its own
+numerical trouble, not a property of your mandate, and sending you to check
+the constraints would be sending you after the wrong thing. And it is
+recoverable in a way the other two are not: `infeasible` needs the mandate
+changed, whereas this one only needs you to decide whether an approximate book
+is worth having. `analyze_feasibility()` says which constraint is making the
+problem this hard.
 
 The most common cause that looks like a solver bug and is not: a
 tracking-error or active-share budget. A benchmark holding an asset your
 bounds cap below its index weight sets a *floor* on tracking error that no
 allocation can go under. Raise the limit or relax the bound.
+
+**`MandateViolationError`** is the fourth, and the only one raised *after* a
+successful solve. It means the answer arrived and does not comply, and you had
+asked to be told loudly:
+
+```python
+from optimization_engine.optimizers.audit import MandateViolationError
+
+try:
+    run = run_engine(returns, config)          # config.strict_mandate = True
+except MandateViolationError as exc:
+    exc.report                                 # the AuditReport
+    exc.report.worst.describe()                # the biggest breach, named
+```
+
+It is the most recoverable of the four, and in a different way: the mandate is
+not unsatisfiable, this *method* did not satisfy it. Three fixes, in order of
+how often they are the right one — pick a method whose `bounds_mode` is
+`"hard"` and have the limit enforced inside the convex program rather than
+projected onto afterwards; loosen the limit the report names; or, having
+decided a near-miss is acceptable, leave `strict_mandate` off and read
+`result.audit` yourself. It subclasses `ValueError`, like
+`InfeasibleConstraintsError`, and carries the report on `exc.report` for the
+same reason.
 
 ---
 
@@ -265,8 +442,11 @@ Some things are reported instead, and are easy to miss if you only guard with
 `try`:
 
 - **Constraint breaches after a solve.** A solver can return an answer that
-  violates a constraint within tolerance. This is reported in the run's
-  diagnostics, never silently accepted — and never raised either.
+  violates a constraint within tolerance, and a projecting method can return one
+  that breaches a limit it was never able to impose. Both are reported — in the
+  run's diagnostics, in `run.warnings`, and structured on `result.audit` — and
+  never silently accepted. Raised only under `strict_mandate`, which is off by
+  default.
 - **Data-quality problems.** Gaps, stale feeds, suspected unadjusted splits and
   thin samples come back in `analyze_prices(...).errors` and `.warnings`. Only
   `--strict` turns an error into a refusal.

@@ -75,7 +75,8 @@ def test_check_passes_on_a_feasible_config(feasible_config, capsys):
 
 
 def test_check_fails_and_names_the_constraint(infeasible_config, capsys):
-    assert main(["check", "--config", str(infeasible_config), "--sample"]) == 1
+    # 2 is the mandate-is-impossible code; 1 stays for unusable data.
+    assert main(["check", "--config", str(infeasible_config), "--sample"]) == 2
     captured = capsys.readouterr()
     assert "cannot reach 100% invested" in captured.out
     assert "Raise the caps" in captured.out
@@ -400,7 +401,9 @@ def test_check_honours_the_benchmark_flags_optimize_does(feasible_config, capsys
         ]
     )
     captured = capsys.readouterr()
-    assert code == 1, captured.out + captured.err
+    # 2, not 1: an impossible mandate and unusable data are different
+    # problems and a script should be able to tell them apart.
+    assert code == 2, captured.out + captured.err
     assert "Not ready to optimize." in captured.err
 
 
@@ -415,3 +418,429 @@ def test_backtest_no_longer_seeds_zero_expected_returns(tmp_path, capsys):
     assert main(["backtest", "--config", str(config), "--sample", "--lookback", "504",
                  "--rebalance-every", "252"]) == 0
     assert "initial solve failed" not in capsys.readouterr().err
+
+
+def test_accept_inaccurate_reaches_the_config_on_every_solving_subcommand(
+    feasible_config, monkeypatch
+):
+    """The flag exists on all three, and each one writes it onto the config.
+
+    ``optimize`` and ``backtest`` pass it into the solve through the optimizer
+    they build; ``check`` has no optimizer and opens the scope around its own
+    feasibility LPs. All three read it off the same field, so a config file
+    that sets ``accept_inaccurate: true`` and a command line that passes
+    ``--accept-inaccurate`` cannot disagree.
+    """
+    from optimization_engine import cli
+
+    seen: list[bool] = []
+    real = cli._apply_estimator_flags
+
+    def spy(config, args):
+        real(config, args)
+        seen.append(config.optimizer.accept_inaccurate)
+
+    monkeypatch.setattr(cli, "_apply_estimator_flags", spy)
+
+    assert main(["check", "--config", str(feasible_config), "--sample"]) == 0
+    assert main(
+        ["check", "--config", str(feasible_config), "--sample", "--accept-inaccurate"]
+    ) == 0
+    assert seen == [False, True]
+
+    for command in ("optimize", "backtest"):
+        parser_args = [command, "--config", str(feasible_config), "--sample"]
+        # Only the parser is exercised here: running a full backtest twice
+        # more to re-check one boolean is not worth the minute it costs.
+        parsed = cli._build_parser().parse_args([*parser_args, "--accept-inaccurate"])
+        assert parsed.accept_inaccurate is True
+        assert cli._build_parser().parse_args(parser_args).accept_inaccurate is False
+
+
+def test_accept_inaccurate_does_not_undo_a_config_that_asked_for_it(
+    tmp_path, feasible_config
+):
+    """Its absence on the command line is silence, not a veto."""
+    import yaml
+
+    from optimization_engine import cli
+    from optimization_engine.config import load_config
+
+    data = yaml.safe_load(feasible_config.read_text())
+    data["optimizer"]["accept_inaccurate"] = True
+    path = tmp_path / "loose.yaml"
+    path.write_text(yaml.safe_dump(data))
+
+    config = load_config(path)
+    args = cli._build_parser().parse_args(
+        ["optimize", "--config", str(path), "--sample"]
+    )
+    cli._apply_estimator_flags(config, args)
+    assert config.optimizer.accept_inaccurate is True
+
+
+# ---------------------------------------------------------------------------
+# --stress
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def shocks_file(tmp_path: Path) -> Path:
+    """One scenario over two names the shipped example config holds."""
+    path = tmp_path / "shocks.yaml"
+    path.write_text(
+        yaml.safe_dump(
+            {
+                "schema_version": 1,
+                "shocks": [
+                    {
+                        "name": "risk_off",
+                        "returns": {"US_Equity": -0.20, "Gold": 0.05},
+                        "covariance_scale": 2.0,
+                        "notes": "a 2008-shaped day",
+                    }
+                ],
+            }
+        )
+    )
+    return path
+
+
+def test_optimize_stresses_the_book_it_solved(feasible_config, shocks_file, capsys):
+    assert (
+        main(
+            ["optimize", "--config", str(feasible_config), "--sample",
+             "--stress", str(shocks_file)]
+        )
+        == 0
+    )
+    out = capsys.readouterr().out
+    assert "Loaded 1 stress scenario(s)" in out
+    assert "risk_off" in out
+    assert "of book value" in out
+    assert "a 2008-shaped day" in out
+
+
+def test_backtest_stresses_the_book_the_walk_forward_ended_on(
+    feasible_config, shocks_file, capsys
+):
+    assert (
+        main(
+            ["backtest", "--config", str(feasible_config), "--sample",
+             "--lookback", "252", "--rebalance-every", "252",
+             "--stress", str(shocks_file)]
+        )
+        == 0
+    )
+    out = capsys.readouterr().out
+    assert "risk_off" in out and "of book value" in out
+
+
+def test_an_unreadable_stress_file_is_an_exit_code_not_a_traceback(
+    feasible_config, tmp_path, capsys
+):
+    bad = tmp_path / "bad.yaml"
+    bad.write_text(yaml.safe_dump({"shocks": [{"name": "x", "retruns": {"A": -0.1}}]}))
+    assert (
+        main(["optimize", "--config", str(feasible_config), "--sample",
+              "--stress", str(bad)])
+        == 2
+    )
+    err = capsys.readouterr().err
+    assert "Could not read stress scenarios" in err and "retruns" in err
+
+    missing = tmp_path / "nowhere.yaml"
+    assert (
+        main(["optimize", "--config", str(feasible_config), "--sample",
+              "--stress", str(missing)])
+        == 2
+    )
+    assert "Could not read stress scenarios" in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------------------
+# --strict-mandate
+# ---------------------------------------------------------------------------
+
+
+def test_strict_mandate_is_the_flag_form_of_the_config_key(feasible_config):
+    """Both commands carry it, and it is one-way: absent means silent."""
+    from optimization_engine import cli
+    from optimization_engine.config import load_config
+
+    for command in ("optimize", "backtest"):
+        args = cli._build_parser().parse_args(
+            [command, "--config", str(feasible_config), "--sample", "--strict-mandate"]
+        )
+        assert args.strict_mandate is True
+        config = load_config(feasible_config)
+        cli._apply_estimator_flags(config, args)
+        assert config.strict_mandate is True
+
+    # Absent, it does not switch off a config that already asked to refuse.
+    config = load_config(feasible_config)
+    config.strict_mandate = True
+    plain = cli._build_parser().parse_args(
+        ["optimize", "--config", str(feasible_config), "--sample"]
+    )
+    assert plain.strict_mandate is False
+    cli._apply_estimator_flags(config, plain)
+    assert config.strict_mandate is True
+
+
+def test_a_refused_book_exits_two_with_the_breach_named(tmp_path, capsys):
+    """HRP under a turnover budget it cannot honour, refused rather than reported.
+
+    Without the CLI's own handler this is the one failure ``--strict-mandate``
+    exists to produce and the only one that would leak a traceback, since
+    ``MandateViolationError`` is a ``ValueError`` and the ``except
+    SolverFailure`` clause never sees it.
+    """
+    data = yaml.safe_load(EXAMPLE_CONFIG.read_text())
+    assets = list(data["expected_returns"])
+    data["optimizer"] = {"name": "hrp"}
+    data["previous_weights"] = {a: (1.0 if a == assets[0] else 0.0) for a in assets}
+    data["turnover_limit"] = 0.01
+    path = tmp_path / "hrp.yaml"
+    path.write_text(yaml.safe_dump(data))
+
+    assert (
+        main(["optimize", "--config", str(path), "--sample", "--strict-mandate"]) == 2
+    )
+    err = capsys.readouterr().err
+    assert "breach the mandate" in err
+    assert "Turnover" in err
+    assert "Traceback" not in err
+    assert "this method did not satisfy it" in err
+
+
+def test_backtests_anchor_solve_is_refused_without_a_traceback(tmp_path, capsys):
+    """The one refusal a backtest cannot record as a failed window.
+
+    Every per-window refusal is caught inside the walk-forward. The anchor
+    solve ``_cmd_backtest`` makes before it is outside that loop, so it needs
+    its own handler or the flag leaks a traceback and exits 1.
+    """
+    data = yaml.safe_load(EXAMPLE_CONFIG.read_text())
+    assets = list(data["expected_returns"])
+    data["optimizer"] = {"name": "hrp"}
+    data["previous_weights"] = {a: (1.0 if a == assets[0] else 0.0) for a in assets}
+    data["turnover_limit"] = 0.01
+    path = tmp_path / "hrp-backtest.yaml"
+    path.write_text(yaml.safe_dump(data))
+
+    assert (
+        main(
+            ["backtest", "--config", str(path), "--sample",
+             "--lookback", "252", "--rebalance-every", "252", "--strict-mandate"]
+        )
+        == 2
+    )
+    err = capsys.readouterr().err
+    assert "The initial solve was refused" in err
+    assert "Turnover" in err
+    assert "Traceback" not in err
+
+
+def test_a_shock_outside_the_panel_is_refused_on_both_commands(
+    feasible_config, tmp_path, capsys
+):
+    """Refused, not zeroed — the same posture as an out-of-universe BL view."""
+    path = tmp_path / "oops.yaml"
+    path.write_text(
+        yaml.safe_dump({"shocks": [{"name": "bad", "returns": {"NOT_IN_PANEL": -0.1}}]})
+    )
+    for argv in (
+        ["optimize", "--config", str(feasible_config), "--sample",
+         "--stress", str(path)],
+        ["backtest", "--config", str(feasible_config), "--sample",
+         "--lookback", "252", "--rebalance-every", "252", "--stress", str(path)],
+    ):
+        assert main(argv) == 2, argv
+        err = capsys.readouterr().err
+        assert "Stress test failed" in err and "NOT_IN_PANEL" in err
+        assert "Traceback" not in err
+
+
+# ---------------------------------------------------------------------------
+# --universe
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def universe_file(tmp_path: Path) -> Path:
+    """A screen over the run's own return panel — no data files beside it."""
+    path = tmp_path / "universe.yaml"
+    path.write_text(
+        yaml.safe_dump(
+            {
+                "schema_version": 1,
+                "combine": "all",
+                "rules": [
+                    {
+                        "kind": "rolling", "panel": "returns", "window": 21,
+                        "agg": "count", "op": ">=", "value": 21,
+                        "name": "printed on all of the last 21 sessions",
+                    }
+                ],
+            }
+        )
+    )
+    return path
+
+
+def test_backtest_reads_a_universe_and_says_what_the_policy_decided(
+    feasible_config, universe_file, capsys
+):
+    assert (
+        main(
+            ["backtest", "--config", str(feasible_config), "--sample",
+             "--lookback", "252", "--rebalance-every", "252",
+             "--universe", str(universe_file)]
+        )
+        == 0
+    )
+    captured = capsys.readouterr()
+    assert "printed on all of the last 21 sessions" in captured.out
+    # The count of what the default policy — not a screen — decided, on stderr
+    # with the alignment log and for the same reason.
+    assert "not evaluable" in captured.err
+    assert "'exclude' policy" in captured.err
+    assert "reads them as ineligible" in captured.err
+
+
+def test_the_universe_policy_defaults_to_exclude_and_raise_stops_the_run(
+    feasible_config, universe_file, capsys
+):
+    from optimization_engine import cli
+
+    parsed = cli._build_parser().parse_args(
+        ["backtest", "--config", str(feasible_config), "--sample"]
+    )
+    assert parsed.universe_policy == "exclude"
+
+    assert (
+        main(
+            ["backtest", "--config", str(feasible_config), "--sample",
+             "--lookback", "252", "--rebalance-every", "252",
+             "--universe", str(universe_file), "--universe-policy", "raise"]
+        )
+        == 2
+    )
+    err = capsys.readouterr().err
+    assert "Universe failed" in err
+    assert "not evaluable" in err
+    assert "Traceback" not in err
+
+
+def test_the_universe_reaches_the_json_payload(
+    feasible_config, universe_file, tmp_path, capsys
+):
+    """``meta.notes["universe"]`` with its *values*, not just its keys."""
+    import json
+
+    assert (
+        main(
+            ["backtest", "--json", "--config", str(feasible_config), "--sample",
+             "--lookback", "252", "--rebalance-every", "252",
+             "--universe", str(universe_file), "--delisting-grace", "5"]
+        )
+        == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+    notes = payload["notes"]
+
+    universe = notes["universe"]
+    assert universe["policy"] == "exclude"
+    assert universe["n_decisions"] >= 1
+    assert universe["min_breadth"] >= 1
+    assert all(isinstance(v, int) for v in universe["breadth"].values())
+    assert universe["unknown_assets"] == []
+    # The separate opt-in lands beside it, and only because it was asked for.
+    assert notes["delisting_grace"] == 5
+    assert "delistings" in notes
+
+
+def test_delisting_grace_is_absent_from_the_notes_unless_asked_for(
+    feasible_config, capsys
+):
+    import json
+
+    assert (
+        main(
+            ["backtest", "--json", "--config", str(feasible_config), "--sample",
+             "--lookback", "252", "--rebalance-every", "252"]
+        )
+        == 0
+    )
+    notes = json.loads(capsys.readouterr().out)["notes"]
+    assert "delisting_grace" not in notes
+    assert "universe" not in notes
+
+
+def test_an_unreadable_universe_file_is_an_exit_code_not_a_traceback(
+    feasible_config, tmp_path, capsys
+):
+    bad = tmp_path / "bad-universe.yaml"
+    bad.write_text(
+        yaml.safe_dump(
+            {"rules": [{"kind": "rolling", "panel": "returns", "windwo": 3,
+                        "agg": "mean", "op": ">", "value": 0.0}]}
+        )
+    )
+    assert (
+        main(["backtest", "--config", str(feasible_config), "--sample",
+              "--universe", str(bad)])
+        == 2
+    )
+    err = capsys.readouterr().err
+    assert "Could not read the universe" in err and "windwo" in err
+    assert "Traceback" not in err
+
+
+def test_a_universe_over_a_characteristic_panel_comes_in_through_the_rules_file(
+    feasible_config, tmp_path, capsys
+):
+    """The ADV screen the CLI has no other route for.
+
+    ``_prepare_inputs`` loads prices and nothing else, so the panel's path is
+    written into the rules file and resolved against that file's directory.
+    """
+    import json
+
+    from optimization_engine.data.loader import prices_to_returns, sample_dataset
+
+    data = yaml.safe_load(EXAMPLE_CONFIG.read_text())
+    assets = list(data["expected_returns"])
+    returns = prices_to_returns(sample_dataset(assets=assets))
+    adv = pd.DataFrame(2.0e7, index=returns.index, columns=assets)
+    thin = assets[-1]
+    adv[thin] = 1.0e5
+    adv.to_csv(tmp_path / "adv.csv")
+
+    rules = tmp_path / "adv-universe.yaml"
+    rules.write_text(
+        yaml.safe_dump(
+            {
+                "panels": {"adv": "adv.csv"},
+                "rules": [
+                    {"kind": "threshold", "panel": "adv", "op": ">=",
+                     "value": 1.0e7, "name": "ADV over $10m"}
+                ],
+            }
+        )
+    )
+
+    assert (
+        main(
+            ["backtest", "--json", "--config", str(feasible_config), "--sample",
+             "--lookback", "252", "--rebalance-every", "252",
+             "--universe", str(rules)]
+        )
+        == 0
+    )
+    captured = capsys.readouterr()
+    assert "Panels read from disk: adv" in captured.err
+    universe = json.loads(captured.out)["notes"]["universe"]
+    # Every name but the thin one, on every decision.
+    assert set(universe["breadth"].values()) == {len(assets) - 1}

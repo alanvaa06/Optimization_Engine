@@ -1,0 +1,67 @@
+# Illustrative point-in-time universe for the sample panel.
+#
+#   optengine backtest --config config/example_multi_asset.yaml --sample \
+#       --universe config/universe.yaml --universe-policy exclude
+#
+# Every rule here reads ``returns``, which the *run* supplies — so this file
+# needs no ``panels:`` block and no data beside it. That is deliberate: an
+# example that required an ADV or market-capitalisation panel this repository
+# does not ship would be an example nobody could run. A real mandate screening
+# on liquidity or size declares those panels here, with their paths, and the
+# loader reads them relative to this file.
+#
+# The screen is a volatility band with hysteresis, which is the shape most
+# real membership rules take:
+#
+#   enter  — trailing 63-session volatility below 20% annualized
+#   leave  — only once it reaches 24% annualized
+#
+# The gap between the two is what stops a name that sits on the threshold from
+# entering and leaving every week, and it is why membership is a state rather
+# than a re-evaluated boolean.
+#
+# The first 63 rows are **not evaluable**, not ineligible: there is no complete
+# prior window behind them, and answering "not eligible" there would assert a
+# test that never ran. What those cells mean is decided by --universe-policy,
+# which has no default; the run prints how many cells that decided.
+
+schema_version: 1
+combine: all
+
+rules:
+  # A liveness screen: the name printed on every one of the last 63 sessions.
+  # On a clean panel this passes everywhere after the warm-up, which is what a
+  # liveness screen is supposed to do — it earns its place on the day a series
+  # goes quiet.
+  - kind: rolling
+    panel: returns
+    window: 63
+    agg: count
+    op: ">="
+    value: 63
+    name: printed on every one of the last 63 sessions
+
+  # Trailing volatility, in the daily units of the return panel:
+  # 0.0126 ≈ 20% annualized (0.20 / √252).
+  - kind: rolling
+    panel: returns
+    window: 63
+    agg: std
+    op: "<"
+    value: 0.0126
+    name: trailing 63-session volatility under 20% annualized
+
+hysteresis:
+  # 0.0151 ≈ 24% annualized. A member stays a member until this fires.
+  exit:
+    - kind: rolling
+      panel: returns
+      window: 63
+      agg: std
+      op: ">="
+      value: 0.0151
+      name: trailing 63-session volatility at or above 24% annualized
+  # Membership before the first evaluable date is *unknown*, and propagates as
+  # unknown rather than defaulting a name in or out. The collapse policy — not
+  # this file — decides what that means.
+  initial: null

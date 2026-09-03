@@ -15,8 +15,13 @@ is therefore derived from two LPs over the actual constraint set.
 
 **Only the upper branch is efficient.** Targets below the global
 minimum-variance return are *dominated*: the same volatility buys more return
-higher up. They are still solved, so the analyst can see the full opportunity
-set, but they are flagged and excluded from the efficient frontier by default.
+higher up. The mean-variance sweep imposes its return target as ``μ'w ≥ R*``
+(see :class:`~optimization_engine.optimizers.mean_variance.MeanVarianceOptimizer`),
+so a target below the minimum-variance return simply returns the
+minimum-variance portfolio rather than a dominated one — the lower branch is
+not reachable through this sweep at all. ``is_efficient`` is still computed and
+reported, because a mean-CVaR sweep minimizes a different risk measure and can
+land below the minimum-*variance* return.
 """
 
 from __future__ import annotations
@@ -24,7 +29,7 @@ from __future__ import annotations
 import copy
 from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Literal
 
 import numpy as np
@@ -44,7 +49,9 @@ class FrontierResult:
     Attributes:
         summary: One row per swept target. Carries ``expected_return``,
             ``expected_volatility``, ``sharpe_ratio``, ``status``, and
-            ``is_efficient`` — False for points on the dominated lower branch.
+            ``is_efficient`` — False for points below the minimum-variance
+            return. The mean-variance sweep cannot produce one (its target is
+            an inequality); a mean-CVaR sweep can.
         weights: Assets × targets weight matrix.
         group_weights: Same, aggregated by group. Empty when no groups.
         min_variance: Summary row of the global minimum-variance portfolio.
@@ -53,6 +60,10 @@ class FrontierResult:
             mean-variance sweep, ``"CVaR"`` for a mean-CVaR sweep.
         reachable_range: ``(min, max)`` expected return the constraints allow.
         failures: Human-readable reasons for any point that did not solve.
+        anchor_failures: ``{"min_variance"|"tangency": reason}`` for any anchor
+            portfolio that could not be solved. An anchor that fails leaves its
+            field ``None``, which on its own is indistinguishable from "not
+            requested"; this says why, and the chart prints it.
     """
 
     summary: pd.DataFrame
@@ -63,6 +74,7 @@ class FrontierResult:
     risk_measure: str = "volatility"
     reachable_range: tuple[float, float] | None = None
     failures: tuple[str, ...] = ()
+    anchor_failures: dict[str, str] = field(default_factory=dict)
 
     @property
     def max_sharpe_index(self) -> int:
@@ -152,13 +164,25 @@ def _anchor_portfolios(
     base_config: EngineConfig,
     cov_matrix: pd.DataFrame,
     expected_returns: pd.Series | None,
-) -> tuple[pd.Series | None, pd.Series | None]:
+) -> tuple[pd.Series | None, pd.Series | None, dict[str, str]]:
     """Solve the two portfolios every frontier chart should mark.
 
     The global minimum-variance point is where the efficient branch starts;
     the tangency point is where a risk-free asset would take you. Both are
     solved directly rather than picked off the sweep, so they land on the
     true frontier instead of the nearest grid point.
+
+    Neither is allowed to fail silently. A mandate can make the tangency
+    portfolio infeasible while leaving the frontier itself perfectly
+    solvable; swallowing that exception drops the marker off the chart and
+    the analyst has no way to tell "no tangency portfolio exists here" from
+    "the chart forgot to draw it".
+
+    Returns:
+        ``(min_variance_row, tangency_row, anchor_failures)``. The failure
+        map is keyed by the :class:`FrontierResult` field the anchor lands
+        in — ``"min_variance"`` and ``"tangency"`` — and carries the
+        exception text for every anchor that did not solve.
     """
     from optimization_engine.optimizers.mean_variance import (
         MaxSharpeOptimizer,
@@ -180,6 +204,7 @@ def _anchor_portfolios(
         )
 
     gmv = tangency = None
+    anchor_failures: dict[str, str] = {}
     try:
         gmv_result = MinVarianceOptimizer(
             expected_returns=expected_returns,
@@ -189,8 +214,8 @@ def _anchor_portfolios(
         ).optimize()
         gmv = _row(gmv_result, "Minimum variance")
         gmv["weights"] = gmv_result.weights
-    except Exception:
-        pass
+    except Exception as exc:
+        anchor_failures["min_variance"] = str(exc)
 
     if expected_returns is not None:
         try:
@@ -202,10 +227,10 @@ def _anchor_portfolios(
             ).optimize()
             tangency = _row(tan_result, "Maximum Sharpe")
             tangency["weights"] = tan_result.weights
-        except Exception:
-            pass
+        except Exception as exc:
+            anchor_failures["tangency"] = str(exc)
 
-    return gmv, tangency
+    return gmv, tangency, anchor_failures
 
 
 def _resolve_return_range(
@@ -284,9 +309,11 @@ def efficient_frontier(
             from what the constraints can actually reach.
         n_workers: Thread-pool size. ``None`` uses ``min(8, n_points)``;
             ``1`` or less runs sequentially.
-        efficient_only: Start the sweep at the minimum-variance return so the
-            dominated lower branch is not traced. Points below it are flagged
-            ``is_efficient=False`` when they are swept anyway.
+        efficient_only: Start the sweep at the minimum-variance return. The
+            mean-variance target is an inequality, so targets below that
+            return all resolve to the same minimum-variance portfolio and
+            add nothing; a mean-CVaR sweep can genuinely land below it, and
+            those points are flagged ``is_efficient=False``.
 
     Raises:
         ValueError: On an unknown ``sweep``, or a return sweep with no
@@ -300,7 +327,9 @@ def efficient_frontier(
         base_config.optimizer.name = "mean_variance"
     risk_measure = "CVaR" if base_config.optimizer.name == "cvar" else "volatility"
 
-    gmv, tangency = _anchor_portfolios(base_config, cov_matrix, expected_returns)
+    gmv, tangency, anchor_failures = _anchor_portfolios(
+        base_config, cov_matrix, expected_returns
+    )
     reachable: tuple[float, float] | None = None
 
     if sweep == "return":
@@ -375,7 +404,7 @@ def efficient_frontier(
                 "status": "ok",
             }
             if risk_measure == "CVaR":
-                row["cvar"] = result.extras.get("cvar_annualized", np.nan)
+                row["cvar"] = result.extras.get("cvar_sqrt_t_scaled", np.nan)
             summary_rows.append(row)
             weights_rows.append(result.weights.rename(target))
 
@@ -391,4 +420,5 @@ def efficient_frontier(
         risk_measure=risk_measure,
         reachable_range=reachable,
         failures=tuple(failures),
+        anchor_failures=anchor_failures,
     )

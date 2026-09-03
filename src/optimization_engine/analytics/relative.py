@@ -372,6 +372,13 @@ def treynor_ratio(
     exposure alone — the right comparison for a sleeve inside a larger book,
     the wrong one for a standalone allocation.
 
+    **Convention:** the numerator is *geometric* — :func:`annualize_returns`
+    compounds it — while
+    :func:`~optimization_engine.analytics.performance.sharpe_ratio` now
+    annualizes arithmetically. The two ratios in the same summary do not share
+    a numerator, so a Treynor cannot be read as "the Sharpe with beta in the
+    denominator". Deliberate and unchanged; stated so the mixing is visible.
+
     Args:
         r: Portfolio returns — a stream, or a frame of them.
         rb: Benchmark returns, over the same dates.
@@ -405,6 +412,14 @@ def m_squared(
     the Sharpe ratio — the ranking is identical — but in percentage points
     rather than in ratio units, which is what makes it answerable: "this
     portfolio earned 1.8% a year more than the index at the same risk".
+
+    **Convention:** it is built from
+    :func:`~optimization_engine.analytics.performance.sharpe_ratio`, so it
+    inherits that function's *arithmetic* annualization and moves with it —
+    unlike :func:`information_ratio` and :func:`treynor_ratio`, whose
+    numerators stay geometric. On the sample panel the switch raised the
+    equal-weight Sharpe from 0.5950 to 0.6238, and M-squared rises in the
+    same proportion.
 
     Args:
         r: Portfolio returns — a stream, or a frame of them.

@@ -171,7 +171,9 @@ class CDaROptimizer(BaseOptimizer):
         self._diagnostics.update(info.as_dict())
 
         weights = np.asarray(w.value, dtype=float)
-        self._record_drawdown_metrics(weights, float(zeta.value))
+        self._record_drawdown_metrics(
+            weights, float(zeta.value), float(objective.value)
+        )
         return weights
 
     def _target_mu_vector(self) -> np.ndarray:
@@ -186,13 +188,23 @@ class CDaROptimizer(BaseOptimizer):
         )
         return (1 + self.returns.mean().values) ** self.periods_per_year - 1
 
-    def _record_drawdown_metrics(self, weights: np.ndarray, zeta: float) -> None:
+    def _record_drawdown_metrics(
+        self, weights: np.ndarray, zeta: float, solver_objective: float
+    ) -> None:
         """Report the realized drawdown shape of the chosen allocation.
 
         The solver's objective is stated on the uncompounded curve; the
         figures here are recomputed on the compounded one, which is the
         drawdown an investor would actually have lived through. Reporting
         both is the honest way to show what the approximation cost.
+
+        Args:
+            weights: The chosen allocation.
+            zeta: The solved ``ζ`` — the drawdown-at-risk threshold, the same
+                quantity mean-CVaR reports as ``cvar_solver_zeta``. It is
+                *not* the objective, which is why it is no longer called one.
+            solver_objective: The solved ``ζ + Σz/(α·T)`` — the CDaR the
+                program actually minimized, on the uncompounded curve.
         """
         from optimization_engine.analytics.risk import drawdown_series
 
@@ -218,7 +230,8 @@ class CDaROptimizer(BaseOptimizer):
         self._diagnostics.update(
             {
                 "cdar_alpha": self.alpha,
-                "cdar_solver_objective": float(zeta),
+                "cdar_solver_zeta": zeta,
+                "cdar_solver_objective": solver_objective,
                 "cdar_realized": cdar,
                 "dar_realized": float(-threshold),
                 "max_drawdown": float(realized.min()),

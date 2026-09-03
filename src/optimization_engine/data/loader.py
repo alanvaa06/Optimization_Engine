@@ -88,11 +88,16 @@ def prices_to_returns(prices: pd.DataFrame, log: bool = False) -> pd.DataFrame:
     Returns:
         A frame one row shorter than ``prices``, with rows that are entirely
         missing dropped. Individual gaps are left as NaN for the alignment
-        step to deal with explicitly.
+        step to deal with explicitly: an interior missing price costs *two*
+        returns, the gap and the period after it. ``fill_method=None`` is
+        passed explicitly because pandas 2.0-2.2 forward-fill by default and
+        3.0 does not — left implicit, the same panel would give a different
+        return series depending on which pandas was installed, with the gap
+        becoming a 0% period followed by the two-period move booked as one.
     """
     if log:
         return np.log(prices / prices.shift(1)).dropna(how="all")
-    return prices.pct_change().dropna(how="all")
+    return prices.pct_change(fill_method=None).dropna(how="all")
 
 
 def sample_dataset(

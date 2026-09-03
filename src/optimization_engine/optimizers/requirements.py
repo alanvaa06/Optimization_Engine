@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 from typing import Any, Literal
 
 ExtraKind = Literal["per_asset", "scalar", "choice", "view_table", "market_caps"]
-BoundsMode = Literal["hard", "soft_iterated", "constrained"]
+BoundsMode = Literal["hard", "soft_iterated", "constrained", "hard_or_projected"]
 
 
 @dataclass(frozen=True)
@@ -102,6 +102,14 @@ class MethodRequirements:
                 "allocation. Bounds and group budgets do hold, but a binding "
                 "one moves the result away from the method's own answer — the "
                 "distance moved is reported with the result."
+            ),
+            "hard_or_projected": (
+                "Bounds and group budgets are enforced inside the solve, "
+                "which is where this method normally answers. If that solve "
+                "fails numerically it falls back to an unconstrained solve "
+                "plus a projection, and then the bounds hold only "
+                "approximately — the result reports which of the two "
+                "happened, and how far the projection moved it."
             ),
         }[self.bounds_mode]
 
@@ -457,7 +465,7 @@ REQUIREMENTS: dict[str, MethodRequirements] = {
         requires_mu=False, requires_cov=True, requires_returns=False,
         supports_target_return=False, supports_target_volatility=False,
         supports_risk_aversion=False, supports_risk_free_rate=False,
-        supports_group_bounds=True, bounds_mode="hard",
+        supports_group_bounds=True, bounds_mode="hard_or_projected",
         supports_frontier=False, supports_turnover=False, extras=(),
         summary=(
             "Maximize weighted-average asset volatility divided by portfolio "
