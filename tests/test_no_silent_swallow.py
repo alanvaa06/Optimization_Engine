@@ -93,19 +93,6 @@ RETURN_ALLOWLIST: tuple[Allowed, ...] = (
         "the probe is tri-state and returns None for 'unanswerable', which the "
         "caller reads as 'not proven guilty' rather than as a clean bill",
     ),
-    Allowed(
-        "optimization_engine/optimizers/factory.py",
-        # KNOWN DEFECT, recorded rather than fixed: this agent owns no source
-        # file. ``_expected_returns_for`` falls back to the prior mean when the
-        # Black-Litterman posterior raises, so Task 1.6's new out-of-universe
-        # and degenerate-view validation is swallowed on the preview path while
-        # the real solve raises on the same config. The two disagree, silently,
-        # which is exactly the failure mode this module exists to prevent.
-        # Delete this entry when the handler learns to report; the stale-entry
-        # check below will then insist on it.
-        "KNOWN DEFECT (execution log item 8): swallows Black-Litterman's "
-        "validation so the preview falls back where the real solve raises",
-    ),
 )
 
 
