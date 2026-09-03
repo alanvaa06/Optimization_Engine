@@ -391,5 +391,6 @@ def test_no_bare_pct_change_survives_in_the_tree() -> None:
                 if not isinstance(func, ast.Attribute) or func.attr != "pct_change":
                     continue
                 if not any(kw.arg == "fill_method" for kw in node.keywords):
-                    offenders.append(f"{path.relative_to(ROOT)}:{node.lineno}")
+                    # POSIX form, so the message reads the same on Windows.
+                    offenders.append(f"{path.relative_to(ROOT).as_posix()}:{node.lineno}")
     assert offenders == [], "bare pct_change(): " + ", ".join(offenders)

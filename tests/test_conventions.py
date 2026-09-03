@@ -304,7 +304,8 @@ def _arithmetic_annualizer_sites() -> list[tuple[str, int, str]]:
                     continue
                 found.append(
                     (
-                        str(path.relative_to(ROOT)),
+                        # POSIX form, or this never matches on Windows.
+                        path.relative_to(ROOT).as_posix(),
                         node.lineno,
                         enclosing.get(node.lineno, "<module>"),
                     )

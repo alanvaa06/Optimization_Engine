@@ -36,6 +36,7 @@ leave a stale exemption behind for the next silent handler to hide under.
 from __future__ import annotations
 
 import ast
+import pathlib
 from pathlib import Path
 from typing import NamedTuple
 
@@ -143,7 +144,10 @@ def _scan() -> tuple[list[Site], list[Site]]:
     pass_sites: list[Site] = []
     return_sites: list[Site] = []
     for path in sorted(SRC.rglob("*.py")):
-        relative = str(path.relative_to(SRC))
+        # ``as_posix``, not ``str``: on Windows ``str`` yields backslashes,
+        # and every allowlist entry and message below is written with
+        # forward slashes. Comparing the two silently finds nothing.
+        relative = path.relative_to(SRC).as_posix()
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
         for node in ast.walk(tree):
             if not isinstance(node, ast.ExceptHandler) or not _is_broad(node):
@@ -157,6 +161,20 @@ def _scan() -> tuple[list[Site], list[Site]]:
                         Site(relative, node.lineno, ast.unparse(body[0]))
                     )
     return pass_sites, return_sites
+
+
+def test_the_scan_reports_paths_in_the_form_the_allowlists_use():
+    """Every key the scan produces must be comparable to an allowlist entry.
+
+    The allowlists are written with forward slashes. ``str()`` on a Windows
+    path gives backslashes, so the two never match and the scan reports the
+    one handler it permits as a new violation — which is exactly how this
+    file failed on the Windows runner the first time it ran there.
+    """
+    pass_sites, return_sites = _scan()
+    for site in [*pass_sites, *return_sites]:
+        assert "\\" not in site.path, site.path
+        assert site.path == pathlib.PurePosixPath(site.path).as_posix()
 
 
 def _report_new(sites: list[Site], allowlist: tuple[Allowed, ...], shape: str) -> str:
