@@ -517,12 +517,70 @@ plan above was written from a read of the source, and a read is not a run.
    expected_returns` swallows Black-Litterman's new validation, so the preview
    falls back silently while the real solve raises.
 
+### The rest of the increments
+
+| Task | Commit | Landed |
+| --- | --- | --- |
+| 1.5 estimators | `da7a296` | Arithmetic mu with one definition site; counted Michaud draws; EWMA effective sample |
+| 3.3 feasibility | `ac674d0` | Structural stage with no solver; a solver crash is no longer "infeasible" |
+| 3.5 universe | `fd13abd` | `Signal`/`Eligibility`/`Classification`; both runners take a universe |
+| 3.1 solver contract | `fde8126` | `accept_inaccurate=False`, carried by an ambient scope |
+| 3.2 mandate audit | `eb44d3a` | `audit_weights`, `strict_mandate`, NCO opt-out |
+| 3.4 stress + presets | `2b3f4a3` | `stress.py`; `scenarios` → `presets` with a shim |
+| Wiring | `b485b67` | `--stress`, `--strict-mandate`, `--universe` with a rules loader |
+| App | `7af50ec` | Stress and Universe tabs; stress in `--json`; example config files |
+
+### More corrections execution turned up
+
+9. **`accept_inaccurate` cannot thread through constructors.** NCO builds its
+   sub-optimizers inside its own `_solve` and never tells them the caller's
+   settings, and since §2.2 those sub-solves go through `optimize()`. A plain
+   boolean default would have silently reset them mid-solve; the setting
+   travels as an inherit-by-default `ContextVar` instead. The plan's note that
+   the flag is a no-op for the clustered methods is wrong for NCO.
+10. **The §3.2 acceptance test's premise is false.** HRP with a layer cap does
+    *not* breach under projection — the projection puts every layer into its
+    own program and meets a 20% bucket cap exactly. What a projection genuinely
+    cannot represent is a turnover budget and a tracking-error budget.
+11. **"Every `bounds_mode="hard"` method audits clean" is not true as stated.**
+    `bounds_mode` is a claim about per-asset and group bounds; the audit checks
+    everything the mandate carries, and `max_sharpe` honestly declares that it
+    ignores a turnover budget. The cross-check is restricted to weight-only
+    mandates.
+12. **The silent-swallow count was one, not three.** Two of the sites reported
+    during execution do not exist — those files contain no `except` at all.
+    A sixth site does exist that a `pass`-body scan structurally cannot see:
+    `factory.py`'s `return`-bodied handler, fixed in `911b6a4`.
+13. **"Geometric Sharpe is below arithmetic" is false in general.** Compounding
+    is convex, and its second-order term beats variance drag whenever
+    volatility falls below about `sqrt(ppy-1)` times the mean. The docstring
+    stated the shorthand as a rule; corrected in `686df53`.
+14. **The projection honours `max_active_share`.** Setting it is what forces
+    the CVXPY branch. See correction 1.
+
 ### Still open
 
 - `app/streamlit_app.py:1890,:1919` — the dominated-branch checkbox is inert.
+  `show_dominated` can come out of `plot_efficient_frontier` after 0.7.x.
 - `reporting/plots.py` still labels the mean-CVaR axis "annualized", the same
-  false claim as the key renamed in §1.14; it coordinates with an app caption.
+  false claim as the key renamed in §1.14; it coordinates with an app caption
+  and a test, so it wants its own change.
 - `app/components.py:404 render_frontier_health` shows `failures` but not
-  `anchor_failures`.
-- README's walk-forward Sharpe figures move with §1.10(c) and must be
-  regenerated from `scripts/render_docs_images.py`, not edited by hand.
+  `anchor_failures`. The chart footnote covers the visual case.
+- The app's Excel export carries no stress sheet: the Report tab claims sheet
+  parity with `optengine optimize`, so this belongs in `reporting/exporters.py`
+  rather than in the app.
+- Three nested solves — in `frontier.py`, `resampling.py` and
+  `black_litterman.py` — still pay for the full post-solve pass. The §3.2
+  opt-out applies to all three.
+- `engine.py` keeps an inline expected-return vocabulary map that duplicates
+  `expected_return_method_for_estimator`. It is correct, but it is a second
+  copy.
+- The mypy allowlist stands at 45 modules and may only shrink.
+
+### Done
+
+Every one of the design's 27 items is implemented, with the acceptance tests
+it names. `docs/superpowers/specs/2026-09-02-numerical-rigor-and-honesty-design.md`
+§1.11(c) — the Black-Litterman posterior-covariance discontinuity — is the one
+item the design itself defers, and it remains open by its own instruction.
