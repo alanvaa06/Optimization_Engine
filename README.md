@@ -839,6 +839,33 @@ optengine backtest --config config/example_multi_asset.yaml --sample \
 optengine backtest --config config/example_multi_asset.yaml --sample \
     --commission-bps 10 --holdout 2024-01-01
 
+# Ask what a named bad day does to the book, before it happens. Each scenario
+# is a one-period return shock per asset; the report decomposes the loss onto
+# the positions that produced it, so the contributions add to the P&L exactly.
+# A shock naming an asset the book cannot hold is refused, not zeroed.
+optengine optimize --config config/example_multi_asset.yaml --sample \
+    --stress shocks.yaml
+
+# Refuse a book that breaks the mandate instead of reporting the breach. It
+# fires *after* a successful solve, and it is the methods that apply bounds by
+# projection — HRP, HERC, NCO, the naive weightings — that it stops. Inside a
+# backtest a refused window is recorded as a failed solve rather than ending
+# the run, so read the "solve(s) failed" line.
+optengine optimize --config config/example_multi_asset.yaml --sample \
+    --strict-mandate
+
+# Backtest against a universe that changes through time, instead of against
+# the survivors of today's panel. The rules file carries its own data paths —
+# a rule over ADV and the ADV panel are one statement — so a screen over
+# nothing but the return panel needs no files beside it. --universe-policy
+# says how a cell no rule could evaluate is read; it defaults to 'exclude' and
+# the run prints on stderr how many cells that decided. --delisting-grace is a
+# separate opt-in: the screen says what the mandate permits, this says what
+# still trades.
+optengine backtest --config config/example_multi_asset.yaml --sample \
+    --universe universe.yaml --universe-policy exclude \
+    --delisting-grace 5
+
 # Price capacity from real traded volume rather than an assumed participation
 # rate. Costs now rise as the fund grows and as a name's turnover dries up —
 # which is why --initial-capital becomes mandatory here: capacity is a
@@ -1233,8 +1260,8 @@ The narrative above says what the engine is for. Three documents say what it
 
 | | |
 | --- | --- |
-| **API reference** | Every one of the 142 exported names with its signature, parameters, units and errors — generated from the docstrings by `scripts/build_api_docs.py`, so it cannot drift from the code. Build it locally with `pip install "finport-optengine[docs]"` then `python scripts/build_api_docs.py`; CI publishes it to GitHub Pages on every push to `main`. |
-| [`docs/ERRORS.md`](https://github.com/alanvaa06/Optimization_Engine/blob/main/docs/ERRORS.md) | The refusal contract: all twenty-one exception types, which to catch, which are recoverable, the CLI's exit codes, and the failures that are *reported* rather than raised — degraded cost models, skipped identifiers, post-solve constraint breaches. |
+| **API reference** | Every one of the 168 exported names with its signature, parameters, units and errors — generated from the docstrings by `scripts/build_api_docs.py`, so it cannot drift from the code. Build it locally with `pip install "finport-optengine[docs]"` then `python scripts/build_api_docs.py`; CI publishes it to GitHub Pages on every push to `main`. |
+| [`docs/ERRORS.md`](https://github.com/alanvaa06/Optimization_Engine/blob/main/docs/ERRORS.md) | The refusal contract: all twenty-four exception types, which to catch, which are recoverable, the CLI's exit codes, and the failures that are *reported* rather than raised — degraded cost models, skipped identifiers, post-solve constraint breaches. |
 | [`AGENTS.md`](https://github.com/alanvaa06/Optimization_Engine/blob/main/AGENTS.md) | The API map and the `--json` CLI contract, written for a caller who wants the shortest correct program. |
 
 ## Where the methods come from

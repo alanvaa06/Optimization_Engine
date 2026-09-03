@@ -17,6 +17,7 @@ import yaml
 
 from optimization_engine.benchmark import BenchmarkSpec
 from optimization_engine.constraints import ConstraintLayer, coerce_layers
+from optimization_engine.stress import Shock, shocks_from_dicts, shocks_to_dicts
 
 
 @dataclass
@@ -112,7 +113,7 @@ _CONFIG_KEYS = frozenset(
         "expected_returns_method", "ema_span", "market_return", "market_weights",
         "optimizer", "benchmark", "benchmark_weights", "max_tracking_error",
         "max_active_share", "long_only", "fully_invested", "leverage",
-        "previous_weights", "turnover_limit", "strict_mandate",
+        "previous_weights", "turnover_limit", "strict_mandate", "stress",
     }
 )
 _OPTIMIZER_KEYS = frozenset(OptimizerSpec.__dataclass_fields__)
@@ -227,6 +228,13 @@ class EngineConfig:
             a turnover budget or a tracking-error cap is dropped by the
             projection entirely, and this is what turns that from a warning
             into a stop.
+        stress: Named one-period shock scenarios for the pre-trade stress
+            report — see :mod:`optimization_engine.stress`. Applied by
+            ``run_engine(..., run_stress=True)`` and by
+            :meth:`~optimization_engine.engine.EngineRun.tearsheet`; empty runs
+            no stress test. Entries may be given as
+            :class:`~optimization_engine.stress.Shock` objects or as the
+            mappings they serialize to, and are normalized to the former.
     """
 
     expected_returns: dict[str, float] = field(default_factory=dict)
@@ -260,18 +268,26 @@ class EngineConfig:
     previous_weights: dict[str, float] | None = None
     turnover_limit: float | None = None
     strict_mandate: bool = False
+    stress: tuple[Shock, ...] = ()
 
     def __post_init__(self) -> None:
-        """Coerce the constraint layers into their canonical form.
+        """Coerce the constraint layers and the stress scenarios into canonical form.
 
         A config loaded from YAML has mappings where one built in memory has
-        :class:`~optimization_engine.constraints.ConstraintLayer` objects; after
-        this they behave identically.
+        :class:`~optimization_engine.constraints.ConstraintLayer` and
+        :class:`~optimization_engine.stress.Shock` objects; after this they
+        behave identically. It runs on direct construction too, so
+        ``EngineConfig(stress=[{"name": ..., "returns": ...}])`` is as valid as
+        the loaded form, and a malformed scenario is refused where it was
+        written rather than at the solve.
 
         Raises:
             LayerConfigurationError: If any layer entry is malformed.
+            StressError: If any stress entry is malformed, or two scenarios
+                share a name.
         """
         self.constraint_layers = list(coerce_layers(self.constraint_layers))
+        self.stress = shocks_from_dicts(self.stress)
 
     @property
     def assets(self) -> list[str]:
@@ -367,6 +383,11 @@ class EngineConfig:
             ),
             "turnover_limit": self.turnover_limit,
             "strict_mandate": self.strict_mandate,
+            # Plain mappings, not ``Shock`` objects: this dict is
+            # ``yaml.safe_dump``-ed by ``save_config`` and by the app's config
+            # panel, and ``json.dumps``-ed by ``config_signature``. A dataclass
+            # here would make every one of those raise a representer error.
+            "stress": shocks_to_dicts(self.stress),
         }
 
     @classmethod
@@ -388,6 +409,8 @@ class EngineConfig:
                 used to load cleanly and simply not constrain anything.
             LayerConfigurationError: If a constraint layer is malformed.
             BenchmarkError: If the benchmark block is malformed.
+            StressError: If the ``stress`` block is not a list of scenario
+                mappings, one of them is malformed, or two share a name.
         """
         from optimization_engine.optimizers import ConfigurationError
 
@@ -462,6 +485,7 @@ class EngineConfig:
                 else None
             ),
             strict_mandate=bool(data.get("strict_mandate", False)),
+            stress=shocks_from_dicts(data.get("stress")),
         )
 
 

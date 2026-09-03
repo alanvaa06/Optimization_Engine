@@ -70,6 +70,7 @@ from optimization_engine.stress import (
     shocks_from_dicts,
     stress_test,
 )
+from optimization_engine.universe import Eligibility
 
 
 def apply_fx_conversion(
@@ -495,6 +496,9 @@ class EngineRun:
         rebalance_frequency: RebalanceFrequency | None = None,
         prices: pd.DataFrame | None = None,
         volumes: pd.DataFrame | None = None,
+        universe: Eligibility | None = None,
+        universe_policy: str | None = None,
+        delisting_grace: int | None = None,
     ) -> WalkForwardRun:
         """:meth:`walk_forward`, returning the full bundle instead of the digest.
 
@@ -513,6 +517,30 @@ class EngineRun:
             volumes: Traded volume per asset. Optional everywhere: without it
                 the impact model prices from a fixed participation rate, which
                 is the only thing available for an index universe.
+            universe: Point-in-time membership — an
+                :class:`~optimization_engine.universe.eligibility.Eligibility`,
+                or ``None`` to take the universe from the panel's columns, which
+                is the survivors-only reading every run had before this
+                argument existed.
+            universe_policy: How a cell the rules could not evaluate is read —
+                ``"exclude"``, ``"include"`` or ``"raise"``. Required whenever
+                ``universe`` is given, and deliberately without a default here
+                too: passing the decision through unchanged is the point.
+            delisting_grace: Bars of silence after which a name counts as
+                delisted, or ``None`` to not diagnose delisting at all. A
+                separate opt-in from ``universe`` because it answers a
+                different question — the screen says what the mandate permits,
+                this says what still trades.
+
+        Returns:
+            The bundle, forwarded from
+            :func:`~optimization_engine.backtest.walkforward.walk_forward_run`.
+
+        Raises:
+            ValueError: If the history is too short, or ``universe`` was given
+                with no ``universe_policy``.
+            UniverseError: If the policy is unknown, or it is ``"raise"`` and
+                some name was not evaluable on some bar.
         """
         ppy = self.config.periods_per_year
         # An explicit "none" rather than the spec default: a caller who never
@@ -528,6 +556,9 @@ class EngineRun:
             rebalance_frequency=rebalance_frequency,
             prices=prices,
             volumes=volumes,
+            universe=universe,
+            universe_policy=universe_policy,
+            delisting_grace=delisting_grace,
         )
 
     def tearsheet(
@@ -597,6 +628,9 @@ class EngineRun:
         rebalance_frequency: RebalanceFrequency | None = None,
         prices: pd.DataFrame | None = None,
         volumes: pd.DataFrame | None = None,
+        universe: Eligibility | None = None,
+        universe_policy: str | None = None,
+        delisting_grace: int | None = None,
     ) -> SweepResults:
         """Walk-forward every cell of a grid, and count the trials.
 
@@ -612,6 +646,16 @@ class EngineRun:
                 way, so a grid run with a capacity-aware cost model must be
                 handed the same panel the single run was — otherwise the grid
                 is cheaper than the run it is supposed to contextualize.
+            universe: Point-in-time membership, applied to every cell. Same
+                argument as ``volumes``, and it bites harder: the cells'
+                Sharpes are what the deflated Sharpe is deflated *against*, so
+                a grid run on the survivors while the headline run was screened
+                would deflate one universe's result by another universe's
+                dispersion.
+            universe_policy: How a *not evaluable* cell is read. Required
+                whenever ``universe`` is given.
+            delisting_grace: Bars of silence after which a name counts as
+                delisted, applied to every cell for the same reason.
         """
         ppy = self.config.periods_per_year
         run_spec = spec or BacktestSpec(periods_per_year=ppy, frequency="none")
@@ -663,6 +707,9 @@ class EngineRun:
                 rebalance_frequency=rebalance_frequency,
                 prices=prices,
                 volumes=volumes,
+                universe=universe,
+                universe_policy=universe_policy,
+                delisting_grace=delisting_grace,
             ).returns
 
         return run_sweep(
@@ -1030,6 +1077,34 @@ def run_engine(
             constraints cannot be satisfied.
         StressError: When ``run_stress`` is set and a configured shock names an
             asset outside the panel, which is the same defect as a view on one.
+        MandateViolationError: When ``config.strict_mandate`` is set and the
+            solved book breaches the mandate past tolerance. Unlike the other
+            two this is raised *after* a successful solve — the answer arrived
+            and does not comply — so it is not a solver failure and the
+            ``except SolverFailure`` below deliberately does not intercept it
+            (``SolverFailure`` is a ``RuntimeError``, this is a ``ValueError``,
+            so the two never overlap). Two consequences worth stating rather
+            than leaving to be discovered:
+
+            * A caller guarding a solve with ``except SolverFailure`` alone
+              will not catch it. Catch it by name, or leave
+              ``strict_mandate`` off and read ``run.result.audit``.
+            * Inside a walk-forward it does not propagate.
+              :func:`~optimization_engine.backtest.walkforward.walk_forward_run`
+              catches every exception a window's solve raises and records the
+              window as ``failed: <message>``, carrying the previous book
+              forward — or holding cash when there is no previous book. That is
+              coherent (a window whose only compliant answer is "no book" is a
+              window the desk could not trade) but surprising: turning
+              ``strict_mandate`` on does not stop a backtest, it converts
+              non-compliant windows into carried-forward ones. Read
+              ``walk.failures`` and ``walk.n_failures``, which name every one.
+              The single exception is a method that can *never* satisfy the
+              mandate, where every window refuses: the walk-forward then raises
+              a plain ``ValueError`` quoting the first window's message, so
+              that case is loud — but it arrives as a ``ValueError`` with no
+              ``.report`` on it, not as the ``MandateViolationError`` a caller
+              would be catching for.
     """
     if returns is None or returns.empty:
         raise ValueError("run_engine received an empty returns frame.")
@@ -1072,9 +1147,25 @@ def run_engine(
     optimizer = optimizer_factory(
         config, cov, expected_returns=expected_returns, returns=returns
     )
+    # The gate lives on the optimizer, not here, so that *every* entry into a
+    # solve honours it and not just this one: the frontier sweep, the
+    # walk-forward's per-window solver and any caller holding the instance all
+    # go through ``optimize()``, and a check written into ``run_engine`` would
+    # bind on exactly one of those paths. Read through ``getattr`` for the same
+    # reason ``configured_shocks`` does — a duck-typed config from an older
+    # release still runs.
+    optimizer.strict_mandate = bool(getattr(config, "strict_mandate", False))
     try:
         result = optimizer.optimize()
     except SolverFailure as exc:
+        # Deliberately narrow. ``optimize()`` also raises
+        # ``MandateViolationError`` under the ``strict_mandate`` set above, and
+        # that must pass straight through: the solve succeeded and the *answer*
+        # is non-compliant, which is not a solver failure and must not be
+        # re-dressed as one. The types keep them apart on their own —
+        # ``SolverFailure`` is a ``RuntimeError``, ``MandateViolationError`` a
+        # ``ValueError`` — so this is a statement of intent, not a guard.
+        #
         # A solver that reports "infeasible" has found the same thing the
         # pre-solve analysis did, but says it in solver terms. When the
         # analysis named the culprit, attach its findings rather than leaving

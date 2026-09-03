@@ -10,14 +10,15 @@ them, because they mean three different things:
 
 | It means | Do this | Examples |
 | --- | --- | --- |
-| **Your inputs are wrong** — a config, a universe, a constraint set | Fix the input. Retrying is pointless. | `SpecValidationError`, `LayerConfigurationError`, `BenchmarkError`, `ConfigurationError`, `SweepValidationError` |
+| **Your inputs are wrong** — a config, a universe, a constraint set | Fix the input. Retrying is pointless. | `SpecValidationError`, `LayerConfigurationError`, `BenchmarkError`, `ConfigurationError`, `SweepValidationError`, `StressError`, `UniverseError` |
 | **Your mandate is impossible** — the constraints have no solution, or this method cannot meet them | Relax something, or pick another method. The exception says which. | `InfeasibleConstraintsError`, `InfeasibleBoundsError`, `SolverFailure`, `MandateViolationError` |
 | **The world got in the way** — network, credentials, a vendor's bad day | Retry, or fix the environment. | `ProviderTransientError`, `ProviderCredentialsError`, `MissingDependencyError` |
 
-Five error types are exported from the package root — `IngestError`,
-`InfeasibleConstraintsError`, `YahooFinanceError`, `FREDError` and `FXError` —
-because they are what a caller writing a `try` block realistically reaches for.
-The rest are importable from the module that raises them.
+Seven error types are exported from the package root — `IngestError`,
+`InfeasibleConstraintsError`, `YahooFinanceError`, `FREDError`, `FXError`,
+`StressError` and `UniverseError` — because they are what a caller writing a
+`try` block realistically reaches for. The rest are importable from the module
+that raises them.
 
 ---
 
@@ -132,6 +133,52 @@ out the hard way. A related trap that is *not* an exception: a mean-variance
 solve given a **flat** expected-return vector carries no cross-sectional view.
 The engine says so rather than returning a `NaN` you discover three steps
 later.
+
+---
+
+## Stress scenarios and the point-in-time universe
+
+Two flat `ValueError` subclasses, one per module, both exported from the
+package root. They share a posture: an input that cannot be honoured is refused
+where it was written, and a question with no honest answer is not guessed at.
+
+| Error | Raised by | Causes |
+| --- | --- | --- |
+| `StressError` | `stress_test`; `Shock` construction and `Shock.from_dict`; `shocks_from_dicts` (so `EngineConfig(stress=…)` and `EngineConfig.from_dict` too); `load_shocks`, `load_shocks_yaml` | A shock with no name, no returns, or a non-finite return; an unknown key in a scenario mapping; two scenarios sharing a name; a stress test with **no** shocks (an empty report reads exactly like a passing one); a shock naming an asset the book cannot hold, unless `unknown_assets="ignore"` says otherwise; a covariance that does not cover the book, or a `covariance_scale` that is neither a number nor a full matrix; a shocks document with an unsupported `schema_version` or neither of its two accepted shapes |
+| `UniverseError` | `Signal` construction and `to_boolean_frame`; the `Eligibility` rule builders (`from_threshold`, `from_rank`, `from_rolling`, `with_hysteresis`, `hold_through`); `to_mask` and `collapse`; `point_in_time_mask`; `Classification.label`; the whole of `universe.rules` | An index that is not dates, or is numeric — reading integers as nanoseconds since the epoch would invent a calendar; a duplicated date, which leaves an as-of lookup with no single answer; an unknown comparison operator, rolling aggregation or `top_n` below 1; a mask policy that is not one of the three; **`"raise"` meeting a cell nothing evaluated**; a point-in-time label asked for with no `as_of`; and in a rules file, an unknown key at any level, an unsupported `schema_version`, an empty `rules` list, a `hysteresis` block with no `exit`, a panel that cannot be read, or a rule naming a panel nothing supplied |
+
+Three things are worth knowing before you catch either.
+
+**An empty stress test raises rather than passing.** `stress_test` with no
+shocks has nothing to report, and a report with no findings is indistinguishable
+from one that found nothing wrong. So `run_engine(..., run_stress=True)` on a
+config with no `stress` block is a documented no-op — it attaches no report —
+while calling `stress_test` directly with an empty list is an error.
+
+**A shock naming an asset outside the book is the same defect as a view on
+one.** It is refused, not zeroed, for the reason `build_pick_matrix` refuses an
+out-of-universe Black-Litterman view: a scenario about a name you cannot hold
+is a scenario about a different portfolio. `unknown_assets="ignore"` is the
+explicit way out, and it records what it dropped.
+
+**`to_mask` has no default policy, and that is not an oversight.** A universe
+rule with a warm-up leaves cells nothing has evaluated, and there is no safe
+reading of them: `"exclude"` silently shrinks the book at every warm-up,
+`"include"` silently admits names nothing screened, and `"raise"` stops any run
+whose rules warm up at all — which is every run with a rolling rule. The library
+therefore makes the caller name one. `optengine backtest --universe` picks
+`"exclude"`, because a non-interactive run cannot ask, and prints to stderr how
+many date/asset cells that decided:
+
+```
+  Universe: 819 date/asset cell(s) across 63 bar(s) and 13 name(s) were not
+  evaluable, and the 'exclude' policy — not a screen — reads them as
+  ineligible: US_Equity, Intl_Equity, EM_Equity, Real_Estate, Commodities ….
+```
+
+`--universe-policy raise` turns that count into a refusal, and it is the one
+`UniverseError` you are most likely to meet: it means your rules have a warm-up,
+not that your data is bad.
 
 ---
 

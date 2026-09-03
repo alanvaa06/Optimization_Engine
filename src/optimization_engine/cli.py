@@ -42,6 +42,8 @@ from optimization_engine.reporting.payloads import (
     describe_payload,
     optimization_payload,
 )
+from optimization_engine.stress import StressError, load_shocks
+from optimization_engine.universe.eligibility import MASK_POLICIES
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -156,9 +158,26 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Cap active share against the benchmark (0.4 = 40%%).",
     )
     optimize.add_argument(
+        "--stress", metavar="FILE",
+        help="YAML/JSON file of stress scenarios to apply to the solved book. "
+             "Each entry needs a 'name' and a 'returns' map of asset -> "
+             "one-period return; 'covariance_scale' (a number or a full "
+             "matrix) and 'notes' are optional. A shock naming an asset "
+             "outside the panel is refused, not silently zeroed.",
+    )
+    optimize.add_argument(
         "--strict", action="store_true",
         help="Refuse to run when the constraints are infeasible, naming the "
              "constraint instead of letting the solver fail.",
+    )
+    optimize.add_argument(
+        "--strict-mandate", action="store_true",
+        help="Refuse a solved book that breaches the mandate instead of "
+             "reporting the breach. The flag form of the config's "
+             "'strict_mandate'. Distinct from --strict, which is a pre-solve "
+             "check on the constraints: this one fires *after* a successful "
+             "solve, and it is the methods that apply bounds by projection "
+             "(HRP, HERC, NCO, the naive weightings) it most often stops.",
     )
 
     backtest = sub.add_parser(
@@ -287,6 +306,48 @@ def _build_parser() -> argparse.ArgumentParser:
              "into the deflated Sharpe.",
     )
     backtest.add_argument(
+        "--stress", metavar="FILE",
+        help="YAML/JSON file of stress scenarios. The tearsheet gains a "
+             "stress panel over the book the walk-forward ended on.",
+    )
+    backtest.add_argument(
+        "--strict-mandate", action="store_true",
+        help="Refuse a solved book that breaches the mandate. Read the "
+             "warning on --strict-mandate for `optimize` first: inside a "
+             "walk-forward a refused window is caught per-window and recorded "
+             "as a failed solve, so this does not stop the run — it turns "
+             "non-compliant windows into carried-forward ones, counted in "
+             "the 'solve(s) failed' line.",
+    )
+    backtest.add_argument(
+        "--universe", metavar="FILE",
+        help="YAML/JSON rules file defining point-in-time membership: which "
+             "names were investable, and when. Without one the universe is "
+             "'every column of the panel, from the first bar', which is "
+             "survivorship bias and look-ahead in the same frame. See "
+             "optimization_engine.universe.rules for the schema.",
+    )
+    backtest.add_argument(
+        "--universe-policy", default="exclude",
+        choices=list(MASK_POLICIES),
+        help="How a date/asset cell the rules could not evaluate is read. "
+             "'exclude' (the default) treats it as ineligible and prints how "
+             "many cells that silently removed; 'include' admits a name "
+             "nothing screened; 'raise' refuses to guess and stops the run. "
+             "The library API has no default here on purpose — the CLI picks "
+             "one because a non-interactive run cannot ask, and then says "
+             "what the choice cost.",
+    )
+    backtest.add_argument(
+        "--delisting-grace", type=int, metavar="N",
+        help="Bars of silence after which a name counts as delisted, dropped "
+             "from the solve and sold at its last mark. Separate from "
+             "--universe and opt-in on its own: a screen says what the "
+             "mandate permits, this says what still trades. Omitted, "
+             "delisting is not diagnosed at all and a name that stopped "
+             "printing is simply held.",
+    )
+    backtest.add_argument(
         "--output", help="Optional Excel path for the tearsheet frames."
     )
 
@@ -394,7 +455,98 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _load_stress_into(config, args: argparse.Namespace) -> int:
+    """Read ``--stress`` into ``config.stress``, or report why it could not.
+
+    Args:
+        config: The configuration to attach the scenarios to, in place.
+        args: The parsed command line. ``--stress`` is optional; without it
+            the config keeps whatever its own file declared.
+
+    Returns:
+        ``0`` on success (including when no file was named), ``2`` when the
+        file could not be read or parsed — the message is on stderr.
+    """
+    path = getattr(args, "stress", None)
+    if not path:
+        return 0
+    try:
+        config.stress = load_shocks(path)
+    except (OSError, StressError) as exc:
+        print(f"Could not read stress scenarios from {path}: {exc}", file=sys.stderr)
+        return 2
+    print(f"Loaded {len(config.stress)} stress scenario(s) from {path}")
+    return 0
+
+
+def _load_universe_for(args: argparse.Namespace, returns, prices):
+    """Read ``--universe`` into an :class:`Eligibility`, and say what it costs.
+
+    The rules file carries the paths to any characteristic panel it needs —
+    ADV, market capitalisation — because :func:`_prepare_inputs` loads prices
+    and nothing else; see :mod:`optimization_engine.universe.rules` for why
+    the data lives with the rules rather than behind a second flag. The run's
+    own panels are handed in here under the names ``returns`` and ``prices``,
+    so a screen written only over those needs no data files at all.
+
+    Args:
+        args: The parsed command line. ``--universe`` is optional.
+        returns: The aligned return panel, available to rules as ``returns``.
+        prices: The aligned price panel, available as ``prices``.
+
+    Returns:
+        The :class:`~optimization_engine.universe.eligibility.Eligibility`,
+        ``None`` when no rules file was named, or ``2`` when the file could
+        not be read — the message is on stderr.
+    """
+    from optimization_engine.universe.rules import (
+        count_unresolved,
+        load_universe_rules,
+    )
+    from optimization_engine.universe.signal import UniverseError
+
+    path = getattr(args, "universe", None)
+    if not path:
+        return None
+    try:
+        rules = load_universe_rules(path)
+        universe = rules.build(returns=returns, prices=prices)
+    except (OSError, UniverseError) as exc:
+        print(f"Could not read the universe from {path}: {exc}", file=sys.stderr)
+        return 2
+    print(rules.describe())
+
+    policy = getattr(args, "universe_policy", "exclude")
+    cells, bars, names = count_unresolved(universe, returns.index, list(returns.columns))
+    if cells:
+        # Unconditionally on stderr, like the alignment log and for the same
+        # reason: the library refuses to pick a collapse policy, this command
+        # picked one, and the size of what that decided is not an advanced-mode
+        # detail. Under "raise" the run is about to stop on these very cells,
+        # so the count is the diagnosis rather than a footnote.
+        verdict = {
+            "exclude": "reads them as ineligible",
+            "include": "admits them",
+            "raise": "will stop the run on them",
+        }[policy]
+        print(
+            f"  Universe: {cells} date/asset cell(s) across {bars} bar(s) and "
+            f"{len(names)} name(s) were not evaluable, and the {policy!r} "
+            f"policy — not a screen — {verdict}: "
+            f"{', '.join(names[:5])}{' …' if len(names) > 5 else ''}.",
+            file=sys.stderr,
+        )
+    else:
+        print(
+            "  Universe: every date/asset cell was evaluable, so the "
+            f"{policy!r} policy decides nothing.",
+            file=sys.stderr,
+        )
+    return universe
+
+
 def _cmd_optimize(args: argparse.Namespace) -> int:
+    from optimization_engine.optimizers.audit import MandateViolationError
     from optimization_engine.optimizers.feasibility import InfeasibleConstraintsError
 
     inputs = _prepare_inputs(args)
@@ -402,6 +554,8 @@ def _cmd_optimize(args: argparse.Namespace) -> int:
         return inputs
     config, returns, quality = inputs.config, inputs.returns, inputs.quality
     alignment = inputs.alignment
+    if _load_stress_into(config, args) != 0:
+        return 2
     for issue in quality.errors:
         print(f"Data error — {issue.describe()}", file=sys.stderr)
     for issue in quality.warnings:
@@ -421,9 +575,28 @@ def _cmd_optimize(args: argparse.Namespace) -> int:
             build_frontier=args.frontier,
             n_frontier_points=args.frontier_points,
             raise_on_infeasible=args.strict,
+            run_stress=bool(config.stress),
         )
     except InfeasibleConstraintsError as exc:
         print(str(exc), file=sys.stderr)
+        return 2
+    except StressError as exc:
+        print(f"Stress test failed: {exc}", file=sys.stderr)
+        return 2
+    except MandateViolationError as exc:
+        # Raised only under --strict-mandate, and *after* a successful solve:
+        # the answer arrived and does not comply. It is a ValueError while
+        # SolverFailure is a RuntimeError, so the clause below never sees it —
+        # without this one the CLI would leak a traceback for the one failure
+        # the flag exists to produce.
+        print(str(exc), file=sys.stderr)
+        print(
+            "  The mandate is satisfiable; this method did not satisfy it. "
+            "Pick a method whose bounds are enforced inside the convex "
+            "program, loosen the limit named above, or drop --strict-mandate "
+            "and read the audit on the result.",
+            file=sys.stderr,
+        )
         return 2
     except SolverFailure as exc:
         print(f"Optimization failed: {exc}", file=sys.stderr)
@@ -439,6 +612,9 @@ def _cmd_optimize(args: argparse.Namespace) -> int:
 
     for warning in run.warnings:
         print(f"Warning — {warning}", file=sys.stderr)
+
+    if run.stress is not None:
+        print(run.stress.describe())
 
     walk_forward = None
     if args.walk_forward:
@@ -743,6 +919,11 @@ def _apply_estimator_flags(config, args: argparse.Namespace) -> None:
         # One-way on purpose. The flag is an opt-in to a weaker answer, so
         # its absence must not overwrite a config that already asked for one.
         config.optimizer.accept_inaccurate = True
+    if getattr(args, "strict_mandate", False):
+        # One-way for the same reason, in the other direction: the flag is an
+        # opt-in to a *stricter* answer, and its absence must not switch off a
+        # config that already asked to refuse a non-compliant book.
+        config.strict_mandate = True
 
 
 
@@ -1098,6 +1279,8 @@ def _cmd_backtest(args: argparse.Namespace) -> int:
         run_backtest,
     )
     from optimization_engine.backtest.spec import SpecValidationError
+    from optimization_engine.optimizers.audit import MandateViolationError
+    from optimization_engine.universe.signal import UniverseError
 
     inputs = _prepare_inputs(args)
     if isinstance(inputs, int):
@@ -1106,6 +1289,11 @@ def _cmd_backtest(args: argparse.Namespace) -> int:
         inputs.config, inputs.prices, inputs.returns, inputs.volumes
     )
     alignment = inputs.alignment
+    if _load_stress_into(config, args) != 0:
+        return 2
+    universe = _load_universe_for(args, returns, prices)
+    if isinstance(universe, int):
+        return universe
 
     try:
         spec = BacktestSpec(
@@ -1146,6 +1334,11 @@ def _cmd_backtest(args: argparse.Namespace) -> int:
 
     try:
         run = run_engine(evaluation, config, check_feasibility=False)
+    except MandateViolationError as exc:
+        # --strict-mandate on the anchor solve. Every per-window refusal is
+        # caught inside the walk-forward and recorded as a failed solve, but
+        # this one is outside it and would otherwise leak a traceback.
+        return _fail(args, f"The initial solve was refused: {exc}")
     except SolverFailure as exc:
         return _fail(args, f"The initial solve failed: {exc}")
     try:
@@ -1156,7 +1349,20 @@ def _cmd_backtest(args: argparse.Namespace) -> int:
             expanding=args.expanding,
             prices=prices,
             volumes=volumes,
+            universe=universe,
+            # Only when there is a universe to read it under. Passed with no
+            # universe the runner logs that the policy decides nothing, which
+            # is noise on every run that does not use the feature.
+            universe_policy=args.universe_policy if universe is not None else None,
+            delisting_grace=args.delisting_grace,
         )
+    except UniverseError as exc:
+        # The 'raise' collapse policy lands here, and it is the one case where
+        # the message has to say which flag chose it: a run that stopped
+        # because a warm-up period could not be evaluated has not found a
+        # problem with the data.
+        print(f"Universe failed: {exc}", file=sys.stderr)
+        return 2
     except ValueError as exc:
         print(f"Walk-forward failed: {exc}", file=sys.stderr)
         return 2
@@ -1176,6 +1382,10 @@ def _cmd_backtest(args: argparse.Namespace) -> int:
         print(f"Sweep skipped: {exc}", file=sys.stderr)
         sweep_spec = None
     if sweep_spec is not None:
+        # The grid is evaluated under the *same* universe as the headline run.
+        # Its cell Sharpes are what the deflated Sharpe is deflated against, so
+        # a grid run on the survivors while the run itself was screened would
+        # deflate one universe's result by another universe's dispersion.
         sweep_results = run.sweep(
             sweep_spec,
             lookback=args.lookback,
@@ -1184,6 +1394,9 @@ def _cmd_backtest(args: argparse.Namespace) -> int:
             expanding=args.expanding,
             prices=prices,
             volumes=volumes,
+            universe=universe,
+            universe_policy=args.universe_policy if universe is not None else None,
+            delisting_grace=args.delisting_grace,
         )
         print(f"  {sweep_results.describe()}")
         n_trials = max(sweep_results.n_cells, 1)
@@ -1195,15 +1408,24 @@ def _cmd_backtest(args: argparse.Namespace) -> int:
         else:
             print(f"  {overfitting.describe()}")
 
-    sheet = run.tearsheet(
-        walk.run,
-        n_trials=n_trials if sweep_results is not None else None,
-        trial_sharpes=trial_sharpes,
-        overfitting=overfitting,
-    )
+    try:
+        sheet = run.tearsheet(
+            walk.run,
+            n_trials=n_trials if sweep_results is not None else None,
+            trial_sharpes=trial_sharpes,
+            overfitting=overfitting,
+        )
+    except StressError as exc:
+        # ``tearsheet`` applies ``config.stress`` to the book the walk-forward
+        # ended on, so a shock naming an asset outside the panel surfaces here
+        # rather than at the solve.
+        print(f"Stress test failed: {exc}", file=sys.stderr)
+        return 2
     print(f"  {sheet.tca.describe()}")
     if sheet.deflated_sharpe is not None:
         print(f"  {sheet.deflated_sharpe.describe()}")
+    if sheet.stress is not None:
+        print(sheet.stress.describe())
     for caveat in sheet.caveats:
         print(f"  ! {caveat}")
 

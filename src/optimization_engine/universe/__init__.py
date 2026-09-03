@@ -27,7 +27,16 @@ This package adds the missing axis. Three pieces, layered:
     labels that know when they became true, so a sector cap in 2019 uses the
     2019 sector map.
 
-Nothing here needs a solver, and nothing here reads a file. The integration
+``rules``
+    :mod:`~optimization_engine.universe.rules` — the file format the three
+    above are written down in, and the one module here that reads a disk: a
+    ``combine``/``rules``/``hysteresis``/``hold_through`` document, plus the
+    ``panels`` block naming the characteristic data (ADV, market
+    capitalisation) the rules are evaluated against. That is where a
+    non-price panel enters the engine at all, and the module docstring says
+    why it enters there and not through a second CLI flag.
+
+Nothing here needs a solver. The integration
 points are :func:`~optimization_engine.backtest.runner.run_backtest` and
 :func:`~optimization_engine.backtest.walkforward.walk_forward_run`, which both
 take a ``universe`` and the policy to read it under, and
@@ -48,6 +57,18 @@ from optimization_engine.universe.eligibility import (
     collapse,
     point_in_time_mask,
 )
+from optimization_engine.universe.rules import (
+    COMBINERS,
+    RULE_KINDS,
+    RULES_SCHEMA_VERSION,
+    RUN_PANELS,
+    PanelSpec,
+    RuleSpec,
+    UniverseRules,
+    count_unresolved,
+    load_universe,
+    load_universe_rules,
+)
 from optimization_engine.universe.signal import (
     BOOLEAN_DTYPE,
     Signal,
@@ -57,16 +78,26 @@ from optimization_engine.universe.signal import (
 
 __all__ = [
     "BOOLEAN_DTYPE",
+    "COMBINERS",
     "COMPARISONS",
     "MASK_POLICIES",
     "ROLLING_AGGS",
+    "RULES_SCHEMA_VERSION",
+    "RULE_KINDS",
+    "RUN_PANELS",
     "Classification",
     "Eligibility",
     "LabelRecord",
+    "PanelSpec",
     "Rule",
+    "RuleSpec",
     "Signal",
     "UniverseError",
+    "UniverseRules",
     "collapse",
+    "count_unresolved",
+    "load_universe",
+    "load_universe_rules",
     "point_in_time_mask",
     "to_boolean_frame",
 ]

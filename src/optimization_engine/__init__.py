@@ -226,6 +226,9 @@ from optimization_engine.universe import (
     Eligibility,
     Signal,
     UniverseError,
+    UniverseRules,
+    load_universe,
+    load_universe_rules,
     point_in_time_mask,
 )
 
@@ -363,6 +366,9 @@ __all__ = [
     "Eligibility",
     "Signal",
     "UniverseError",
+    "UniverseRules",
+    "load_universe",
+    "load_universe_rules",
     "point_in_time_mask",
     "BaseOptimizer",
     "BlackLittermanOptimizer",
