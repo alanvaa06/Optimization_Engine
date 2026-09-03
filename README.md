@@ -123,7 +123,7 @@ replays, so a fitted track record is a description of the past, not a
 forecast. The walk-forward re-estimates and re-solves on a rolling window and
 holds each solution over returns the optimizer never saw. Same rebalancing
 cadence and the same 15bps of trading cost on both lines, so the gap is
-overfitting rather than a cost artefact: **Sharpe 0.74 fitted against 0.23
+overfitting rather than a cost artefact: **Sharpe 0.87 fitted against 0.43
 walk-forward.**
 
 ![In-sample and out-of-sample wealth curves diverging over time](https://raw.githubusercontent.com/alanvaa06/Optimization_Engine/main/docs/images/walk-forward.png)
@@ -598,7 +598,7 @@ On top of the core:
   `config.expected_returns` is normally populated — the UI seeds that table
   from the *full* history — so reusing it would hand every "out-of-sample"
   window an estimate built partly from its own future. On the sample panel
-  that look-ahead lifts walk-forward Sharpe from 0.46 to 0.89. Turn it off
+  that look-ahead lifts walk-forward Sharpe from 0.43 to 0.83. Turn it off
   only when your expected returns are genuine forward-looking assumptions
   rather than estimates from the same data.
 
