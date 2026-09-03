@@ -174,6 +174,22 @@ with what to do about it.
 - **`max_diversification` declares `bounds_mode="hard_or_projected"`.** It
   advertised `"hard"` for a method that can run projected.
 - **A payload schema bump to 1.1** for the added `alignment` key.
+- **`accept_inaccurate` defaults to `False`.** The solver chain settled for an
+  `optimal_inaccurate` answer with a logged warning; a degraded answer returned
+  by default is how a wrong book ships. It now raises, and the message names
+  every way to proceed. The refusal also reports the right status: it used to
+  raise with whatever the *last* solver in the chain said, so a run that found
+  an unverifiable answer and then hit a solver returning `infeasible` was told
+  its mandate had no solution. The setting travels as an ambient scope, because
+  NCO builds its sub-optimizers internally and constructor threading cannot
+  reach them.
+- **`optengine check` exits 2 for an impossible mandate** and keeps 1 for
+  unusable data. A finding that only says the solver could not answer is a
+  warning, not a fatal.
+- **Payload schema 2.0, then 2.1.** Feasibility issues are now objects with
+  `code`, `severity`, `message` and `suggestion` instead of stringified
+  dataclass reprs, and carry `stage_reached` and `reachable_return`; 2.1 adds
+  the `audit` key.
 
 ### Added
 
@@ -199,6 +215,29 @@ with what to do about it.
   caller names one.
 - **`ConstraintLayer.from_classification`**, building a layer from labels as of
   a date.
+- **A post-solve mandate audit.** `audit_weights` gives the compliance check a
+  public surface, `OptimizationResult.audit` carries it, and
+  `EngineConfig.strict_mandate` turns a reported breach into a raised
+  `MandateViolationError`. Most of the checking already existed; what is new is
+  that the audit reindexes onto the *declared universe* first, so an asset
+  missing from the weight vector can no longer escape its own lower bound, and
+  that a clean report records the tolerance it was clean at. NCO's sub-solves
+  opt out — their constraint set deliberately omits the mandate's bounds,
+  which are applied by projection after both layers.
+- **A structural feasibility stage that needs no solver.** `analyze_feasibility`
+  now answers box capacity against the budget, per-bucket capacity, parent
+  coherence and instructions naming absent assets by arithmetic, before any
+  solver is involved, and reports `stage_reached`. Box-and-budget mandates get
+  their reachable return range from a fractional knapsack in closed form —
+  exact, and zero solves where it used to cost two.
+- **`--accept-inaccurate`, `--strict-mandate` and `--stress` on the CLI**, and
+  an Advanced panel in the app for the first.
+
+### Removed
+
+- **The frontier's "Dominated (below min-variance)" trace.** A return target is
+  now a floor, so a mean-variance sweep cannot reach the lower branch to draw
+  it. `show_dominated` remains as a documented no-op for one release.
 
 
 
