@@ -54,6 +54,15 @@ class OptimizerSpec:
         nco_objective: Objective solved at both NCO layers.
         nco_detone_for_clustering: Strip the market eigenvector before
             clustering in NCO.
+        accept_inaccurate: Take an ``optimal_inaccurate`` answer when no
+            solver in the fallback chain converges exactly. ``False`` — the
+            default — refuses it: the run raises rather than report weights
+            no solver would vouch for as though they were optimal. Set it to
+            ``True`` only having decided that an approximate book is more
+            use than no book, and read ``solver_status`` on the result, which
+            says which one you got. It is a no-op for the methods that never
+            call a solver (HRP, HERC and the naive weightings); it *does*
+            reach NCO, whose two layers are solved by real optimizers.
     """
 
     name: str = "mean_variance"
@@ -79,6 +88,7 @@ class OptimizerSpec:
     nco_detone_for_clustering: bool = True
     bl_market_return: float | None = None
     bl_calibrate_risk_aversion: bool = False
+    accept_inaccurate: bool = False
     extra: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:

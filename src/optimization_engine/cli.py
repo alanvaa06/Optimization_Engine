@@ -80,6 +80,13 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     _add_ingest_arguments(optimize)
     optimize.add_argument("--output", default="outputs.xlsx", help="Output Excel path.")
+    optimize.add_argument(
+        "--accept-inaccurate",
+        action="store_true",
+        help=(
+            "Accept an approximate solution when no solver converges exactly. Off by default: a solve that only reaches 'optimal_inaccurate' fails rather than report unverified weights as optimal. Turn it on when an indicative book beats no book, and read solver_status on the result to see which one you got. No-op for HRP, HERC and the naive weightings, which never call a solver."
+        ),
+    )
     optimize.add_argument("--frontier", action="store_true", help="Also compute the frontier.")
     optimize.add_argument("--frontier-points", type=int, default=25)
     optimize.add_argument(
@@ -178,6 +185,13 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     backtest.add_argument("--yahoo-start", help="Yahoo start date (YYYY-MM-DD).")
     backtest.add_argument("--yahoo-end", help="Yahoo end date (YYYY-MM-DD).")
+    backtest.add_argument(
+        "--accept-inaccurate",
+        action="store_true",
+        help=(
+            "Accept an approximate solution when no solver converges exactly. Off by default: a solve that only reaches 'optimal_inaccurate' fails rather than report unverified weights as optimal. Turn it on when an indicative book beats no book, and read solver_status on the result to see which one you got. No-op for HRP, HERC and the naive weightings, which never call a solver. Applies to every re-solve in the walk-forward."
+        ),
+    )
     backtest.add_argument(
         "--lookback", type=int, metavar="N",
         help="Estimation window in periods. Defaults to two years.",
@@ -308,6 +322,17 @@ def _build_parser() -> argparse.ArgumentParser:
     check.add_argument(
         "--benchmark",
         help="Benchmark to check the mandate against: a kind or an asset name.",
+    )
+    check.add_argument(
+        "--accept-inaccurate",
+        action="store_true",
+        help=(
+            "Let the reachable-return LPs settle for an approximate answer. "
+            "Off by default, in which case a range the solver could not "
+            "verify is reported as 'we could not tell' rather than as a "
+            "range. This is the pre-flight's half of the same flag "
+            "'optimize' and 'backtest' pass to the solve itself."
+        ),
     )
     check.add_argument("--max-tracking-error", type=float, default=None)
     check.add_argument("--max-active-share", type=float, default=None)
@@ -697,17 +722,27 @@ def _cmd_describe(args: argparse.Namespace) -> int:
 
 
 def _apply_estimator_flags(config, args: argparse.Namespace) -> None:
-    """Let command-line estimator flags override the config file.
+    """Let command-line flags override the config file's estimator settings.
 
     Kept in one place so ``check`` and ``optimize`` cannot diverge: a
     pre-flight that reports the conditioning of a matrix the solve will not
-    use is worse than no pre-flight at all.
+    use is worse than no pre-flight at all. The same argument covers
+    ``--accept-inaccurate``: the command that says the mandate is reachable
+    and the command that solves it have to agree about what counts as an
+    answer.
+
+    ``getattr`` throughout because the three subcommands that share
+    :func:`_prepare_inputs` do not carry identical flags.
     """
     if getattr(args, "denoise", False):
         config.denoise = True
     detone = getattr(args, "detone", None)
     if detone is not None:
         config.detone = int(detone)
+    if getattr(args, "accept_inaccurate", False):
+        # One-way on purpose. The flag is an opt-in to a weaker answer, so
+        # its absence must not overwrite a config that already asked for one.
+        config.optimizer.accept_inaccurate = True
 
 
 
@@ -1231,6 +1266,7 @@ def _cmd_check(args: argparse.Namespace) -> int:
         covariance_diagnostics,
         covariance_from_config,
     )
+    from optimization_engine.optimizers._cvxpy_helpers import accepting_inaccurate
     from optimization_engine.optimizers.factory import (
         constraints_from_config,
         effective_expected_returns,
@@ -1277,12 +1313,18 @@ def _cmd_check(args: argparse.Namespace) -> int:
     # zeros, when the config carries no expected_returns block — would have
     # this command validate a mandate the optimizer never sees.
     mu = resolve_expected_returns(config, returns, cov)
-    report = analyze_feasibility(
-        list(returns.columns),
-        constraints_from_config(config, list(returns.columns)),
-        expected_returns=effective_expected_returns(config, cov, mu),
-        cov_matrix=cov,
-    )
+    # The reachable-return LPs run on the same solver chain as the solve, so
+    # they inherit the same refusal of an unverified answer. ``check`` builds
+    # no optimizer, so there is no constructor to carry the setting down --
+    # the scope is opened here instead, which is what keeps the pre-flight
+    # and the solve answering the same question.
+    with accepting_inaccurate(config.optimizer.accept_inaccurate):
+        report = analyze_feasibility(
+            list(returns.columns),
+            constraints_from_config(config, list(returns.columns)),
+            expected_returns=effective_expected_returns(config, cov, mu),
+            cov_matrix=cov,
+        )
     # Fatal findings and warnings print differently on purpose: the whole
     # point of the two-stage analysis is that "no allocation satisfies these
     # constraints" and "the solver could not answer" are different answers,

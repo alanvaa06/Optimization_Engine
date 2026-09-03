@@ -245,6 +245,7 @@ class BaseOptimizer(ABC):
         cov_matrix: pd.DataFrame | None = None,
         constraints: PortfolioConstraints | None = None,
         risk_free_rate: float = 0.0,
+        accept_inaccurate: bool | None = None,
     ) -> None:
         """Store the inputs a solve will run against.
 
@@ -261,11 +262,24 @@ class BaseOptimizer(ABC):
             risk_free_rate: Per-period risk-free rate, in the same periodicity as
                 the inputs. Used by the Sharpe-based objectives and reported in
                 the result's summary statistics.
+            accept_inaccurate: Whether to take an ``optimal_inaccurate``
+                solution when no solver in the fallback chain converges
+                exactly. ``False`` refuses it — the solve raises
+                :class:`~optimization_engine.optimizers._cvxpy_helpers.SolverFailure`
+                rather than report unverified weights as optimal. ``None``,
+                the default, inherits from the surrounding solve if there is
+                one and refuses otherwise, which is what lets NCO's
+                per-cluster sub-optimizers run under the settings of the
+                solve that built them. The methods that never reach a solver
+                — HRP, HERC, and the naive weightings — ignore this entirely;
+                NCO does *not*, because both of its layers are solved by real
+                optimizers.
         """
         self.expected_returns = expected_returns
         self.cov_matrix = cov_matrix
         self.constraints = constraints or PortfolioConstraints()
         self.risk_free_rate = float(risk_free_rate)
+        self.accept_inaccurate = accept_inaccurate
         #: Populated by subclasses; surfaced through ``result.extras``.
         self._diagnostics: dict[str, Any] = {}
 
@@ -308,7 +322,16 @@ class BaseOptimizer(ABC):
             InfeasibleBoundsError: If the projection step cannot reconcile the
                 bounds with the budget.
         """
-        weights = self._solve()
+        from optimization_engine.optimizers._cvxpy_helpers import accepting_inaccurate
+
+        # The scope covers ``_solve`` and nothing else. Every CVXPY solve this
+        # method makes happens in there -- including the ones a sub-optimizer
+        # makes on the way down -- while the dust-cleanup projection below runs
+        # outside it, on its own terms. Imported here rather than at module
+        # scope because ``_cvxpy_helpers`` imports ``PortfolioConstraints``
+        # from this module.
+        with accepting_inaccurate(self.accept_inaccurate):
+            weights = self._solve()
         weights = np.asarray(weights, dtype=float).flatten()
         if not np.isfinite(weights).all():
             raise RuntimeError(

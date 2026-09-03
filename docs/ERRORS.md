@@ -163,6 +163,37 @@ arithmetic Σ is a mismatch. The geometric form is `"geometric_mean"`.
 under iid-Gaussian returns and not otherwise, which is why the key no longer
 says "annualized".
 
+**An answer no solver can verify is refused, not returned.** When every
+solver in the fallback chain reports `optimal_inaccurate`, the solve raises
+`SolverFailure` with `status="optimal_inaccurate"` rather than hand back
+weights labelled optimal that are not. There are four ways to opt in, and they
+cover different things:
+
+| Opt-in | Covers |
+| --- | --- |
+| `accept_inaccurate: true` under the config's `optimizer` block | every solve the run's optimizers make, nested ones included |
+| `--accept-inaccurate` on `optengine optimize` / `backtest` | the same, by setting that field |
+| `--accept-inaccurate` on `optengine check` | the pre-flight's reachable-return LPs — `check` builds no optimizer |
+| `solve_problem(problem, accept_inaccurate=True)` | that one call |
+
+When you do opt in, the answer says so: `solver_status` on the result reads
+`optimal_inaccurate`, a warning is logged, and the UI's compliance banner shows
+it.
+
+Two edges are worth knowing. The flag is a no-op for the methods that never
+reach a solver — HRP, HERC and the naive weightings — but it is **not** a
+no-op for NCO, whose two layers are each solved by a real optimizer. And one
+call site accepts an inaccurate answer regardless of the setting: the
+projection in `_bounds.project_to_constraints`, which is the dust cleanup
+*after* a solve rather than the solve, where refusing would fail every
+soft-bounds method whose real answer had already arrived.
+
+The pre-flight `analyze_feasibility` also runs inside `optimize` and
+`backtest`, and there it keeps the default whatever the flag says: a range no
+solver could verify is reported as a `solver_error` warning rather than as a
+range, and the solve goes ahead. "We could not tell you the range" has never
+been a reason to refuse to optimize.
+
 ## Infeasible mandates
 
 The difference between these three matters.
@@ -205,16 +236,29 @@ from optimization_engine.optimizers._cvxpy_helpers import SolverFailure
 try:
     ...
 except SolverFailure as exc:
-    exc.status     # the last solver status: 'infeasible', 'unbounded', ...
+    exc.status     # 'infeasible', 'unbounded', 'optimal_inaccurate', ...
     exc.attempts   # every solver tried, in order
 ```
 
 The message already interprets the common statuses — `infeasible` means no
 allocation satisfies every constraint at once, `unbounded` means the objective
 improves without limit and you are missing a bound or a budget. The engine
-walks a solver fallback chain before giving up, and an `optimal_inaccurate`
-answer is not accepted until the rest of the chain has been tried, so a
-`SolverFailure` means every solver declined, not just the first.
+walks a solver fallback chain before giving up, so a `SolverFailure` means
+every solver declined, not just the first.
+
+`optimal_inaccurate` is the third, and it is the one that reads oddly at
+first: a solution *was* found, and refused, because no solver would vouch for
+it. See the convention above for the opt-in. Two details matter when you catch
+it. The status is `optimal_inaccurate` whenever an inaccurate answer was on
+the table and nothing better arrived, **even if a later solver in the chain
+said something else** — a fallback that then claims `infeasible` about a
+problem another solver has already found a point in is reporting its own
+numerical trouble, not a property of your mandate, and sending you to check
+the constraints would be sending you after the wrong thing. And it is
+recoverable in a way the other two are not: `infeasible` needs the mandate
+changed, whereas this one only needs you to decide whether an approximate book
+is worth having. `analyze_feasibility()` says which constraint is making the
+problem this hard.
 
 The most common cause that looks like a solver bug and is not: a
 tracking-error or active-share budget. A benchmark holding an asset your

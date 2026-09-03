@@ -271,6 +271,7 @@ if _pending and _pending in st.session_state.scenarios:
     st.session_state["herc_risk_measure"] = str(_cfg.optimizer.herc_risk_measure)
     st.session_state["nco_objective"] = str(_cfg.optimizer.nco_objective)
     st.session_state["nco_detone"] = bool(_cfg.optimizer.nco_detone_for_clustering)
+    st.session_state["accept_inaccurate"] = bool(_cfg.optimizer.accept_inaccurate)
     st.session_state["long_only"] = bool(_cfg.long_only)
     st.session_state["benchmark_kind"] = _cfg.benchmark.kind
     if _cfg.benchmark.asset:
@@ -877,6 +878,26 @@ with st.sidebar:
     )
     if not ws["frontier"]["enabled"]:
         build_frontier = False
+
+    st.divider()
+    with st.expander("9 · Advanced", expanded=False):
+        accept_inaccurate = st.checkbox(
+            "Accept approximate solutions",
+            value=False,
+            key="accept_inaccurate",
+            help=(
+                "Off: a solve that no solver can verify fails, and says so. "
+                "On: the approximate weights are used and flagged in the "
+                "compliance banner. Turn it on only when an indicative book "
+                "is more use than none — the constraints it reports as "
+                "satisfied are satisfied to the solver's own loose tolerance, "
+                "not to yours."
+            ),
+        )
+        st.caption(
+            "Has no effect on HRP, HERC or the naive weightings: they never "
+            "call a solver."
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1514,6 +1535,7 @@ def _build_config() -> EngineConfig:
         ),
         nco_objective=str(st.session_state.get("nco_objective", "min_variance")),
         nco_detone_for_clustering=bool(st.session_state.get("nco_detone", True)),
+        accept_inaccurate=bool(accept_inaccurate),
     )
 
     if optimizer_name == "risk_parity" and "risk_budget" in st.session_state:

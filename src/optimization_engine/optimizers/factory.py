@@ -344,6 +344,7 @@ def optimizer_factory(
         cov_matrix=cov_matrix,
         constraints=constraints,
         risk_free_rate=spec.risk_free_rate,
+        accept_inaccurate=spec.accept_inaccurate,
     )
     if cls not in (CVaROptimizer, CDaROptimizer):
         common["expected_returns"] = expected_returns
@@ -387,6 +388,10 @@ def optimizer_factory(
             **common,
             **overrides,
         )
+    # These two re-list every base argument instead of splatting ``common``,
+    # because they take ``expected_returns`` conditionally above. Anything
+    # added to ``common`` has to be added here too or it silently stops
+    # reaching the two path-dependent methods.
     if cls is CVaROptimizer:
         return cls(
             returns=returns,
@@ -397,6 +402,7 @@ def optimizer_factory(
             cov_matrix=cov_matrix,
             constraints=constraints,
             risk_free_rate=spec.risk_free_rate,
+            accept_inaccurate=spec.accept_inaccurate,
             **overrides,
         )
     if cls is CDaROptimizer:
@@ -409,6 +415,7 @@ def optimizer_factory(
             cov_matrix=cov_matrix,
             constraints=constraints,
             risk_free_rate=spec.risk_free_rate,
+            accept_inaccurate=spec.accept_inaccurate,
             **overrides,
         )
     return cls(**common, **overrides)

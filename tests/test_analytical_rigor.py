@@ -6,6 +6,7 @@ future refactor cannot quietly reintroduce it.
 
 from __future__ import annotations
 
+import logging
 import sys
 import warnings
 from pathlib import Path
@@ -801,28 +802,136 @@ def test_solver_chain_prefers_an_exact_solution_over_an_inaccurate_one():
     assert info.status == "optimal"
 
 
-def test_solver_chain_falls_back_to_the_inaccurate_answer_if_nothing_better():
+def _always_inaccurate_problem():
+    """A feasible QP plus a patch making every solver report it inaccurate.
+
+    Returns the variable, the problem and the patch function; the caller
+    installs the patch so it can choose the scope.
+    """
     import cvxpy as cp
 
-    from optimization_engine.optimizers._cvxpy_helpers import solve_problem
-
     real_solve = cp.Problem.solve
-    seen: list[str] = []
 
     def always_inaccurate(self, *args, **kwargs):
-        seen.append(str(kwargs.get("solver", "default")))
         real_solve(self, *args, **kwargs)
         self._status = "optimal_inaccurate"
 
     w = cp.Variable(2)
     problem = cp.Problem(cp.Minimize(cp.sum_squares(w)), [cp.sum(w) == 1])
+    return w, problem, always_inaccurate
+
+
+def test_inaccurate_refused_by_default():
+    """Nothing verified the answer, so nothing hands it back as if verified."""
+    import cvxpy as cp
+
+    from optimization_engine.optimizers._cvxpy_helpers import SolverFailure, solve_problem
+
+    _w, problem, patch = _always_inaccurate_problem()
     with pytest.MonkeyPatch.context() as mp:
-        mp.setattr(cp.Problem, "solve", always_inaccurate)
-        info = solve_problem(problem, solvers=("CLARABEL", "SCS"))
+        mp.setattr(cp.Problem, "solve", patch)
+        with pytest.raises(SolverFailure) as excinfo:
+            solve_problem(problem, solvers=("CLARABEL", "SCS"))
+
+    exc = excinfo.value
+    # Not the last solver's verdict -- the one that describes what happened.
+    assert exc.status == "optimal_inaccurate"
+    assert exc.attempts == ("CLARABEL", "SCS")
+    # The message has to name the way out, or the refusal is just a wall.
+    assert "accept_inaccurate=True" in str(exc)
+    assert "analyze_feasibility" in str(exc)
+
+
+def test_inaccurate_refused_reports_inaccurate_not_the_last_solvers_verdict():
+    """A later solver disagreeing must not relabel the failure.
+
+    A chain that goes inaccurate and then hits a solver claiming the problem
+    is infeasible used to raise with ``status="infeasible"`` and the message
+    "no allocation satisfies every constraint at once" -- about a problem
+    where a solver had already found an allocation.
+    """
+    import cvxpy as cp
+
+    from optimization_engine.optimizers._cvxpy_helpers import SolverFailure, solve_problem
+
+    real_solve = cp.Problem.solve
+    calls: list[str] = []
+
+    def inaccurate_then_infeasible(self, *args, **kwargs):
+        calls.append(str(kwargs.get("solver", "default")))
+        real_solve(self, *args, **kwargs)
+        self._status = "optimal_inaccurate" if len(calls) == 1 else "infeasible"
+
+    w = cp.Variable(2)
+    problem = cp.Problem(cp.Minimize(cp.sum_squares(w)), [cp.sum(w) == 1])
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(cp.Problem, "solve", inaccurate_then_infeasible)
+        with pytest.raises(SolverFailure) as excinfo:
+            solve_problem(problem, solvers=("CLARABEL", "SCS"))
+
+    assert excinfo.value.status == "optimal_inaccurate"
+    assert "no allocation satisfies" not in str(excinfo.value)
+
+
+def test_inaccurate_accepted_on_opt_in(caplog):
+    """The opt-in returns the loose answer, and says out loud that it did."""
+    import cvxpy as cp
+
+    from optimization_engine.optimizers._cvxpy_helpers import solve_problem
+
+    w, problem, patch = _always_inaccurate_problem()
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(cp.Problem, "solve", patch)
+        with caplog.at_level(
+            logging.WARNING, logger="optimization_engine.optimizers._cvxpy_helpers"
+        ):
+            info = solve_problem(
+                problem, solvers=("CLARABEL", "SCS"), accept_inaccurate=True
+            )
+
     assert info.status == "optimal_inaccurate"
-    # And the weights from the first usable attempt are still on the variable.
+    assert info.attempts == ("CLARABEL", "SCS")
+    assert "approximate solution" in caplog.text
+    # And the weights from the first usable attempt are still on the variable:
+    # the later solver in the chain overwrote them, so they were restored.
     assert w.value is not None
     assert float(np.sum(w.value)) == pytest.approx(1.0, abs=1e-4)
+
+
+def test_inaccurate_opt_in_travels_with_the_scope():
+    """``accepting_inaccurate`` is how the setting reaches a nested solve.
+
+    ``solve_problem`` is called with no keyword from inside every optimizer's
+    ``_solve``; the scope is the only thing that carries a caller's decision
+    that far down.
+    """
+    import cvxpy as cp
+
+    from optimization_engine.optimizers._cvxpy_helpers import (
+        SolverFailure,
+        accepting_inaccurate,
+        solve_problem,
+    )
+
+    _w, problem, patch = _always_inaccurate_problem()
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(cp.Problem, "solve", patch)
+        with accepting_inaccurate(True):
+            assert solve_problem(problem, solvers=("CLARABEL",)).status == (
+                "optimal_inaccurate"
+            )
+            # None inherits rather than resetting: that is what lets NCO's
+            # per-cluster optimizers run under the outer solve's settings.
+            with accepting_inaccurate(None):
+                assert solve_problem(problem, solvers=("CLARABEL",)).status == (
+                    "optimal_inaccurate"
+                )
+            with accepting_inaccurate(False):
+                with pytest.raises(SolverFailure):
+                    solve_problem(problem, solvers=("CLARABEL",))
+        # And the scope is closed again on the way out.
+        with pytest.raises(SolverFailure):
+            solve_problem(problem, solvers=("CLARABEL",))
 
 
 def test_solver_failure_distinguishes_infeasible_from_numerical():

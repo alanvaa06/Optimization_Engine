@@ -418,3 +418,62 @@ def test_backtest_no_longer_seeds_zero_expected_returns(tmp_path, capsys):
     assert main(["backtest", "--config", str(config), "--sample", "--lookback", "504",
                  "--rebalance-every", "252"]) == 0
     assert "initial solve failed" not in capsys.readouterr().err
+
+
+def test_accept_inaccurate_reaches_the_config_on_every_solving_subcommand(
+    feasible_config, monkeypatch
+):
+    """The flag exists on all three, and each one writes it onto the config.
+
+    ``optimize`` and ``backtest`` pass it into the solve through the optimizer
+    they build; ``check`` has no optimizer and opens the scope around its own
+    feasibility LPs. All three read it off the same field, so a config file
+    that sets ``accept_inaccurate: true`` and a command line that passes
+    ``--accept-inaccurate`` cannot disagree.
+    """
+    from optimization_engine import cli
+
+    seen: list[bool] = []
+    real = cli._apply_estimator_flags
+
+    def spy(config, args):
+        real(config, args)
+        seen.append(config.optimizer.accept_inaccurate)
+
+    monkeypatch.setattr(cli, "_apply_estimator_flags", spy)
+
+    assert main(["check", "--config", str(feasible_config), "--sample"]) == 0
+    assert main(
+        ["check", "--config", str(feasible_config), "--sample", "--accept-inaccurate"]
+    ) == 0
+    assert seen == [False, True]
+
+    for command in ("optimize", "backtest"):
+        parser_args = [command, "--config", str(feasible_config), "--sample"]
+        # Only the parser is exercised here: running a full backtest twice
+        # more to re-check one boolean is not worth the minute it costs.
+        parsed = cli._build_parser().parse_args([*parser_args, "--accept-inaccurate"])
+        assert parsed.accept_inaccurate is True
+        assert cli._build_parser().parse_args(parser_args).accept_inaccurate is False
+
+
+def test_accept_inaccurate_does_not_undo_a_config_that_asked_for_it(
+    tmp_path, feasible_config
+):
+    """Its absence on the command line is silence, not a veto."""
+    import yaml
+
+    from optimization_engine import cli
+    from optimization_engine.config import load_config
+
+    data = yaml.safe_load(feasible_config.read_text())
+    data["optimizer"]["accept_inaccurate"] = True
+    path = tmp_path / "loose.yaml"
+    path.write_text(yaml.safe_dump(data))
+
+    config = load_config(path)
+    args = cli._build_parser().parse_args(
+        ["optimize", "--config", str(path), "--sample"]
+    )
+    cli._apply_estimator_flags(config, args)
+    assert config.optimizer.accept_inaccurate is True
