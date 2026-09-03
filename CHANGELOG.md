@@ -152,7 +152,11 @@ with what to do about it.
   The digest also ignored holdings, so two runs with identical NAV and trades
   but different books collided. `RunMeta` gains `hash_version = 2`; hashes
   stored by earlier versions are not comparable to new ones.
-- **`pandas>=2.1`** — the first release where `fill_method=None` is silent.
+- **`pandas>=2.2`.** `fill_method=None` is silent from 2.1, but the backtest
+  calendar and the reporting resamplers use the `ME`/`QE`/`YE` frequency
+  aliases, which arrived in 2.2 — so 2.1 was never a version this code could
+  run on. The declared floor said otherwise until a CI cell pinned to it
+  failed 43 tests with `Invalid frequency: ME`.
 - **`expected_returns_from_history("mean")` is the arithmetic annualized
   mean.** It returned the geometric mean, so every μ-driven optimizer paired a
   geometric μ with an arithmetic Σ — a single-period model fed a multi-period
@@ -210,9 +214,10 @@ with what to do about it.
   "not evaluable" its own colour rather than a shade of "ineligible", in
   three flat bands so it cannot read as half-eligible, with the state named
   in words on hover.
-- **A Windows test cell and a pandas 2.1 cell** in CI. The first exercises the
-  cache's `os.replace`; the second exercises `fill_method=None` on a pandas
-  version that would otherwise pad.
+- **A Windows test cell and a pandas 2.2 cell** in CI. The first exercises the
+  cache's `os.replace`; the second pins the declared floor, which is the only
+  version in the matrix whose `pct_change` still pads and so the only one
+  that can see that fix regress.
 - **A point-in-time universe layer**, `optimization_engine.universe`. `Signal`
   is a date-by-asset frame with three states — true, false, and *not
   evaluable* — under Kleene logic, because a rolling liquidity rule knows

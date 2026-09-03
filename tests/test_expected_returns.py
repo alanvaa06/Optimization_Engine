@@ -30,6 +30,7 @@ if str(SRC) not in sys.path:
 
 from optimization_engine.config import (
     EngineConfig,
+    ExpectedReturnsMethod,
     expected_return_method_for_estimator,
 )
 from optimization_engine.data.covariance import (
@@ -165,8 +166,13 @@ def test_every_config_method_resolves_to_a_real_estimator(returns: pd.DataFrame)
     """A name the config accepts must be a name the estimator accepts."""
     import typing
 
-    hints = typing.get_type_hints(EngineConfig)
-    allowed = typing.get_args(hints["expected_returns_method"])
+    # Read the vocabulary from its own name, not from the class's
+    # annotations: ``get_type_hints`` evaluates *every* annotation on
+    # ``EngineConfig``, and several are PEP 604 unions, which are a runtime
+    # ``TypeError`` on Python 3.9 even under ``from __future__ import
+    # annotations``. The library never evaluates them, so only this test
+    # ever hit it.
+    allowed = typing.get_args(ExpectedReturnsMethod)
     assert "geometric_mean" in allowed
     cov = covariance_matrix(returns, method="ledoit_wolf")
     for name in allowed:
@@ -211,6 +217,47 @@ def test_bayes_stein_degenerate_reports_zero_intensity():
 
     assert intensity == 0.0
     pd.testing.assert_series_equal(shrunk, mu)
+
+
+def test_bayes_stein_does_not_depend_on_an_exact_cancellation():
+    """A deviation at the level of floating-point residue is not a deviation.
+
+    This is the case that actually broke: with identical means the Jorion
+    target is that same mean recomputed through ``pinv``, so the deviation
+    comes back as exactly zero on one BLAS and a few ulps on another. Both are
+    the estimator doing the same nothing. Testing the quadratic form for
+    ``<= 0`` alone caught only the first, and the second returned an intensity
+    of 1.0 beside an unshrunk vector — the exact claim the zero exists to
+    prevent, reached through a different door and invisible on whichever
+    interpreter happened to cancel exactly.
+    """
+    assets = [f"a{i}" for i in range(5)]
+    rng = np.random.default_rng(0)
+    data = rng.normal(size=(600, len(assets)))
+    cov = pd.DataFrame(np.cov(data, rowvar=False) * 0.04, index=assets, columns=assets)
+    # Means that differ only at the last bit, as a recomputed target does.
+    mu = pd.Series([0.07, 0.07 + 1e-17, 0.07 - 1e-17, 0.07, 0.07], index=assets)
+
+    shrunk, intensity = james_stein_shrinkage(mu, cov, n_observations=600)
+
+    assert intensity == 0.0
+    pd.testing.assert_series_equal(shrunk, mu)
+
+
+def test_bayes_stein_still_shrinks_a_real_deviation():
+    """The residue guard must not swallow shrinkage that should happen."""
+    assets = [f"a{i}" for i in range(5)]
+    rng = np.random.default_rng(0)
+    data = rng.normal(size=(600, len(assets)))
+    cov = pd.DataFrame(np.cov(data, rowvar=False) * 0.04, index=assets, columns=assets)
+    mu = pd.Series([0.02, 0.05, 0.09, 0.13, 0.20], index=assets)
+
+    shrunk, intensity = james_stein_shrinkage(mu, cov, n_observations=600)
+
+    assert 0.0 < intensity <= 1.0
+    assert not np.allclose(shrunk.values, mu.values)
+    # A convex combination, so it stays inside the sample range.
+    assert mu.min() - 1e-12 <= shrunk.min() and shrunk.max() <= mu.max() + 1e-12
 
 
 def test_bayes_stein_reports_a_real_intensity_when_it_shrinks():

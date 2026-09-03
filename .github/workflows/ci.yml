@@ -126,18 +126,18 @@ jobs:
           - os: windows-latest
             python-version: "3.12"
             label: "3.12 / Windows"
-          # pandas 2.1 is the floor in ``dependencies`` and the last release
+          # pandas 2.2 is the floor in ``dependencies`` and the last release
           # whose ``pct_change`` pads gaps by default, so it is the only
           # version in this matrix that can *see* a dropped
           # ``fill_method=None``: everything else resolves to pandas 3.x,
           # where the padding is already gone and the regression is invisible.
-          # 3.11 because pandas 2.1.4 ships a cp311 wheel and its own metadata
+          # 3.11 because pandas 2.2.4 ships a cp311 wheel and its own metadata
           # caps ``numpy<2``, which is what keeps this cell's stack
           # self-consistent without a second pin here.
           - os: ubuntu-latest
             python-version: "3.11"
-            pandas: "pandas==2.1.*"
-            label: "3.11 / pandas 2.1"
+            pandas: "pandas==2.2.*"
+            label: "3.11 / pandas 2.2"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5

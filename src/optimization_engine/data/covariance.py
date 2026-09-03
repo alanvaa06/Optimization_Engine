@@ -593,7 +593,17 @@ def james_stein_shrinkage(
         )
         diff = mu.values - mu_target
         quad = float(diff @ inv @ diff) / float(periods_per_year)
-        if quad <= 0:
+        # A deviation at the level of floating-point residue is not a
+        # deviation. Testing ``quad <= 0`` alone made this branch depend on an
+        # exact cancellation: when every mean already sits on the target, the
+        # target is that mean recomputed through ``pinv``, so ``diff`` comes
+        # back as either exactly zero or a few ulps, depending on the BLAS.
+        # Both are the same estimator doing the same nothing, and only one of
+        # them used to be reported as such — the other returned an intensity
+        # of 1.0 beside an unshrunk vector, which is the very claim this
+        # branch exists to prevent.
+        scale = float(np.max(np.abs(mu.values))) or 1.0
+        if quad <= 0 or not bool(np.any(np.abs(diff) > 1e-12 * scale)):
             # Nothing was shrunk — see the docstring. The analytic limit of
             # the formula is 1.0, but the intensity reports what happened to
             # the vector, and what happened to it was nothing.

@@ -558,6 +558,35 @@ plan above was written from a read of the source, and a read is not a run.
 14. **The projection honours `max_active_share`.** Setting it is what forces
     the CVXPY branch. See correction 1.
 
+### Corrections CI found that local verification could not
+
+15. **`pandas>=2.1` was never a floor this code could run on.** §1.4 chose it
+    because 2.1 is the first release where `fill_method=None` is silent, without
+    checking what else the tree needs — and `backtest/spec.py` and
+    `analytics/report.py` use the `ME`/`QE`/`YE` aliases, which arrived in 2.2.
+    The cell pinned to the declared floor failed 43 tests with
+    `Invalid frequency: ME`. The floor is now 2.2, which is exactly what a
+    version cell is for: nothing in local development or in a 3.x matrix could
+    have caught a floor that was wrong on paper.
+16. **The Bayes-Stein degenerate branch depended on an exact cancellation.**
+    Testing the quadratic form for `<= 0` caught the case only when the BLAS
+    cancelled exactly. When it left a few ulps — as 3.12's build does — the
+    estimator returned intensity 1.0 beside an unshrunk vector, which is the
+    claim §1.10(b) exists to prevent, reached through a different door. The
+    guard is now on the deviation's own scale, so it does not vary by
+    interpreter. §1.10(b)'s fix was close to unreachable on real data before.
+17. **`typing.get_type_hints` cannot be used on `EngineConfig` at 3.9.** It
+    evaluates every annotation on the class, several of which are PEP 604
+    unions — a runtime `TypeError` there, even under
+    `from __future__ import annotations`. The library never evaluates them, so
+    only a test hit it; the expected-return vocabulary now has a name of its
+    own to read instead.
+18. **The typecheck job failed on its own first run**, on the three modules
+    that import `yaml`. It passed locally only because a stub package had been
+    installed by hand into the development environment and never reached the
+    `dev` extra — the local green was not reproducible, which is the failure
+    the job exists to catch.
+
 ### Still open
 
 - `app/streamlit_app.py:1890,:1919` — the dominated-branch checkbox is inert.

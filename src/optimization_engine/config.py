@@ -143,6 +143,16 @@ def expected_return_method_for_estimator(method: str) -> str:
     return _EXPECTED_RETURN_METHOD_ALIASES.get(method, method)
 
 
+#: How ``EngineConfig`` seeds expected returns. Named rather than written
+#: inline on the field, so a caller can read the vocabulary without resolving
+#: the class's annotations: ``typing.get_type_hints(EngineConfig)`` evaluates
+#: every annotation on the class, and several use PEP 604 unions, which are a
+#: runtime ``TypeError`` on the 3.9 this package still supports.
+ExpectedReturnsMethod = Literal[
+    "historical_mean", "geometric_mean", "ema", "capm", "shrunk_mean"
+]
+
+
 @dataclass
 class EngineConfig:
     """Complete engine configuration.
@@ -251,9 +261,7 @@ class EngineConfig:
     denoise_method: str = "constant_residual"
     denoise_alpha: float = 0.0
     detone: int = 0
-    expected_returns_method: Literal[
-        "historical_mean", "geometric_mean", "ema", "capm", "shrunk_mean"
-    ] = "historical_mean"
+    expected_returns_method: ExpectedReturnsMethod = "historical_mean"
     ema_span: int = 180
     market_return: float | None = None
     market_weights: dict[str, float] | None = None
