@@ -232,7 +232,7 @@ from optimization_engine.universe import (
     point_in_time_mask,
 )
 
-__version__ = "0.5.3"
+__version__ = "0.7.0"
 
 __all__ = [
     "BenchmarkSpec",

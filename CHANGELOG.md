@@ -11,6 +11,8 @@ with what to do about it.
 
 ## [Unreleased]
 
+## [0.7.0] — 2026-09-03
+
 ### Fixed
 
 - **A max-diversification mandate the solver could not honour was returned
