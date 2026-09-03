@@ -6,7 +6,7 @@ import logging
 import warnings
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import pandas as pd
@@ -16,6 +16,9 @@ from optimization_engine.constraints import (
     coerce_layers,
     effective_layers,
 )
+
+if TYPE_CHECKING:  # pragma: no cover - import cycle: audit imports this module
+    from optimization_engine.optimizers.audit import AuditReport
 
 _LOG = logging.getLogger(__name__)
 
@@ -170,6 +173,14 @@ class OptimizationResult:
     status, concentration diagnostics, constraint violations, and any
     method-specific output (the Black-Litterman posterior, the realized CVaR,
     the risk-contribution error of an ERC solve).
+
+    Attributes:
+        audit: The mandate audit for these weights, or ``None`` when the solve
+            was asked not to run one. It carries the same breaches as
+            ``extras["violations"]``, as
+            :class:`~optimization_engine.optimizers.diagnostics.ConstraintViolation`
+            objects rather than sentences — the structured form is the one a
+            caller can act on.
     """
 
     weights: pd.Series
@@ -177,6 +188,10 @@ class OptimizationResult:
     expected_volatility: float
     sharpe_ratio: float
     extras: dict[str, Any] = field(default_factory=dict)
+    # Appended last, and defaulted, because this is a plain dataclass built
+    # positionally in places; a new field anywhere else would move the ones
+    # after it.
+    audit: AuditReport | None = None
 
     @property
     def solver_status(self) -> str:
@@ -246,6 +261,7 @@ class BaseOptimizer(ABC):
         constraints: PortfolioConstraints | None = None,
         risk_free_rate: float = 0.0,
         accept_inaccurate: bool | None = None,
+        strict_mandate: bool = False,
     ) -> None:
         """Store the inputs a solve will run against.
 
@@ -274,12 +290,23 @@ class BaseOptimizer(ABC):
                 — HRP, HERC, and the naive weightings — ignore this entirely;
                 NCO does *not*, because both of its layers are solved by real
                 optimizers.
+            strict_mandate: Whether a post-solve mandate breach raises rather
+                than being reported. ``False`` — the default — keeps the
+                long-standing contract: the audit is attached to the result and
+                the caller decides. ``True`` raises
+                :class:`~optimization_engine.optimizers.audit.MandateViolationError`
+                on any violation past tolerance, which is what a caller who
+                would rather have no book than a non-compliant one wants. It
+                bites hardest on the projecting methods, which is the point —
+                they are the ones that can return a book their mandate does not
+                permit.
         """
         self.expected_returns = expected_returns
         self.cov_matrix = cov_matrix
         self.constraints = constraints or PortfolioConstraints()
         self.risk_free_rate = float(risk_free_rate)
         self.accept_inaccurate = accept_inaccurate
+        self.strict_mandate = bool(strict_mandate)
         #: Populated by subclasses; surfaced through ``result.extras``.
         self._diagnostics: dict[str, Any] = {}
 
@@ -304,14 +331,34 @@ class BaseOptimizer(ABC):
     @abstractmethod
     def _solve(self) -> np.ndarray: ...
 
-    def optimize(self) -> OptimizationResult:
+    def optimize(
+        self, *, run_post_solve_diagnostics: bool = True
+    ) -> OptimizationResult:
         """Solve, validate, and package the allocation with its diagnostics.
+
+        Args:
+            run_post_solve_diagnostics: Whether to run the post-solve pass —
+                the concentration and exposure summary, the compliance check
+                against :attr:`constraints`, and the mandate audit built from
+                it. ``True`` is what a top-level solve wants and what every
+                caller gets by default. ``False`` is for a solve whose
+                constraints are deliberately *not* the mandate, where the check
+                would measure the wrong quantity: NCO's per-cluster and
+                inter-cluster layers run against budget-and-sign only, because
+                a 10% cap on an asset means 10% of the *book* and not 10% of a
+                cluster. Skipping it there also returns the cost, which was
+                measured at 12.8% of an NCO solve over 15 assets and 12.3% over
+                64. With it off,
+                ``extras`` carries no ``diagnostics`` or ``violations`` key and
+                ``result.audit`` is ``None``: nothing looked, which the result
+                says rather than implying compliance.
 
         Returns:
             An :class:`OptimizationResult` carrying the weights, the three summary
             statistics, and every diagnostic the solve produced — the solver that
             answered, its status, and any constraint the answer breaches. A
-            breach is reported here rather than raised: the caller decides whether
+            breach is reported rather than raised unless
+            :attr:`strict_mandate` is set: by default the caller decides whether
             a violation within solver tolerance is acceptable.
 
         Raises:
@@ -321,6 +368,8 @@ class BaseOptimizer(ABC):
                 solution.
             InfeasibleBoundsError: If the projection step cannot reconcile the
                 bounds with the budget.
+            MandateViolationError: If ``strict_mandate`` is set and the audit
+                found a breach past tolerance.
         """
         from optimization_engine.optimizers._cvxpy_helpers import accepting_inaccurate
 
@@ -356,7 +405,14 @@ class BaseOptimizer(ABC):
             "bounds_mode": self.bounds_mode,
             **self._diagnostics,
         }
-        extras.update(self._post_solve_diagnostics(w))
+        audit: AuditReport | None = None
+        if run_post_solve_diagnostics:
+            extras.update(self._post_solve_diagnostics(w))
+            audit = self._audit(extras.get("diagnostics"))
+            if self.strict_mandate and audit is not None and not audit.is_clean:
+                from optimization_engine.optimizers.audit import MandateViolationError
+
+                raise MandateViolationError(audit)
 
         return OptimizationResult(
             weights=w,
@@ -364,6 +420,36 @@ class BaseOptimizer(ABC):
             expected_volatility=port_vol,
             sharpe_ratio=sharpe,
             extras=extras,
+            audit=audit,
+        )
+
+    def _audit(self, diagnostics: Any) -> AuditReport | None:
+        """Package the compliance check the diagnostics pass already ran.
+
+        The audit is not a second check. ``portfolio_diagnostics`` calls
+        :func:`~optimization_engine.optimizers.diagnostics.check_constraints`
+        over the same weights, the same mandate and the same covariance, and
+        that sweep is the expensive half of the post-solve pass — running it
+        again to build a report would double the cost to produce a second copy
+        of the same answer, and would leave two places for the two answers to
+        disagree.
+
+        Args:
+            diagnostics: The
+                :class:`~optimization_engine.optimizers.diagnostics.PortfolioDiagnostics`
+                the post-solve pass produced, or ``None``.
+
+        Returns:
+            An :class:`~optimization_engine.optimizers.audit.AuditReport`, or
+            ``None`` when no diagnostics were computed.
+        """
+        from optimization_engine.optimizers.audit import AuditReport
+        from optimization_engine.optimizers.diagnostics import DEFAULT_TOLERANCE
+
+        if diagnostics is None:
+            return None
+        return AuditReport(
+            violations=tuple(diagnostics.violations), tolerance=DEFAULT_TOLERANCE
         )
 
     def _post_solve_diagnostics(self, weights: pd.Series) -> dict[str, Any]:

@@ -112,7 +112,7 @@ _CONFIG_KEYS = frozenset(
         "expected_returns_method", "ema_span", "market_return", "market_weights",
         "optimizer", "benchmark", "benchmark_weights", "max_tracking_error",
         "max_active_share", "long_only", "fully_invested", "leverage",
-        "previous_weights", "turnover_limit",
+        "previous_weights", "turnover_limit", "strict_mandate",
     }
 )
 _OPTIMIZER_KEYS = frozenset(OptimizerSpec.__dataclass_fields__)
@@ -215,6 +215,18 @@ class EngineConfig:
         turnover_limit: Cap on ``Σ|w_i − w_prev,i|``. Honoured by the
             mean-variance family and mean-CVaR; the homogeneous solves
             (max-Sharpe, max-diversification, risk parity) warn instead.
+        strict_mandate: Refuse a book that breaches the mandate instead of
+            reporting the breach. Off by default, which is the engine's
+            long-standing contract: the post-solve audit is attached to the
+            result and to ``run.warnings``, and the caller decides. Turning it
+            on raises
+            :class:`~optimization_engine.optimizers.audit.MandateViolationError`
+            on any violation past tolerance. It matters most for the methods
+            that apply bounds by projection — HRP, HERC, NCO, the naive
+            weightings — which can return a book their mandate does not permit;
+            a turnover budget or a tracking-error cap is dropped by the
+            projection entirely, and this is what turns that from a warning
+            into a stop.
     """
 
     expected_returns: dict[str, float] = field(default_factory=dict)
@@ -247,6 +259,7 @@ class EngineConfig:
     leverage: float | None = None
     previous_weights: dict[str, float] | None = None
     turnover_limit: float | None = None
+    strict_mandate: bool = False
 
     def __post_init__(self) -> None:
         """Coerce the constraint layers into their canonical form.
@@ -353,6 +366,7 @@ class EngineConfig:
                 dict(self.previous_weights) if self.previous_weights else None
             ),
             "turnover_limit": self.turnover_limit,
+            "strict_mandate": self.strict_mandate,
         }
 
     @classmethod
@@ -447,6 +461,7 @@ class EngineConfig:
                 if data.get("turnover_limit") is not None
                 else None
             ),
+            strict_mandate=bool(data.get("strict_mandate", False)),
         )
 
 

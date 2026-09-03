@@ -35,7 +35,11 @@ import pandas as pd
 #: Bumped major on a breaking change to any payload below, minor when keys
 #: are added. Consumers should check the major and refuse a version they do
 #: not know rather than parsing optimistically.
-SCHEMA_VERSION = "2.0"
+#:
+#: ``2.1`` adds ``audit`` to the optimize payload — the mandate audit, as
+#: structured violations rather than the sentences ``diagnostics.violations``
+#: has always carried.
+SCHEMA_VERSION = "2.1"
 
 
 def _num(value: Any) -> float | None:
@@ -159,6 +163,58 @@ def portfolio_diagnostics_payload(diagnostics: Any) -> dict[str, Any] | None:
     }
 
 
+def audit_payload(report: Any) -> dict[str, Any] | None:
+    """Whether the solved book obeys the mandate, breach by breach.
+
+    ``diagnostics.violations`` already carried this, as prose. A consumer that
+    wanted the size of a breach — to decide whether 20.4% against a 20% cap is
+    worth a phone call — had to parse it back out of a sentence. Here each
+    violation is an object with the limit, the actual figure and the distance
+    between them as numbers, and the sentence is kept alongside as ``message``
+    for whoever was only ever going to print it.
+
+    ``clean`` is lifted to the top for the same reason ``feasible`` is on the
+    feasibility payload: a consumer branches on one boolean rather than on the
+    emptiness of a list. Note that a clean audit means every limit that *could*
+    be checked was met — a tracking-error budget needs a covariance matrix, and
+    a solve that had none did not look.
+
+    Args:
+        report: An
+            :class:`~optimization_engine.optimizers.audit.AuditReport`, or
+            ``None`` when the solve was asked not to run one.
+
+    Returns:
+        A JSON-serializable dict, or ``None`` when nothing was supplied.
+    """
+    if report is None:
+        return None
+    violations = [
+        {
+            "kind": str(getattr(violation, "kind", "")),
+            "label": str(getattr(violation, "label", "")),
+            "limit": _num(getattr(violation, "limit", None)),
+            "actual": _num(getattr(violation, "actual", None)),
+            "magnitude": _num(getattr(violation, "magnitude", None)),
+            "message": str(
+                violation.describe()
+                if hasattr(violation, "describe")
+                else violation
+            ),
+        }
+        for violation in (getattr(report, "violations", None) or ())
+    ]
+    # The report's own verdict, not one derived from the list — the same
+    # reasoning as `feasible` above, and cheap insurance against the day the
+    # two stop coinciding.
+    clean = getattr(report, "is_clean", None)
+    return {
+        "clean": bool(clean) if clean is not None else not violations,
+        "tolerance": _num(getattr(report, "tolerance", None)),
+        "violations": violations,
+    }
+
+
 def covariance_diagnostics_payload(diagnostics: Any) -> dict[str, Any] | None:
     """Whether the covariance estimate is worth the weights built on it.
 
@@ -273,6 +329,11 @@ def optimization_payload(
             "sharpe_ratio": _num(result.sharpe_ratio),
         },
         "diagnostics": portfolio_diagnostics_payload(getattr(run, "diagnostics", None)),
+        # The compliance half of the diagnostics above, structured: same
+        # breaches, as numbers a consumer can threshold on rather than
+        # sentences it has to parse. `null` means the solve ran no audit,
+        # which is not the same claim as an empty violation list.
+        "audit": audit_payload(getattr(result, "audit", None)),
         "covariance": covariance_diagnostics_payload(
             getattr(run, "covariance_diagnostics", None)
         ),

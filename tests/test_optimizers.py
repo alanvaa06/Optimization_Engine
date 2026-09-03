@@ -734,3 +734,89 @@ def test_result_bounds_mode_matches_its_requirements(returns: pd.DataFrame, name
     )
     equity = sum(v for a, v in result.weights.items() if a in equities)
     assert equity <= 0.20 + 1e-6, f"{name}: the bucket budget did not bind"
+
+
+# ---------------------------------------------------------------------------
+# Registry cross-check: a hard-bounds solve owes a clean audit
+# ---------------------------------------------------------------------------
+
+#: Mandates for the audit cross-check, every one of them expressed purely in
+#: weight terms — a box, the unit budget, bucket budgets on one or two layers.
+#: That restriction is the test's whole validity. ``bounds_mode`` is a claim
+#: about per-asset and group bounds and nothing else, while the audit checks
+#: every limit the mandate carries, so a turnover or tracking-error budget here
+#: would fail methods that are not lying about anything: ``max_sharpe``
+#: declares hard bounds and *drops* a turnover limit, reporting it under
+#: ``ignored_constraints``. That is a different promise, broken in a different
+#: place, and it has its own tests.
+def _audit_mandates(assets: list[str]) -> dict[str, dict]:
+    """The weight-only mandates every method is cross-checked against."""
+    from optimization_engine.constraints import ConstraintLayer
+
+    equities = assets[:3]
+    return {
+        # The box and one bucket, both binding against 1/N.
+        "box_and_bucket": dict(
+            bounds={a: [0.0, 0.20] for a in assets},
+            groups={a: ("Equity" if a in equities else "Other") for a in assets},
+            group_bounds={"Equity": [0.0, 0.20]},
+        ),
+        # Floors as well as caps: the box binds from below, where a projection
+        # that only clips has nothing to give.
+        "floors_and_caps": dict(bounds={a: [0.03, 0.25] for a in assets}),
+        # A second layer of policy, with both of its buckets fenced in.
+        "layered_policy": dict(
+            bounds={a: [0.0, 0.35] for a in assets},
+            constraint_layers=[
+                ConstraintLayer(
+                    name="asset_class",
+                    assignments={
+                        a: ("Equity" if a in equities else "Bond") for a in assets
+                    },
+                    limits={"Equity": (0.10, 0.25), "Bond": (0.75, 0.90)},
+                )
+            ],
+        ),
+    }
+
+
+@pytest.mark.parametrize("mandate", ["box_and_bucket", "floors_and_caps", "layered_policy"])
+@pytest.mark.parametrize("name", available_optimizers())
+def test_hard_bounds_solves_audit_clean(returns: pd.DataFrame, name: str, mandate: str):
+    """A solve that reports ``bounds_mode="hard"`` must audit clean.
+
+    The companion to ``test_result_bounds_mode_matches_its_requirements``: that
+    one checks the *label* is the one the registry declares, this one checks the
+    label is true. "Hard" means the box and the bucket budgets went into the
+    convex program, so the post-solve audit has nothing to find — a hard method
+    that comes back with a breach is either mislabelled or has stopped putting a
+    constraint it claims into the program, and both are silent today.
+
+    Keyed off the reported mode rather than the declared one, which is what
+    brings ``max_diversification`` in: it declares ``"hard_or_projected"`` and
+    is held to the hard standard exactly on the solves where it says it took the
+    hard branch.
+    """
+    from optimization_engine.benchmark import BenchmarkSpec
+
+    assets = list(returns.columns)
+    cfg = EngineConfig(
+        expected_returns=(
+            (1 + returns).prod() ** (252 / len(returns)) - 1
+        ).to_dict(),
+        benchmark=BenchmarkSpec(kind="equal_weight"),
+        optimizer=OptimizerSpec(name=name, risk_free_rate=0.02),
+        **_audit_mandates(assets)[mandate],
+    )
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        result = run_engine(returns, cfg).result
+
+    assert result.audit is not None, f"{name}: the solve ran no audit"
+    if result.extras["bounds_mode"] != "hard":
+        pytest.skip(f"{name} reported {result.extras['bounds_mode']!r} on this mandate")
+    assert result.audit.is_clean, (
+        f"{name} reported hard bounds and breached the mandate:\n"
+        f"{result.audit.describe()}"
+    )

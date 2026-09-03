@@ -5,13 +5,13 @@ That only helps if the refusal is legible, so this is the contract: every
 exception the library raises on purpose, what causes it, whether it is
 recoverable, and what to catch.
 
-There are twenty-one exception classes. You almost never want to catch all of
+There are twenty-four exception classes. You almost never want to catch all of
 them, because they mean three different things:
 
 | It means | Do this | Examples |
 | --- | --- | --- |
 | **Your inputs are wrong** — a config, a universe, a constraint set | Fix the input. Retrying is pointless. | `SpecValidationError`, `LayerConfigurationError`, `BenchmarkError`, `ConfigurationError`, `SweepValidationError` |
-| **Your mandate is impossible** — the constraints have no solution | Relax something. The exception says which. | `InfeasibleConstraintsError`, `InfeasibleBoundsError`, `SolverFailure` |
+| **Your mandate is impossible** — the constraints have no solution, or this method cannot meet them | Relax something, or pick another method. The exception says which. | `InfeasibleConstraintsError`, `InfeasibleBoundsError`, `SolverFailure`, `MandateViolationError` |
 | **The world got in the way** — network, credentials, a vendor's bad day | Retry, or fix the environment. | `ProviderTransientError`, `ProviderCredentialsError`, `MissingDependencyError` |
 
 Five error types are exported from the package root — `IngestError`,
@@ -194,9 +194,40 @@ solver could verify is reported as a `solver_error` warning rather than as a
 range, and the solve goes ahead. "We could not tell you the range" has never
 been a reason to refuse to optimize.
 
+**A book that breaks the mandate is reported, not raised — unless you say
+otherwise.** Every solve audits its own weights on the way out and attaches the
+result as `result.audit`, an `AuditReport` whose violations carry the limit, the
+actual figure and the distance between them as numbers:
+
+```python
+run = run_engine(returns, config)
+if not run.result.audit.is_clean:
+    print(run.result.audit.describe())      # one line per breach
+    print(run.result.audit.worst.magnitude) # the biggest one, in weight terms
+```
+
+The same check runs on weights from anywhere — a spreadsheet, a backtest's
+schedule, a book you did not solve for — through
+`optimization_engine.optimizers.audit.audit_weights(weights, assets,
+constraints, cov_matrix)`. Pass `assets` and an asset the weights never mention
+is audited at zero, so a floor it misses is a breach rather than an absence.
+
+Set `strict_mandate: true` in the config to make that a refusal instead. The
+default is off because the methods that apply bounds by *projection* — HRP,
+HERC, NCO, the naive weightings — can legitimately return a book their mandate
+does not permit, and refusing would make them unusable. What `bounds_mode`
+promises is narrower than what the audit checks: a `"hard"` method puts the box
+and the bucket budgets into the convex program, and still drops a turnover
+budget if it is one of the homogeneous solves (`ignored_constraints` names
+them). Two limits are dropped by every projection, so they are the ones a
+soft-bounds method most often breaches: a **turnover budget** (a projection is
+not a trade) and a **tracking-error budget** (a risk statement, not a weights
+one). An audit that ran without a covariance matrix could not check the second
+at all, and comes back clean because it did not look.
+
 ## Infeasible mandates
 
-The difference between these three matters.
+The difference between these four matters.
 
 **`InfeasibleConstraintsError`** is the good one. It is raised by the
 pre-flight analysis, before a solver is ever called, and it carries a full
@@ -264,6 +295,30 @@ The most common cause that looks like a solver bug and is not: a
 tracking-error or active-share budget. A benchmark holding an asset your
 bounds cap below its index weight sets a *floor* on tracking error that no
 allocation can go under. Raise the limit or relax the bound.
+
+**`MandateViolationError`** is the fourth, and the only one raised *after* a
+successful solve. It means the answer arrived and does not comply, and you had
+asked to be told loudly:
+
+```python
+from optimization_engine.optimizers.audit import MandateViolationError
+
+try:
+    run = run_engine(returns, config)          # config.strict_mandate = True
+except MandateViolationError as exc:
+    exc.report                                 # the AuditReport
+    exc.report.worst.describe()                # the biggest breach, named
+```
+
+It is the most recoverable of the four, and in a different way: the mandate is
+not unsatisfiable, this *method* did not satisfy it. Three fixes, in order of
+how often they are the right one — pick a method whose `bounds_mode` is
+`"hard"` and have the limit enforced inside the convex program rather than
+projected onto afterwards; loosen the limit the report names; or, having
+decided a near-miss is acceptable, leave `strict_mandate` off and read
+`result.audit` yourself. It subclasses `ValueError`, like
+`InfeasibleConstraintsError`, and carries the report on `exc.report` for the
+same reason.
 
 ---
 
@@ -340,8 +395,11 @@ Some things are reported instead, and are easy to miss if you only guard with
 `try`:
 
 - **Constraint breaches after a solve.** A solver can return an answer that
-  violates a constraint within tolerance. This is reported in the run's
-  diagnostics, never silently accepted — and never raised either.
+  violates a constraint within tolerance, and a projecting method can return one
+  that breaches a limit it was never able to impose. Both are reported — in the
+  run's diagnostics, in `run.warnings`, and structured on `result.audit` — and
+  never silently accepted. Raised only under `strict_mandate`, which is off by
+  default.
 - **Data-quality problems.** Gaps, stale feeds, suspected unadjusted splits and
   thin samples come back in `analyze_prices(...).errors` and `.warnings`. Only
   `--strict` turns an error into a refusal.

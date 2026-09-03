@@ -157,26 +157,30 @@ class NCOOptimizer(BaseOptimizer):
         :meth:`~optimization_engine.optimizers.base.BaseOptimizer.optimize`
         rather than its raw ``_solve``, so a nested layer gets the same
         treatment as a top-level solve: the non-finite check, dust removal
-        and budget restoration of ``_clean_weights``, ``bounds_mode``
-        recorded on the result, and the post-solve compliance diagnostics.
-        Reaching past ``optimize`` was how the two layers came to be the only
-        weights in the engine that nothing ever validated.
+        and budget restoration of ``_clean_weights``, and ``bounds_mode``
+        recorded on the result. Reaching past ``optimize`` was how the two
+        layers came to be the only weights in the engine that nothing ever
+        validated.
 
-        Note that each layer is checked against :meth:`_sub_constraints` --
-        budget and sign -- and *not* against the mandate, whose per-asset and
-        group limits are applied to the combined book by projection in
-        :meth:`_solve`. Auditing a cluster against a portfolio-level cap would
-        measure the wrong quantity, which is the whole reason the sub-problem
-        drops those limits in the first place.
+        What a nested layer does *not* get is the mandate audit, and that is
+        the one deliberate exception: the sub-problem is solved against
+        :meth:`_sub_constraints` -- budget and sign -- while the mandate's
+        per-asset and group limits are applied to the combined book by
+        projection in :meth:`_solve`. Auditing a cluster against a
+        portfolio-level cap would measure the wrong quantity (a 10% weight
+        *within* a cluster is not 10% of the book), and auditing it against the
+        budget-and-sign set it was actually solved with re-checks, once per
+        cluster plus once more, a constraint the convex program has already
+        imposed. So this passes ``run_post_solve_diagnostics=False``, which is
+        the per-solve opt-out ``optimize`` carries for exactly this case.
 
-        Running the check once per cluster plus once for the inter-cluster
-        layer costs roughly a fifth of an NCO solve (measured at 15 and 64
-        assets; the compliance sweep is most of it, the weight cleaning the
-        rest). It is kept rather than short-circuited because what it verifies
-        -- the weights sum to one, and stay non-negative under a long-only
-        mandate -- is exactly the invariant the outer product in :meth:`_solve`
-        depends on. A per-solve opt-out, if one is wanted, belongs on
-        ``optimize`` itself rather than as a private hook here.
+        The invariant the outer product in :meth:`_solve` depends on -- each
+        layer's weights summing to one -- is not left to that check either way:
+        :meth:`_unit_budget` enforces it below, and says so when it cannot.
+        Skipping the sweep also returns what it cost: 12.8% of an NCO solve
+        over 15 assets and 12.3% over 64, median of nine runs each. The weight
+        cleaning, which is the other half of what the per-layer diagnostics were
+        measured at, is kept -- it is what normalizes each layer's budget.
 
         Args:
             cov: Covariance of this layer's universe — one cluster's assets,
@@ -214,7 +218,8 @@ class NCOOptimizer(BaseOptimizer):
             optimizer = MinVarianceOptimizer(
                 cov_matrix=cov, constraints=constraints
             )
-        weights = optimizer.optimize().weights.reindex(assets)
+        solved = optimizer.optimize(run_post_solve_diagnostics=False)
+        weights = solved.weights.reindex(assets)
         return self._unit_budget(weights, layer)
 
     @staticmethod

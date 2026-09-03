@@ -199,6 +199,10 @@ def test_nco_layers_go_through_optimize(objective: str, blocked_cov: pd.DataFram
     checked — no dust removal, no ``bounds_mode``, no solver record. The spy
     below fires only if the sub-solves go through ``optimize``, so the test
     fails outright on a regression rather than on a weakened assertion.
+
+    The one thing a nested layer deliberately does *not* get is the post-solve
+    mandate audit: see ``test_nco_sub_solves_are_not_audited_against_the_mandate``
+    for why, and for what the opt-out is worth in cost.
     """
     from optimization_engine.optimizers.mean_variance import (
         MaxSharpeOptimizer,
@@ -215,11 +219,13 @@ def test_nco_layers_go_through_optimize(objective: str, blocked_cov: pd.DataFram
         np.linspace(0.03, 0.12, len(blocked_cov.columns)), index=blocked_cov.columns
     )
     sub_results = []
+    sub_kwargs = []
     unpatched = sub_optimizer.optimize
 
-    def spy(self):
-        result = unpatched(self)
+    def spy(self, **kwargs):
+        result = unpatched(self, **kwargs)
         sub_results.append(result)
+        sub_kwargs.append(kwargs)
         return result
 
     sub_optimizer.optimize = spy
@@ -243,14 +249,72 @@ def test_nco_layers_go_through_optimize(objective: str, blocked_cov: pd.DataFram
         assert sub.extras["solvers_attempted"]
         assert sub.extras["bounds_mode"] == "hard"
         assert sub.extras["optimizer"] == sub_optimizer.name
-        assert "diagnostics" in sub.extras
-        assert not sub.violations, sub.violations
         assert sub.weights.sum() == pytest.approx(1.0)
+
+    # Every layer asked `optimize` to skip the post-solve pass, explicitly.
+    assert sub_kwargs == [{"run_post_solve_diagnostics": False}] * len(sub_results)
 
     # The last sub-solve is the inter-cluster layer: one weight per cluster.
     assert list(sub_results[-1].weights.index) == sorted(
         int(label) for label in result.extras["nco_cluster_weights"]
     )
+
+
+def test_nco_sub_solves_are_not_audited_against_the_mandate(blocked_cov: pd.DataFrame):
+    """A cluster weight is not a book weight, so the mandate cannot judge it.
+
+    NCO solves each cluster against budget-and-sign only and applies the
+    mandate's per-asset limits to the *combined* book by projection. Auditing a
+    sub-solve against the mandate would therefore measure the wrong quantity —
+    an intra-cluster weight of 0.30 is 30% of a cluster, not 30% of the
+    portfolio, and a 10% cap would be "breached" by every layer of every NCO
+    run. Auditing it against the budget-and-sign set it really was solved with
+    is not wrong, only pointless: it re-checks, k+1 times, a constraint the
+    convex program has already imposed.
+
+    So the layers opt out, and the assertion that proves it is not that the
+    sub-reports are clean — it is that the raw intra-cluster weights would
+    *not* have been, had the mandate been the yardstick.
+    """
+    from optimization_engine.optimizers.mean_variance import MinVarianceOptimizer
+
+    cap = 0.10
+    constraints = PortfolioConstraints(
+        bounds={a: (0.0, cap) for a in blocked_cov.columns}
+    )
+    sub_results = []
+    unpatched = MinVarianceOptimizer.optimize
+
+    def spy(self, **kwargs):
+        result = unpatched(self, **kwargs)
+        sub_results.append((self.constraints, result))
+        return result
+
+    MinVarianceOptimizer.optimize = spy
+    try:
+        result = NCOOptimizer(cov_matrix=blocked_cov, constraints=constraints).optimize()
+    finally:
+        del MinVarianceOptimizer.optimize
+
+    assert sub_results, "no sub-solve was observed"
+    for sub_constraints, sub in sub_results:
+        # The sub-problem never sees the mandate's box in the first place.
+        assert sub_constraints.bounds == {}
+        assert sub.audit is None
+        assert "diagnostics" not in sub.extras
+        assert "violations" not in sub.extras
+
+    # The heart of it: at least one layer breaks the mandate's cap in cluster
+    # units, so an audit against `constraints` would have reported a breach
+    # that does not exist in the book.
+    assert any(
+        sub.weights.max() > cap + 1e-6 for _constraints, sub in sub_results
+    ), "expected a cluster weight above the book-level cap"
+
+    # The book itself is audited, and complies.
+    assert result.audit is not None
+    assert result.audit.is_clean, result.audit.describe()
+    assert result.weights.max() <= cap + 1e-6
 
 
 def test_nco_survives_a_long_short_mandate(blocked_cov: pd.DataFrame):
