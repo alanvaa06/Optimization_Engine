@@ -844,7 +844,7 @@ optengine backtest --config config/example_multi_asset.yaml --sample \
 # the positions that produced it, so the contributions add to the P&L exactly.
 # A shock naming an asset the book cannot hold is refused, not zeroed.
 optengine optimize --config config/example_multi_asset.yaml --sample \
-    --stress shocks.yaml
+    --stress config/shocks.yaml
 
 # Refuse a book that breaks the mandate instead of reporting the breach. It
 # fires *after* a successful solve, and it is the methods that apply bounds by
@@ -863,7 +863,7 @@ optengine optimize --config config/example_multi_asset.yaml --sample \
 # separate opt-in: the screen says what the mandate permits, this says what
 # still trades.
 optengine backtest --config config/example_multi_asset.yaml --sample \
-    --universe universe.yaml --universe-policy exclude \
+    --universe config/universe.yaml --universe-policy exclude \
     --delisting-grace 5
 
 # Price capacity from real traded volume rather than an assumed participation

@@ -191,7 +191,9 @@ with what to do about it.
 - **Payload schema 2.0, then 2.1.** Feasibility issues are now objects with
   `code`, `severity`, `message` and `suggestion` instead of stringified
   dataclass reprs, and carry `stage_reached` and `reachable_return`; 2.1 adds
-  the `audit` key.
+  the `audit` key, and 2.2 the `stress` key — stress reached the console and
+  the Excel export but not the payload, so an agent calling the CLI could not
+  see it at all.
 
 ### Added
 
@@ -199,6 +201,15 @@ with what to do about it.
   checking it. mypy now runs over the package; the 45 modules that do not yet
   pass are listed in an allowlist that a test holds to a ceiling and that may
   only shrink.
+- **`config/shocks.yaml` and `config/universe.yaml`**, so the documented
+  `--stress` and `--universe` commands run from a clean checkout. The
+  universe example reads only the reserved `returns` panel, needs no data
+  file beside it, and produces all three eligibility states on the sample
+  panel — which is the point of shipping it.
+- **A Stress tab and a Universe tab in the app.** The universe heatmap gives
+  "not evaluable" its own colour rather than a shade of "ineligible", in
+  three flat bands so it cannot read as half-eligible, with the state named
+  in words on hover.
 - **A Windows test cell and a pandas 2.1 cell** in CI. The first exercises the
   cache's `os.replace`; the second exercises `fill_method=None` on a pandas
   version that would otherwise pad.
