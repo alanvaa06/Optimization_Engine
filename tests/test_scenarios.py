@@ -1,12 +1,19 @@
-"""Tests for the named-scenarios module."""
+"""The ``scenarios`` → ``presets`` deprecation shim.
+
+The behaviour these names implement is covered by ``tests/test_presets.py``.
+What is covered here is the promise the shim makes: that the old import path
+still warns *and* still works — including a full save/load round-trip through
+it, because a deprecation that quietly stops persisting anything is worse than
+no deprecation at all.
+"""
 
 from __future__ import annotations
 
+import importlib
 import sys
+import warnings
 from pathlib import Path
 
-import numpy as np
-import pandas as pd
 import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -14,249 +21,166 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
+from optimization_engine import presets  # noqa: E402
 from optimization_engine.config import EngineConfig, OptimizerSpec  # noqa: E402
-from optimization_engine.data.loader import prices_to_returns, sample_dataset  # noqa: E402
-from optimization_engine.engine import run_engine  # noqa: E402
-from optimization_engine.scenarios import (  # noqa: E402
-    NOTES_MAX_LEN,
-    SCHEMA_VERSION,
-    Scenario,
-    config_signature,
-    delete_scenario,
-    dump_scenarios_yaml,
-    load_scenarios,
-    load_scenarios_yaml,
-    rename_scenario,
-    save_scenarios,
-    scenario_signature,
-)
 
-# ---------------------------------------------------------------------------
-# Fixtures (mirrored from tests/test_optimizers.py)
-# ---------------------------------------------------------------------------
+#: Every pre-0.7.0 name, and what it is now. The shim is only as good as this
+#: table, so the table is the test.
+RENAMES = {
+    "Scenario": "Preset",
+    "scenario_to_dict": "preset_to_dict",
+    "scenario_from_dict": "preset_from_dict",
+    "dump_scenarios_yaml": "dump_presets_yaml",
+    "load_scenarios_yaml": "load_presets_yaml",
+    "save_scenarios": "save_presets",
+    "load_scenarios": "load_presets",
+    "rename_scenario": "rename_preset",
+    "delete_scenario": "delete_preset",
+    "scenario_signature": "preset_signature",
+}
 
-
-@pytest.fixture(scope="module")
-def returns() -> pd.DataFrame:
-    prices = sample_dataset(n_periods=252 * 4, seed=7)
-    return prices_to_returns(prices)
+#: The names that did not move.
+UNCHANGED = ("SCHEMA_VERSION", "NOTES_MAX_LEN", "config_signature", "now_iso")
 
 
-@pytest.fixture(scope="module")
-def baseline_config(returns: pd.DataFrame) -> EngineConfig:
-    expected = (1 + returns).prod() ** (252 / len(returns)) - 1
-    return EngineConfig(
-        expected_returns=expected.to_dict(),
-        bounds={a: [0.0, 0.5] for a in returns.columns},
-        groups={a: "All" for a in returns.columns},
-        group_bounds={"All": [1.0, 1.0]},
-        optimizer=OptimizerSpec(name="mean_variance", risk_free_rate=0.03),
-    )
+def _reimport_scenarios():
+    """Import ``optimization_engine.scenarios`` with its module body re-run.
+
+    A module-level warning fires once per interpreter, when the module body
+    executes. Dropping the entry from ``sys.modules`` is what makes the
+    warning observable in a suite that has already imported it. Safe to do
+    repeatedly: every name the shim binds comes from ``presets``, which is not
+    reloaded, so the re-executed module binds the identical objects.
+    """
+    sys.modules.pop("optimization_engine.scenarios", None)
+    return importlib.import_module("optimization_engine.scenarios")
 
 
 @pytest.fixture
-def two_scenarios(baseline_config: EngineConfig) -> dict[str, Scenario]:
-    rp_cfg = EngineConfig.from_dict(baseline_config.to_dict())
-    rp_cfg.optimizer = OptimizerSpec(name="risk_parity", risk_free_rate=0.03)
-    return {
-        "Baseline": Scenario(
+def config() -> EngineConfig:
+    return EngineConfig(
+        expected_returns={"A": 0.05, "B": 0.03},
+        bounds={"A": [0.0, 1.0], "B": [0.0, 1.0]},
+        optimizer=OptimizerSpec(name="equal_weight"),
+    )
+
+
+# ---------------------------------------------------------------------------
+# 1. The warning
+# ---------------------------------------------------------------------------
+
+
+def test_importing_scenarios_warns_and_names_its_replacement():
+    with pytest.warns(DeprecationWarning, match="optimization_engine.presets"):
+        module = _reimport_scenarios()
+    assert module.Preset is presets.Preset
+
+
+def test_importing_the_package_itself_does_not_warn():
+    """``__init__`` must reach ``presets`` directly.
+
+    Routing the package's own eager imports through the shim would fire a
+    deprecation warning at ``import optimization_engine`` — a warning about a
+    module the caller never named, which they cannot act on.
+    """
+    sys.modules.pop("optimization_engine.scenarios", None)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        importlib.reload(importlib.import_module("optimization_engine"))
+    messages = [str(w.message) for w in caught if issubclass(w.category, DeprecationWarning)]
+    assert not [m for m in messages if "optimization_engine.scenarios" in m]
+
+
+# ---------------------------------------------------------------------------
+# 2. Every old name still resolves, to the same object
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(("old", "new"), sorted(RENAMES.items()))
+def test_old_name_is_the_new_object(old: str, new: str):
+    with pytest.warns(DeprecationWarning):
+        module = _reimport_scenarios()
+    assert getattr(module, old) is getattr(presets, new)
+
+
+@pytest.mark.parametrize("name", UNCHANGED)
+def test_unchanged_names_are_still_there(name: str):
+    with pytest.warns(DeprecationWarning):
+        module = _reimport_scenarios()
+    assert getattr(module, name) == getattr(presets, name)
+
+
+def test_scenario_is_preset_not_a_subclass_of_it(config: EngineConfig):
+    """``isinstance`` against the old name must still hold for new objects."""
+    with pytest.warns(DeprecationWarning):
+        module = _reimport_scenarios()
+    assert module.Scenario is presets.Preset
+    assert isinstance(presets.Preset("X", config), module.Scenario)
+
+
+def test_the_shim_exports_everything_it_documents():
+    with pytest.warns(DeprecationWarning):
+        module = _reimport_scenarios()
+    for name in [*RENAMES, *RENAMES.values(), *UNCHANGED]:
+        assert name in module.__all__, f"{name} is missing from the shim's __all__"
+        assert hasattr(module, name)
+
+
+# ---------------------------------------------------------------------------
+# 3. The old path still round-trips a saved config
+# ---------------------------------------------------------------------------
+
+
+def test_the_old_import_path_still_round_trips_a_saved_config(
+    tmp_path: Path, config: EngineConfig
+):
+    """Save through the deprecated names, load through them, get it back.
+
+    The end-to-end promise of "keep it working for one release": a caller who
+    has not migrated yet writes a file and reads it back with no change in
+    behaviour, and the file is the same file the new names produce.
+    """
+    with pytest.warns(DeprecationWarning):
+        module = _reimport_scenarios()
+
+    saved = {
+        "Baseline": module.Scenario(
             name="Baseline",
-            config=baseline_config,
-            notes="MV target=auto",
-            created_at="2026-04-27T10:00:00",
-            updated_at="2026-04-27T10:00:00",
-        ),
-        "RiskParity": Scenario(
-            name="RiskParity",
-            config=rp_cfg,
-            notes="ERC fallback",
-            created_at="2026-04-27T10:01:00",
-            updated_at="2026-04-27T10:01:00",
-        ),
+            config=config,
+            notes="via the old path",
+            created_at="2026-09-02T10:00:00+00:00",
+            updated_at="2026-09-02T10:00:00+00:00",
+        )
     }
 
+    path = tmp_path / "scenarios.yaml"
+    module.save_scenarios(saved, path)
+    back = module.load_scenarios(path)
 
-# ---------------------------------------------------------------------------
-# 1. YAML round-trip (in-memory)
-# ---------------------------------------------------------------------------
+    assert list(back) == ["Baseline"]
+    assert back["Baseline"].name == "Baseline"
+    assert back["Baseline"].notes == "via the old path"
+    assert back["Baseline"].created_at == "2026-09-02T10:00:00+00:00"
+    assert back["Baseline"].config.to_dict() == config.to_dict()
+    assert module.scenario_signature(back["Baseline"]) == presets.preset_signature(
+        saved["Baseline"]
+    )
 
+    # The bytes are what the new names write, so a file is portable in both
+    # directions across the rename.
+    assert path.read_text(encoding="utf-8") == presets.dump_presets_yaml(saved)
 
-def test_scenario_yaml_round_trip(two_scenarios: dict[str, Scenario]):
-    text = dump_scenarios_yaml(two_scenarios)
-    back = load_scenarios_yaml(text)
-    assert list(back.keys()) == list(two_scenarios.keys())
-    for k in two_scenarios:
-        assert back[k].name == two_scenarios[k].name
-        assert back[k].notes == two_scenarios[k].notes
-        assert back[k].created_at == two_scenarios[k].created_at
-        assert back[k].updated_at == two_scenarios[k].updated_at
-        assert back[k].config.to_dict() == two_scenarios[k].config.to_dict()
-
-
-# ---------------------------------------------------------------------------
-# 2. Filesystem round-trip (yaml + json)
-# ---------------------------------------------------------------------------
+    # And the new loader reads the file the old writer produced.
+    assert list(presets.load_presets(path)) == ["Baseline"]
 
 
-def test_save_and_load_file_round_trip(
-    tmp_path: Path, two_scenarios: dict[str, Scenario]
-):
-    yaml_path = tmp_path / "scenarios.yaml"
-    save_scenarios(two_scenarios, yaml_path)
-    yaml_back = load_scenarios(yaml_path)
-    assert {k: v.config.to_dict() for k, v in yaml_back.items()} == {
-        k: v.config.to_dict() for k, v in two_scenarios.items()
+def test_old_mutation_helpers_still_work(config: EngineConfig):
+    with pytest.warns(DeprecationWarning):
+        module = _reimport_scenarios()
+    presets_map = {
+        "A": module.Scenario("A", config),
+        "B": module.Scenario("B", config),
     }
-
-    json_path = tmp_path / "scenarios.json"
-    save_scenarios(two_scenarios, json_path)
-    json_back = load_scenarios(json_path)
-    assert list(json_back.keys()) == list(two_scenarios.keys())
-
-
-# ---------------------------------------------------------------------------
-# 3. Schema version guard
-# ---------------------------------------------------------------------------
-
-
-def test_load_rejects_unknown_schema_version():
-    payload = (
-        "schema_version: 999\n"
-        "scenarios: []\n"
-    )
-    with pytest.raises(ValueError, match="schema_version"):
-        load_scenarios_yaml(payload)
-
-
-# ---------------------------------------------------------------------------
-# 4. Duplicate name guard
-# ---------------------------------------------------------------------------
-
-
-def test_load_rejects_duplicate_names():
-    payload = """
-schema_version: 1
-scenarios:
-  - name: Foo
-    config: {expected_returns: {A: 0.05}, bounds: {A: [0.0, 1.0]}, optimizer: {name: equal_weight}}
-  - name: Foo
-    config: {expected_returns: {A: 0.06}, bounds: {A: [0.0, 1.0]}, optimizer: {name: equal_weight}}
-"""
-    with pytest.raises(ValueError, match="Duplicate"):
-        load_scenarios_yaml(payload)
-
-
-# ---------------------------------------------------------------------------
-# 5. End-to-end: round-trip preserves solver result exactly
-# ---------------------------------------------------------------------------
-
-
-def test_loaded_scenario_solves_identically(
-    returns: pd.DataFrame, baseline_config: EngineConfig
-):
-    scn = Scenario(name="Baseline", config=baseline_config)
-    text = dump_scenarios_yaml({"Baseline": scn})
-    back = load_scenarios_yaml(text)["Baseline"]
-
-    direct = run_engine(returns, baseline_config)
-    via_yaml = run_engine(returns, back.config)
-    np.testing.assert_allclose(
-        direct.result.weights.values,
-        via_yaml.result.weights.values,
-        atol=1e-8,
-    )
-
-
-# ---------------------------------------------------------------------------
-# 6. Rename helper
-# ---------------------------------------------------------------------------
-
-
-def test_rename_preserves_config_and_metadata(two_scenarios: dict[str, Scenario]):
-    orig_created = two_scenarios["Baseline"].created_at
-    out = rename_scenario(two_scenarios, "Baseline", "Baseline V2", touch=True)
-    assert list(out.keys()) == ["Baseline V2", "RiskParity"]
-    moved = out["Baseline V2"]
-    assert moved.name == "Baseline V2"
-    assert moved.config.to_dict() == two_scenarios["Baseline"].config.to_dict()
-    assert moved.created_at == orig_created
-    assert moved.updated_at != orig_created  # bumped
-
-
-def test_rename_rejects_collision(two_scenarios: dict[str, Scenario]):
-    with pytest.raises(ValueError, match="already exists"):
-        rename_scenario(two_scenarios, "Baseline", "RiskParity")
-
-
-# ---------------------------------------------------------------------------
-# 7. Delete helper
-# ---------------------------------------------------------------------------
-
-
-def test_delete_removes_only_target(two_scenarios: dict[str, Scenario]):
-    out = delete_scenario(two_scenarios, "Baseline")
-    assert list(out.keys()) == ["RiskParity"]
-    # original dict not mutated
-    assert "Baseline" in two_scenarios
-
-
-# ---------------------------------------------------------------------------
-# 8. Infeasible bounds raise (covers the What-if error path)
-# ---------------------------------------------------------------------------
-
-
-def test_infeasible_bounds_raise(returns: pd.DataFrame, baseline_config: EngineConfig):
-    """Caps that cannot reach the budget must fail, and say why."""
-    from optimization_engine.optimizers._cvxpy_helpers import SolverFailure
-    from optimization_engine.optimizers.feasibility import InfeasibleConstraintsError
-
-    bad_dict = baseline_config.to_dict()
-    # Cap every asset at 5%; with N < 20 assets the upper bounds sum below 1.
-    bad_dict["bounds"] = {a: [0.0, 0.05] for a in bad_dict["expected_returns"]}
-    bad_cfg = EngineConfig.from_dict(bad_dict)
-
-    with pytest.raises((SolverFailure, InfeasibleConstraintsError, RuntimeError)):
-        run_engine(returns, bad_cfg)
-
-    # And the pre-solve report names the constraint rather than leaving the
-    # analyst with a bare solver status.
-    with pytest.raises(InfeasibleConstraintsError, match="cannot reach 100%"):
-        run_engine(returns, bad_cfg, raise_on_infeasible=True)
-
-
-# ---------------------------------------------------------------------------
-# 9. Cache-key signature stable across dict insertion order
-# ---------------------------------------------------------------------------
-
-
-def test_config_signature_stable_across_dict_order():
-    cfg_a = EngineConfig(
-        expected_returns={"A": 0.05, "B": 0.03, "C": 0.04},
-        bounds={"A": [0.0, 1.0], "B": [0.0, 1.0], "C": [0.0, 1.0]},
-        optimizer=OptimizerSpec(name="risk_parity"),
-    )
-    cfg_b = EngineConfig(
-        expected_returns={"C": 0.04, "A": 0.05, "B": 0.03},
-        bounds={"B": [0.0, 1.0], "A": [0.0, 1.0], "C": [0.0, 1.0]},
-        optimizer=OptimizerSpec(name="risk_parity"),
-    )
-    assert config_signature(cfg_a) == config_signature(cfg_b)
-    assert scenario_signature(Scenario("A", cfg_a)) == scenario_signature(Scenario("B", cfg_b))
-
-
-# ---------------------------------------------------------------------------
-# 10. Notes truncation respected on save
-# ---------------------------------------------------------------------------
-
-
-def test_notes_truncation(baseline_config: EngineConfig):
-    big = "x" * (NOTES_MAX_LEN + 50)
-    scn = Scenario(name="Big", config=baseline_config, notes=big)
-    text = dump_scenarios_yaml({"Big": scn})
-    back = load_scenarios_yaml(text)["Big"]
-    assert len(back.notes) == NOTES_MAX_LEN
-
-
-def test_schema_version_constant():
-    # Pin: bumping SCHEMA_VERSION is a deliberate breaking change.
-    assert SCHEMA_VERSION == 1
+    renamed = module.rename_scenario(presets_map, "A", "A2")
+    assert list(renamed) == ["A2", "B"]
+    assert list(module.delete_scenario(renamed, "B")) == ["A2"]

@@ -8,6 +8,7 @@ whether to trust it.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
@@ -62,6 +63,12 @@ from optimization_engine.optimizers.feasibility import (
     FeasibilityReport,
     InfeasibleConstraintsError,
     analyze_feasibility,
+)
+from optimization_engine.stress import (
+    Shock,
+    StressReport,
+    shocks_from_dicts,
+    stress_test,
 )
 
 
@@ -124,6 +131,10 @@ class EngineRun:
     #: The benchmark this run was measured — and possibly optimized — against,
     #: resolved once at solve time so every downstream view uses the same one.
     benchmark: ResolvedBenchmark | None = None
+    #: What the configured shocks do to this allocation, when ``run_engine``
+    #: was asked for them (``run_stress=True``) and the config named any.
+    #: ``None`` means the question was not asked — never that nothing hurts.
+    stress: StressReport | None = None
 
     # -- allocation views ---------------------------------------------------
 
@@ -527,6 +538,7 @@ class EngineRun:
         n_trials: int | None = None,
         trial_sharpes: pd.Series | None = None,
         overfitting: Any = None,
+        shocks: Sequence[Shock] | None = None,
     ) -> Tearsheet:
         """The assembled reading of a run, caveats attached.
 
@@ -546,13 +558,22 @@ class EngineRun:
             trial_sharpes: The Sharpe ratios of those trials, which sharpen the
                 deflation.
             overfitting: A pre-computed overfitting report to attach.
+            shocks: Stress scenarios for the book the run ends on. ``None``
+                takes the ones this run's config carries, so a mandate that
+                declares its scenarios gets the panel without asking twice;
+                pass ``()`` to suppress it.
 
         Returns:
             A :class:`~optimization_engine.backtest.Tearsheet` carrying the run,
-            its cost analysis, the selection-bias diagnostics, and the caveats
-            that qualify them.
+            its cost analysis, the selection-bias diagnostics, the stress panel
+            when scenarios were configured, and the caveats that qualify them.
+
+        Raises:
+            StressError: If a configured shock names an asset outside the
+                panel this run was solved on.
         """
         rf = self.config.optimizer.risk_free_rate if riskfree_rate is None else riskfree_rate
+        applied = configured_shocks(self.config) if shocks is None else tuple(shocks)
         return build_tearsheet(
             run if run is not None else self.simulate(),
             self.returns,
@@ -560,6 +581,8 @@ class EngineRun:
             n_trials=n_trials,
             trial_sharpes=trial_sharpes,
             overfitting=overfitting,
+            shocks=applied,
+            stress_cov_matrix=self.cov_matrix,
         )
 
     def sweep(
@@ -937,6 +960,27 @@ def resolve_expected_returns(
     return expected_returns.reindex(returns.columns).fillna(0.0)
 
 
+def configured_shocks(config: EngineConfig) -> tuple[Shock, ...]:
+    """The stress scenarios a configuration carries, if it carries any.
+
+    Args:
+        config: The configuration to read ``stress`` from.
+
+    Returns:
+        The shocks as a tuple, empty when none are configured. Read through
+        ``getattr`` for the same reason
+        :func:`~optimization_engine.data.covariance.covariance_from_config`
+        reads the denoising settings that way — a config object built by an
+        older release, or duck-typed by a caller, still runs.
+
+    Raises:
+        StressError: If ``config.stress`` is set to something that is neither a
+            sequence of :class:`~optimization_engine.stress.Shock` nor of the
+            mappings one serializes to, or names the same scenario twice.
+    """
+    return shocks_from_dicts(getattr(config, "stress", ()) or ())
+
+
 def run_engine(
     returns: pd.DataFrame,
     config: EngineConfig,
@@ -947,6 +991,7 @@ def run_engine(
     check_feasibility: bool = True,
     raise_on_infeasible: bool = False,
     external_returns: pd.DataFrame | pd.Series | None = None,
+    run_stress: bool = False,
 ) -> EngineRun:
     """Run the engine end-to-end.
 
@@ -966,11 +1011,25 @@ def run_engine(
             of letting the solver fail with a less informative error.
         external_returns: Return series from outside the investable universe,
             needed only when ``config.benchmark`` names an external index.
+        run_stress: Apply ``config.stress`` to the solved book and attach the
+            report as ``run.stress``. Off by default, and deliberately: the
+            walk-forward and sweep solvers call this function once per window
+            and throw everything but the weights away, so nothing they do not
+            read should be computed. Setting it with no shocks configured is a
+            no-op, not an error.
+
+    Returns:
+        An :class:`EngineRun` carrying the allocation and the evidence behind
+        it — the covariance, the expected returns, the feasibility report when
+        one was asked for, the frontier when one was built, and the stress
+        report when ``run_stress`` was set and shocks were configured.
 
     Raises:
         ValueError: If ``returns`` is empty or has no columns.
         InfeasibleConstraintsError: When ``raise_on_infeasible`` is set and the
             constraints cannot be satisfied.
+        StressError: When ``run_stress`` is set and a configured shock names an
+            asset outside the panel, which is the same defect as a view on one.
     """
     if returns is None or returns.empty:
         raise ValueError("run_engine received an empty returns frame.")
@@ -1040,6 +1099,12 @@ def run_engine(
             return_range=return_range,
         )
 
+    stress: StressReport | None = None
+    if run_stress:
+        shocks = configured_shocks(config)
+        if shocks:
+            stress = stress_test(result.weights, shocks, cov_matrix=cov)
+
     run_warnings: list[str] = list(cov_diag.warnings)
     if feasibility is not None:
         run_warnings.extend(i.message for i in feasibility.warnings)
@@ -1056,4 +1121,5 @@ def run_engine(
         covariance_diagnostics=cov_diag,
         warnings=tuple(run_warnings),
         benchmark=benchmark,
+        stress=stress,
     )
